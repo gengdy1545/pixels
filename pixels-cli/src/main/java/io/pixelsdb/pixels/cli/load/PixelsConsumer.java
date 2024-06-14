@@ -104,7 +104,8 @@ public class PixelsConsumer extends Consumer
                     count++;
                     Storage originStorage = StorageFactory.Instance().getStorage(originalFilePath);
                     reader = new BufferedReader(new InputStreamReader(originStorage.open(originalFilePath)));
-
+                    // set unified timestamp
+                    long timestamp = System.currentTimeMillis();
                     System.out.println("loading data from: " + originalFilePath);
 
                     while ((line = reader.readLine()) != null)
@@ -154,7 +155,10 @@ public class PixelsConsumer extends Consumer
                             try
                             {
                                 int valueIdx = orderMapping[i];
-                                if (valueIdx >= colsInLine.length ||
+                                if (valueIdx == colsInLine.length) // add timestamp
+                                {
+                                    columnVectors[i].add(timestamp);
+                                } else if (valueIdx > colsInLine.length ||
                                         colsInLine[valueIdx].isEmpty() ||
                                         colsInLine[valueIdx].equalsIgnoreCase("\\N"))
                                 {

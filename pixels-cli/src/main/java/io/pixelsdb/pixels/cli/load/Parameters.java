@@ -110,13 +110,17 @@ public class Parameters
         List<Column> columns = metadataService.getColumns(dbName, tableName, false);
         int colSize = columns.size();
         // record original column names and types
-        String[] originalColNames = new String[colSize];
-        String[] originalColTypes = new String[colSize];
+        String[] originalColNames = new String[colSize + 1];
+        String[] originalColTypes = new String[colSize + 1];
         for (int i = 0; i < colSize; i++)
         {
             originalColNames[i] = columns.get(i).getName();
             originalColTypes[i] = columns.get(i).getType();
         }
+        // add commit_timestamp column
+        originalColNames[colSize] = "pixels_commit_timestamp";
+        originalColTypes[colSize] = "timestamp";
+        colSize += 1;
         // get the latest layout for writing
         List<Layout> layouts = metadataService.getLayouts(dbName, tableName);
         Layout writingLayout = null;
@@ -140,6 +144,7 @@ public class Parameters
         // get the column order of the latest writing layout
         Ordered ordered = writingLayout.getOrdered();
         List<String> layoutColumnOrder = ordered.getColumnOrder();
+        layoutColumnOrder.add("pixels_commit_timestamp");
         // check size consistency
         if (layoutColumnOrder.size() != colSize)
         {
