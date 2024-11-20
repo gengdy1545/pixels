@@ -86,7 +86,7 @@ private:
 	std::vector<std::shared_ptr<pixels::proto::ColumnChunkIndex>> curChunkIndex;
     /**
      * Columns included by reader option; if included, set true
-     */
+     */f
     std::vector<bool> includedColumns;
     /**
      * Target row groups to read after matching reader option,

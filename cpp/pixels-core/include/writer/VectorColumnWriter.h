@@ -1,0 +1,8 @@
+//
+// Created by whz on 11/19/24.
+//
+
+#ifndef DUCKDB_VECTORCOLUMNWRITER_H
+#define DUCKDB_VECTORCOLUMNWRITER_H
+
+#endif // DUCKDB_VECTORCOLUMNWRITER_H

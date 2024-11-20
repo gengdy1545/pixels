@@ -27,8 +27,6 @@ set(pixels_core_cxx
         lib/encoding/RunLenIntDecoder.cpp
         lib/encoding/Encoder.cpp
         lib/encoding/RunLenIntEncoder.cpp
-        lib/encoding/EncodingLevel.cpp
-        lib/utils/EncodingUtils.cpp
         lib/utils/EncodingUtils.cpp
         include/vector/DecimalColumnVector.h
         lib/vector/DecimalColumnVector.cpp
@@ -45,7 +43,46 @@ set(pixels_core_cxx
         include/vector/TimestampColumnVector.h
         lib/vector/TimestampColumnVector.cpp
         include/reader/TimestampColumnReader.h
-        lib/reader/TimestampColumnReader.cpp)
+        lib/reader/TimestampColumnReader.cpp
+        include/writer/ColumnWriter.h
+        lib/encoding/EncodingLevel.cpp
+        lib/writer/ColumnWriter.cpp
+        lib/utils/Integer.cpp
+        lib/stats/StatsRecoder.cpp
+        include/writer/BooleanColumnWriter.h
+        include/writer/ByteColumnWriter.h
+        include/writer/IntegerColumnWriter.h
+        include/writer/FloatColumnWriter.h
+        include/writer/DoubleColumnWriter.h
+        include/writer/DecimalColumnWriter.h
+        include/writer/LongDecimalColumnWriter.h
+        include/writer/StringColumnWriter.h
+        include/writer/CharColumnWriter.h
+        include/writer/VarcharColumnWriter.h
+        include/writer/BinaryColumnWriter.h
+        include/writer/VarbinaryColumnWriter.h
+        include/writer/DateColumnWriter.h
+        include/writer/TimeColumnWriter.h
+        include/writer/TimestampColumnWriter.h
+        include/writer/VectorColumnWriter.h
+        lib/writer/BooleanColumnWriter.cpp
+        lib/writer/ByteColumnWriter.cpp
+        lib/writer/IntegerColumnWriter.cpp
+        lib/writer/FloatColumnWriter.cpp
+        lib/writer/DoubleColumnWriter.cpp
+        lib/writer/DecimalColumnWriter.cpp
+        lib/writer/LongDecimalColumnWriter.cpp
+        lib/writer/StringColumnWriter.cpp
+        lib/writer/CharColumnWriter.cpp
+        lib/writer/VarcharColumnWriter.cpp
+        lib/writer/BinaryColumnWriter.cpp
+        lib/writer/VarbinaryColumnWriter.cpp
+        lib/writer/DateColumnWriter.cpp
+        lib/writer/TimeColumnWriter.cpp
+        lib/writer/TimestampColumnWriter.cpp
+        lib/writer/VectorColumnWriter.cpp
+        lib/writer/BaseColumnWriter.cpp
+)
 
 add_library(pixels-core ${pixels_core_cxx})
 

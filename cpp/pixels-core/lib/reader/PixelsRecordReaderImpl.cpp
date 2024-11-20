@@ -12,7 +12,7 @@ PixelsRecordReaderImpl::PixelsRecordReaderImpl(std::shared_ptr<PhysicalReader> r
                                                const PixelsReaderOption& opt,
                                                std::shared_ptr<PixelsFooterCache> pixelsFooterCache) {
     physicalReader = reader;
-    footer = pixelsFooter;
+    // debug read path
     postScript = pixelsPostScript;
     footerCache = pixelsFooterCache;
     option = opt;
@@ -37,6 +37,7 @@ PixelsRecordReaderImpl::PixelsRecordReaderImpl(std::shared_ptr<PhysicalReader> r
     curRowInRG = 0;
 	curRGRowCount = 0;
     fileName = physicalReader->getName();
+    std::cout<<"fileName: "<<fileName<<std::endl;
     enableEncodedVector = option.isEnableEncodedColumnVector();
     includedColumnNum = 0;
 	endOfFile = false;
@@ -95,7 +96,7 @@ void PixelsRecordReaderImpl::checkBeforeRead() {
             targetColIdx++;
         }
     }
-
+    std::cout<<"before create column readers"<<std::endl;
     // create column readers
     auto columnSchemas = fileSchema->getChildren();
     readers.clear();
@@ -247,7 +248,10 @@ void PixelsRecordReaderImpl::prepareRead() {
     // read row group statistics and find target row groups
     for(int i = 0; i < RGLen; i++) {
         includedRGs.at(i) = true;
+        // unhandled C++ exception
+        std::cout<<"before footer rowgroup"<<std::endl;
         includedRowNum += footer.rowgroupinfos(RGStart + i).numberofrows();
+        std::cout<<"after footer rowgroup"<<std::endl;
     }
     targetRGs.clear();
     targetRGs.resize(RGLen);

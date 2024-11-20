@@ -65,7 +65,9 @@ std::string PhysicalLocalReader::getName() {
     if(path.empty()) {
         return "";
     }
-    return path.substr(path.find_last_of('/') + 1);
+    // get full name
+    return path;
+//    return path.substr(path.find_last_of('/') + 1);
 }
 
 std::shared_ptr<ByteBuffer> PhysicalLocalReader::readAsync(int length, std::shared_ptr<ByteBuffer> buffer, int index) {
