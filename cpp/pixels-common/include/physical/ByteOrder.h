@@ -1,0 +1,10 @@
+// Created by lizinuo on 11/22/2024
+#ifndef PIXELS_PIXELS_BYTEORDER_H
+#define PIXELS_PIXELS_BYTEORDER_H
+
+enum class ByteOrder {
+  PIXELS_LITTLE_ENDIAN,
+  PIXELS_BIG_ENDIAN
+};
+
+#endif // PIXELS_PIXELS_BYTEORDER_H

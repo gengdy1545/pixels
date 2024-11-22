@@ -328,3 +328,7 @@ int TypeDescription::getScale() {
 	return scale;
 }
 
+uint32_t TypeDescription::getMaxLength() const
+{
+    return maxLength;
+}

@@ -80,6 +80,7 @@ public:
 	std::vector<std::string> getFieldNames();
 	int getPrecision();
 	int getScale();
+    uint32_t getMaxLength() const;
     static std::map<Category, CategoryProperty> categoryMap;
 
     static int SHORT_DECIMAL_MAX_PRECISION;

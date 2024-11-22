@@ -9,12 +9,8 @@ public:
     DateColumnWriter(TypeDescription type, const PixelsWriterOption &writerOption);
     virtual int write(ColumnVector *vector, int size);
     virtual void newPixel();
-
-    
     // StatsRecorder getColumnChunkStatRecorder();
     virtual int write(std::shared_ptr<ColumnVector> vector, int length);
-    virtual ByteBuffer getColumnChunkContent();
-    virtual int getColumnChunkSize();
 
 protected:
     virtual bool decideNullsPadding(const PixelsWriterOption &writerOption);

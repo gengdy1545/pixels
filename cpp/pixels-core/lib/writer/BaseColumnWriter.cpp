@@ -3,12 +3,13 @@
 //
 #include "writer/BaseColumnWriter.h"
 #include "utils/ConfigFactory.h"
+#include "utils/BitUtils.h"
 
 const int BaseColumnWriter::ISNULL_ALIGNMENT = std::stoi(ConfigFactory::Instance().getProperty("isnull.bitmap.alignment"));
 const std::vector<uint8_t> BaseColumnWriter::ISNULL_PADDING_BUFFER(BaseColumnWriter::ISNULL_ALIGNMENT, 0);
 
 // 构造函数实现
-BaseColumnWriter::BaseColumnWriter(const TypeDescription& type, PixelsWriterOption writerOption)
+BaseColumnWriter::BaseColumnWriter(const TypeDescription& type, const PixelsWriterOption& writerOption)
     : pixelStride(writerOption.getPixelsStride()),
       encodingLevel(writerOption.getEncodingLevel()),
       nullsPadding(decideNullsPadding(writerOption)),
@@ -17,22 +18,23 @@ BaseColumnWriter::BaseColumnWriter(const TypeDescription& type, PixelsWriterOpti
 //      pixelStatRecorder(StatsRecorder::create(type)),
 //      columnChunkStatRecorder(StatsRecorder::create(type))
 {
-  columnChunkIndex.setLittleEndian(byteOrder == ByteOrder::LITTLE_ENDIAN);
-  columnChunkIndex.setNullsPadding(nullsPadding);
-  columnChunkIndex.setIsNullAlignment(ISNULL_ALIGNMENT);
+  columnChunkIndex->set_littleendian(byteOrder == ByteOrder::PIXELS_LITTLE_ENDIAN);
+  columnChunkIndex->set_nullspadding(nullsPadding);
+  columnChunkIndex->set_isnullalignment(ISNULL_ALIGNMENT);
 }
 
 
 std::vector<uint8_t> BaseColumnWriter::getColumnChunkContent() const {
-  const std::string& str = outputStream.str();
-  return std::vector<uint8_t>(str.begin(), str.end());
+  auto begin = outputStream->getPointer() + outputStream->getReadPos();
+  auto end = outputStream->getPointer() + outputStream->getReadPos();
+  return std::vector<uint8_t>(begin, end);
 }
 
 int BaseColumnWriter::getColumnChunkSize() const {
-  return static_cast<int>(outputStream.str().size());
+  return static_cast<int>(outputStream->getWritePos() - outputStream->getReadPos());
 }
 
-const pixels::proto::ColumnChunkIndex& BaseColumnWriter::getColumnChunkIndex() const {
+const std::shared_ptr<pixels::proto::ColumnChunkIndex> BaseColumnWriter::getColumnChunkIndex() const {
   return columnChunkIndex;
 }
 
@@ -46,7 +48,7 @@ const StatsRecorder& BaseColumnWriter::getColumnChunkStatRecorder() const {
 
 pixels::proto::ColumnEncoding BaseColumnWriter::getColumnChunkEncoding() const {
   pixels::proto::ColumnEncoding encoding;
-  encoding.setKind(pixels::proto::ColumnEncoding::Kind::NONE);
+  encoding.set_kind(pixels::proto::ColumnEncoding::Kind::ColumnEncoding_Kind_NONE);
   return encoding;
 }
 
@@ -54,24 +56,23 @@ void BaseColumnWriter::flush() {
   if (curPixelEleIndex > 0) {
     newPixel();
   }
-  int isNullOffset = static_cast<int>(outputStream.tellp());
+  int isNullOffset = static_cast<int>(outputStream->getWritePos());
   if (ISNULL_ALIGNMENT != 0 && isNullOffset % ISNULL_ALIGNMENT != 0) {
     int alignBytes = ISNULL_ALIGNMENT - (isNullOffset % ISNULL_ALIGNMENT);
-    outputStream.write(reinterpret_cast<const char*>(ISNULL_PADDING_BUFFER.data()), alignBytes);
+    outputStream->putBytes(const_cast<uint8_t*>(ISNULL_PADDING_BUFFER.data()), alignBytes);
     isNullOffset += alignBytes;
   }
-  columnChunkIndex.setIsNullOffset(isNullOffset);
-  isNullStream.seekp(0, std::ios::end);
-  outputStream << isNullStream.str();
+  columnChunkIndex->set_isnulloffset(isNullOffset);
+  outputStream->putBytes(isNullStream->getPointer() + isNullStream->getReadPos(), isNullStream->getWritePos() - isNullStream->getReadPos());
 }
 
 void BaseColumnWriter::newPixel() {
   if (hasNull) {
     auto compacted = BitUtils::bitWiseCompact(isNull, curPixelIsNullIndex, byteOrder);
-    isNullStream.write(reinterpret_cast<const char*>(compacted.data()), compacted.size());
+    isNullStream->putBytes(const_cast<uint8_t*>(compacted.data()), compacted.size());
     pixelStatRecorder.setHasNull();
   }
-  curPixelPosition = static_cast<int>(outputStream.tellp());
+  curPixelPosition = static_cast<int>(outputStream->getWritePos());
   curPixelEleIndex = 0;
   curPixelVectorIndex = 0;
   curPixelIsNullIndex = 0;
@@ -79,9 +80,10 @@ void BaseColumnWriter::newPixel() {
   columnChunkStatRecorder.merge(pixelStatRecorder);
 
   pixels::proto::PixelStatistic pixelStat;
-  pixelStat.setStatistic(pixelStatRecorder.serialize());
-  columnChunkIndex.addPixelPositions(lastPixelPosition);
-  columnChunkIndex.addPixelStatistics(pixelStat);
+  *pixelStat.mutable_statistic() = pixelStatRecorder.serialize();
+  columnChunkIndex->add_pixelpositions(lastPixelPosition);
+  auto new_pixelstatistic = columnChunkIndex->add_pixelstatistics();
+  *new_pixelstatistic = pixelStat;
 
   lastPixelPosition = curPixelPosition;
   pixelStatRecorder.reset();
@@ -91,17 +93,15 @@ void BaseColumnWriter::newPixel() {
 void BaseColumnWriter::reset() {
   lastPixelPosition = 0;
   curPixelPosition = 0;
-  columnChunkIndex.Clear();
-  columnChunkStat.Clear();
+  columnChunkIndex->Clear();
+  columnChunkStat->Clear();
   pixelStatRecorder.reset();
   columnChunkStatRecorder.reset();
-  outputStream.str("");
-  outputStream.clear();
-  isNullStream.str("");
-  isNullStream.clear();
+  outputStream->resetPosition();
+  isNullStream->resetPosition();
 }
 
 void BaseColumnWriter::close() {
-  outputStream.clear();
-  isNullStream.clear();
+  outputStream->clear();
+  isNullStream->clear();
 }

@@ -10,23 +10,23 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "encoding/EncodingLevel.h"
 #include "writer/ColumnWriter.h"
+#include "ByteOrder.h"
 
-
-class PixelsWriterOption{
+class PixelsWriterOption {
 public:
     PixelsWriterOption();
-    int getPixelsStride() {
+    int getPixelsStride() const{
         return pixelsStride;
     }
 
-    EncodingLevel getEncodingLevel() {
+    EncodingLevel getEncodingLevel() const {
         return  encodingLevel;
     }
 
-    bool isNullsPadding() {
+    bool isNullsPadding() const{
         return nullsPadding;
     }
-    ByteOrder getByteOrder(){
+    ByteOrder getByteOrder() const {
       return byteOrder;
     }
 

@@ -6,6 +6,6 @@
 #define PIXELS_ENCODER_H
 
 class Encoder {
-
+    
 };
 #endif //PIXELS_ENCODER_H

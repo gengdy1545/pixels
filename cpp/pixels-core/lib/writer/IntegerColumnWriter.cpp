@@ -1,9 +1,10 @@
 #include "writer/IntegerColumnWriter.h"
-
+#include "utils/BitUtils.h"
+#include "IntegerColumnWriter.h"
 IntegerColumnWriter::IntegerColumnWriter(TypeDescription type, const PixelsWriterOption &writerOption) : BaseColumnWriter(type, writerOption), curPixelVector(pixelStride)
 {
     isLong = type.getCategory() == TypeDescription::Category::LONG;
-    runlengthEncoding = encodingLevel.ge(EncodingLevel::EL2);
+    runlengthEncoding = encodingLevel.ge(EncodingLevel::Level::EL2);
     if (runlengthEncoding)
     {
         encoder = std::make_unique<RunLenIntEncoder>(false);
@@ -33,9 +34,16 @@ int IntegerColumnWriter::write(std::shared_ptr<ColumnVector> vector, int size)
     curPartLength = nextPartLength;
     writeCurPartLong(columnVector, values, curPartLength, curPartOffset);
 
-    return outputStream.getWritePos();
+    return outputStream->getWritePos();
 }
 
+void IntegerColumnWriter::close()
+{
+    if(runlengthEncoding && encoder) {
+       encoder->clear();
+    }
+    BaseColumnWriter::close();
+}
 void IntegerColumnWriter::writeCurPartLong(std::shared_ptr<ColumnVector> columnVector, long *values, int curPartLength, int curPartOffset)
 {
     for (int i = 0; i < curPartLength; i++)
@@ -56,9 +64,7 @@ void IntegerColumnWriter::writeCurPartLong(std::shared_ptr<ColumnVector> columnV
             curPixelVector[curPixelVectorIndex++] = values[i + curPartOffset];
         }
     }
-    std::copy(columnVector->isNull + curPartOffset,
-              columnVector->isNull + curPartOffset + curPartLength,
-              isNull.begin() + curPixelIsNullIndex);
+    isNull.insert(isNull.begin() + curPixelIsNullIndex, columnVector->isNull + curPartOffset, columnVector->isNull + curPartOffset + curPartLength);
     curPixelIsNullIndex += curPartLength;
 }
 
@@ -66,12 +72,12 @@ void IntegerColumnWriter::newPixel()
 {
     if (hasNull)
     {
-        // TODO
-        // isNullStream.write(BitUtils.bitWiseCompact(isNull, curPixelIsNullIndex, byteOrder));
-        // pixelStatRecorder.setHasNull();
+        auto compacted = BitUtils::bitWiseCompact(isNull, curPixelIsNullIndex, byteOrder);
+        isNullStream->putBytes(const_cast<uint8_t*>(compacted.data()), compacted.size());
+        pixelStatRecorder.setHasNull();
     }
     // update position of current pixel
-    curPixelPosition = outputStream.getWritePos();
+    curPixelPosition = outputStream->getWritePos();
     // set current pixel element count to 0 for the next batch pixel writing
     curPixelEleIndex = 0;
     curPixelVectorIndex = 0;
@@ -80,15 +86,15 @@ void IntegerColumnWriter::newPixel()
     // columnChunkStatRecorder.merge(pixelStatRecorder);
     // add current pixel stat and position info to columnChunkIndex
 
-    auto pixelStat = columnChunkIndex_->add_pixelstatistics();
-    // *pixelStat->mutable_statistic() = pixelStatRecorder.serialize();
+    auto pixelStat = columnChunkIndex->add_pixelstatistics();
+    *pixelStat->mutable_statistic() = pixelStatRecorder.serialize();
 
-    columnChunkIndex_->add_pixelpositions(lastPixelPosition);
+    columnChunkIndex->add_pixelpositions(lastPixelPosition);
     
     // update lastPixelPosition to current one
     lastPixelPosition = curPixelPosition;
     // reset current pixel stat recorder
-    // pixelStatRecorder.reset();
+    pixelStatRecorder.reset();
     // reset hasNull
     hasNull = false;
 }//

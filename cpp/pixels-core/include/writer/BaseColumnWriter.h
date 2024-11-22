@@ -4,14 +4,13 @@
 
 #ifndef CPP_BASECOLUMNWRITER_H
 #define CPP_BASECOLUMNWRITER_H
-#include "ColumnWriter.h"
 #include <vector>
 #include <string>
 #include <sstream>
 #include <memory>
+#include "writer/ColumnWriter.h"
 #include "encoding/EncodingLevel.h"
 #include "encoding/Encoder.h"
-//#include ""
 
 
 class BaseColumnWriter : public ColumnWriter{
@@ -24,8 +23,8 @@ protected:
 //  const ByteOrder byteOrder;
   const bool nullsPadding;
   std::vector<bool> isNull;
-  pixels::proto::ColumnChunkIndex columnChunkIndex;
-  pixels::proto::ColumnStatistic columnChunkStat;
+  std::shared_ptr<pixels::proto::ColumnChunkIndex> columnChunkIndex;
+  std::shared_ptr<pixels::proto::ColumnStatistic> columnChunkStat;
 
   StatsRecorder pixelStatRecorder;
   StatsRecorder columnChunkStatRecorder;
@@ -36,23 +35,23 @@ protected:
   int curPixelVectorIndex = 0;
   int curPixelIsNullIndex = 0;
 
-  std::unique_ptr<Encoder> encoder;
+  //std::unique_ptr<Encoder> encoder;
   bool hasNull = false;
 
   std::shared_ptr<ByteBuffer> outputStream;
   std::shared_ptr<ByteBuffer> isNullStream;
 
 public:
-  BaseColumnWriter(const TypeDescription& type, PixelsWriterOption writerOption);
+  BaseColumnWriter(const TypeDescription& type, const PixelsWriterOption& writerOption);
   virtual ~BaseColumnWriter() = default;
 
   virtual bool decideNullsPadding(const PixelsWriterOption& writerOption) = 0;
-  virtual int write(const ColumnVector& vector, int size) = 0;
+  virtual int write(std::shared_ptr<ColumnVector> vector, int size) = 0;
 
   std::vector<uint8_t> getColumnChunkContent() const;
   int getColumnChunkSize() const;
 
-  const pixels::proto::ColumnChunkIndex& getColumnChunkIndex() const;
+  const std::shared_ptr<pixels::proto::ColumnChunkIndex> getColumnChunkIndex() const;
   pixels::proto::ColumnStatistic getColumnChunkStat() const;
   const StatsRecorder& getColumnChunkStatRecorder() const;
 
@@ -64,8 +63,5 @@ public:
   void close();
   ByteOrder byteOrder;
 };
-
-
-
 
 #endif //CPP_BASECOLUMNWRITER_H

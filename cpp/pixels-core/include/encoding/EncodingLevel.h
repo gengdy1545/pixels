@@ -49,6 +49,10 @@ public:
         return static_cast<int>(level) >= otherLevel;
     }
 
+    bool ge(Level otherLevel) const {
+        return static_cast<int>(level) >= static_cast<int>(otherLevel);
+    }
+
     bool ge(const EncodingLevel& other) const {
         return static_cast<int>(level) >= static_cast<int>(other.level);
     }
