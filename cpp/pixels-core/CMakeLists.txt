@@ -27,7 +27,9 @@ set(pixels_core_cxx
         lib/encoding/RunLenIntDecoder.cpp
         lib/encoding/Encoder.cpp
         lib/encoding/RunLenIntEncoder.cpp
+        lib/encoding/RunLenByteEncoder.cpp
         lib/utils/EncodingUtils.cpp
+        lib/utils/BitUtils.cpp
         include/vector/DecimalColumnVector.h
         lib/vector/DecimalColumnVector.cpp
         include/reader/DecimalColumnReader.h

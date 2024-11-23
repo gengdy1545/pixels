@@ -162,3 +162,70 @@ std::vector<uint8_t> BitUtils::bitWiseCompact(std::vector<bool> values, int leng
         return bitWiseCompactLE(values, length);
     }
 }
+
+std::vector<uint8_t> BitUtils::bitWiseCompact(std::vector<uint8_t> values, int length, ByteOrder byteOrder)
+{
+    if (byteOrder == ByteOrder::PIXELS_BIG_ENDIAN)
+    {
+        return bitWiseCompactBE(values, length);
+    }
+    else
+    {
+        return bitWiseCompactLE(values, length);
+    }
+}
+
+std::vector<uint8_t> BitUtils::bitWiseCompactBE(std::vector<uint8_t> values, int length)
+{
+    std::vector<uint8_t> bitWiseOutput;
+    // Issue #99: remove to improve performance.
+    // int bitsToWrite = 1;
+    int bitsLeft = 8;
+    uint8_t current = 0;
+    for (int i = 0; i < length; i++)
+    {
+        auto v = values[i];
+        bitsLeft--; // -= bitsToWrite;
+        current |= v << bitsLeft;
+        if (bitsLeft == 0)
+        {
+            bitWiseOutput.emplace_back(current);
+            current = 0;
+            bitsLeft = 8;
+        }
+    }
+
+    if (bitsLeft != 8)
+    {
+        bitWiseOutput.emplace_back(current);
+    }
+
+    return bitWiseOutput;
+}
+
+std::vector<uint8_t> BitUtils::bitWiseCompactLE(std::vector<uint8_t> values, int length)
+{
+    std::vector<uint8_t> bitWiseOutput;
+    int currBit = 0;
+    uint8_t current = 0;
+
+    for (int i = 0; i < length; i++)
+    {
+        auto v = values[i];
+        current |= v << currBit;
+        currBit++;
+        if (currBit == 8)
+        {
+            bitWiseOutput.emplace_back(current);
+            current = 0;
+            currBit = 0;
+        }
+    }
+
+    if (currBit != 0)
+    {
+        bitWiseOutput.emplace_back(current);
+    }
+
+    return bitWiseOutput;
+}
