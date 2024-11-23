@@ -3,6 +3,7 @@
 //
 
 #include "utils/EncodingUtils.h"
+#include "EncodingUtils.h"
 
 int EncodingUtils::BUFFER_SIZE = 64;
 
@@ -630,6 +631,14 @@ void EncodingUtils::unrolledBitPackBytes(long* input, int offset, int len,
     if(remainder > 0) {
         writeRemainingLongs(output, i, input, remainder, numBytes);
     }
+}
+
+void EncodingUtils::writeIntLE(std::shared_ptr<ByteBuffer> output, int val)
+{
+    output->putByte(static_cast<uint8_t>(val & 0xff));       
+    output->putByte(static_cast<uint8_t>((val >> 8) & 0xff)); 
+    output->putByte(static_cast<uint8_t>((val >> 16) & 0xff)); 
+    output->putByte(static_cast<uint8_t>((val >> 24) & 0xff));
 }
 
 

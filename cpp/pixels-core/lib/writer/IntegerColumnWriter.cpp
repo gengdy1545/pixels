@@ -64,39 +64,11 @@ void IntegerColumnWriter::writeCurPartLong(std::shared_ptr<ColumnVector> columnV
             curPixelVector[curPixelVectorIndex++] = values[i + curPartOffset];
         }
     }
-    isNull.insert(isNull.begin() + curPixelIsNullIndex, columnVector->isNull + curPartOffset, columnVector->isNull + curPartOffset + curPartLength);
+    std::copy(columnVector->isNull + curPartOffset, columnVector->isNull + curPartOffset + curPartLength, isNull.begin() + curPixelIsNullIndex);
     curPixelIsNullIndex += curPartLength;
 }
 
 void IntegerColumnWriter::newPixel()
 {
-    if (hasNull)
-    {
-        auto compacted = BitUtils::bitWiseCompact(isNull, curPixelIsNullIndex, byteOrder);
-        isNullStream->putBytes(const_cast<uint8_t*>(compacted.data()), compacted.size());
-        pixelStatRecorder.setHasNull();
-    }
-    // update position of current pixel
-    curPixelPosition = outputStream->getWritePos();
-    // set current pixel element count to 0 for the next batch pixel writing
-    curPixelEleIndex = 0;
-    curPixelVectorIndex = 0;
-    curPixelIsNullIndex = 0;
-    // update column chunk stat
-    // columnChunkStatRecorder.merge(pixelStatRecorder);
-    // add current pixel stat and position info to columnChunkIndex
-
-    auto pixelStat = columnChunkIndex->add_pixelstatistics();
-    *pixelStat->mutable_statistic() = pixelStatRecorder.serialize();
-
-    columnChunkIndex->add_pixelpositions(lastPixelPosition);
-    
-    // update lastPixelPosition to current one
-    lastPixelPosition = curPixelPosition;
-    // reset current pixel stat recorder
-    pixelStatRecorder.reset();
-    // reset hasNull
-    hasNull = false;
-}//
-// Created by whz on 11/19/24.
-//
+    // TODO impl
+}
