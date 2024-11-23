@@ -31,13 +31,6 @@
 class BinaryColumnVector: public ColumnVector {
 public:
     duckdb::string_t * vector;
-    std::vector<int> start;          // start offset of each field
-
-    /**
-     * The length of each field. If the value repeats for every entry, then it is stored
-     * in vector[0] and isRepeating from the superclass is set to true.
-     */
-    std::vector<int> lens;
 
     /**
     * Use this constructor by default. All column vectors

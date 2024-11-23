@@ -77,8 +77,6 @@ public:
                            std::shared_ptr<ByteBuffer> output);
     void unrolledBitPackBytes(long* input, int offset, int len, 
                               std::shared_ptr<ByteBuffer> output, int numBytes);
-    void writeIntLE(std::shared_ptr<ByteBuffer> output, int val);
-    void writeIntBE(std::shared_ptr<ByteBuffer> output, int val); 
     void writeLongBE(std::shared_ptr<ByteBuffer> output, 
                      long* input, int offset, int numHops, int numBytes);
     void writeLongBE2(std::shared_ptr<ByteBuffer> output, 
