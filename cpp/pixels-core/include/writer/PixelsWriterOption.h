@@ -10,7 +10,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "encoding/EncodingLevel.h"
 #include "writer/ColumnWriter.h"
-#include "ByteOrder.h"
+#include "physical/ByteOrder.h"
 
 class PixelsWriterOption {
 public:

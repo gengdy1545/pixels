@@ -69,14 +69,14 @@ public:
     virtual int write(std::shared_ptr<ColumnVector> columnVector,int length);
 
     std::vector<uint8_t> getColumnChunkContent() const;
-    int getColumnChunkSize();
-    bool decideNullsPadding(PixelsWriterOption writerOption);
+    virtual int getColumnChunkSize() = 0;
+    virtual bool decideNullsPadding(PixelsWriterOption writerOption) = 0;
 
-    pixels::proto::ColumnChunkIndex getColumnChunkIndex();
+    virtual pixels::proto::ColumnChunkIndex getColumnChunkIndex() = 0;
 
-    pixels::proto::ColumnStatistic getColumnChunkStat();
+    virtual pixels::proto::ColumnStatistic getColumnChunkStat() = 0;
 
-    pixels::proto::ColumnEncoding getColumnChunkEncoding();
+    virtual pixels::proto::ColumnEncoding getColumnChunkEncoding() = 0;
 
     StatsRecorder getColumnChunkStatRecorder();
 

@@ -34,8 +34,8 @@ int BaseColumnWriter::getColumnChunkSize() const {
   return static_cast<int>(outputStream->getWritePos() - outputStream->getReadPos());
 }
 
-const std::shared_ptr<pixels::proto::ColumnChunkIndex> BaseColumnWriter::getColumnChunkIndex() const {
-  return columnChunkIndex;
+pixels::proto::ColumnChunkIndex BaseColumnWriter::getColumnChunkIndex() const {
+  return pixels::proto::ColumnChunkIndex();
 }
 
 pixels::proto::ColumnStatistic BaseColumnWriter::getColumnChunkStat() const {

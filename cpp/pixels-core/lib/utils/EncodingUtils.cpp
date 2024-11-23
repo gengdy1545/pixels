@@ -632,6 +632,23 @@ void EncodingUtils::unrolledBitPackBytes(long* input, int offset, int len,
     }
 }
 
+void EncodingUtils::writeIntLE(std::shared_ptr<ByteBuffer> output, int value)
+{
+    writeBuffer[0] = (byte) ((value) & 0xff);
+    writeBuffer[1] = (byte) ((value >> 8) & 0xff);
+    writeBuffer[2] = (byte) ((value >> 16) & 0xff);
+    writeBuffer[3] = (byte) ((value >> 24) & 0xff);
+    output->putBytes(writeBuffer, 4);
+}
+
+void EncodingUtils::writeIntBE(std::shared_ptr<ByteBuffer> output, int value)
+{
+    writeBuffer[3] = (byte) ((value) & 0xff);
+    writeBuffer[2] = (byte) ((value >> 8) & 0xff);
+    writeBuffer[1] = (byte) ((value >> 16) & 0xff);
+    writeBuffer[0] = (byte) ((value >> 24) & 0xff);
+    output->putBytes(writeBuffer, 4);
+}
 
 /**
  * @brief write a encoded long value into the output in little endian

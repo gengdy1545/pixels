@@ -51,11 +51,13 @@ public:
   std::vector<uint8_t> getColumnChunkContent() const;
   int getColumnChunkSize() const;
 
-  const std::shared_ptr<pixels::proto::ColumnChunkIndex> getColumnChunkIndex() const;
-  pixels::proto::ColumnStatistic getColumnChunkStat() const;
+
+
   const StatsRecorder& getColumnChunkStatRecorder() const;
 
-  pixels::proto::ColumnEncoding getColumnChunkEncoding() const;
+  virtual pixels::proto::ColumnStatistic getColumnChunkStat() const;
+  virtual pixels::proto::ColumnChunkIndex getColumnChunkIndex() const;
+  virtual pixels::proto::ColumnEncoding getColumnChunkEncoding() const;
 
   void flush();
   void newPixel();

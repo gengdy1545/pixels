@@ -4,7 +4,7 @@
 
 #include "vector/BinaryColumnVector.h"
 
-BinaryColumnVector::BinaryColumnVector(uint64_t len, bool encoding): ColumnVector(len, encoding) {
+BinaryColumnVector::BinaryColumnVector(uint64_t len, bool encoding): ColumnVector(len, encoding), start(len), lens(len) {
     posix_memalign(reinterpret_cast<void **>(&vector), 32,
                    len * sizeof(duckdb::string_t));
     memoryUsage += (long) sizeof(uint8_t) * len;
@@ -26,6 +26,8 @@ void BinaryColumnVector::setRef(int elementNum, uint8_t * const &sourceBuf, int 
     this->vector[elementNum]
         = duckdb::string_t((char *)(sourceBuf + start), length);
 
+    this->start[elementNum] = start;
+    this->lens[elementNum] = length;    
     // TODO: isNull should implemented, but not now.
 
 }
