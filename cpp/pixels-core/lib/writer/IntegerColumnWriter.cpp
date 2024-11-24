@@ -1,19 +1,22 @@
 #include "writer/IntegerColumnWriter.h"
 #include "utils/BitUtils.h"
-#include "IntegerColumnWriter.h"
-IntegerColumnWriter::IntegerColumnWriter(TypeDescription type, const PixelsWriterOption &writerOption) : BaseColumnWriter(type, writerOption), curPixelVector(pixelStride)
+IntegerColumnWriter::IntegerColumnWriter(const TypeDescription &type, const PixelsWriterOption &writerOption) : BaseColumnWriter(type, writerOption), curPixelVector(pixelStride)
 {
     isLong = type.getCategory() == TypeDescription::Category::LONG;
     runlengthEncoding = encodingLevel.ge(EncodingLevel::Level::EL2);
     if (runlengthEncoding)
     {
-        encoder = std::make_unique<RunLenIntEncoder>(false);
+        encoder = std::make_unique<RunLenIntEncoder>();
     }
 }
 
 int IntegerColumnWriter::write(std::shared_ptr<ColumnVector> vector, int size)
 {
     auto columnVector = std::static_pointer_cast<LongColumnVector>(vector);
+    if (!columnVector)
+    {
+        throw std::invalid_argument("Invalid vector type");
+    }
     auto values = columnVector->longVector;
 
     int curPartLength;         // size of the partition which belongs to current pixel
@@ -39,8 +42,9 @@ int IntegerColumnWriter::write(std::shared_ptr<ColumnVector> vector, int size)
 
 void IntegerColumnWriter::close()
 {
-    if(runlengthEncoding && encoder) {
-       encoder->clear();
+    if (runlengthEncoding && encoder)
+    {
+        encoder->clear();
     }
     BaseColumnWriter::close();
 }
@@ -52,7 +56,7 @@ void IntegerColumnWriter::writeCurPartLong(std::shared_ptr<ColumnVector> columnV
         if (columnVector->isNull[i + curPartOffset])
         {
             hasNull = true;
-            // pixelStatRecorder.increment();
+            pixelStatRecorder.increment();
             if (nullsPadding)
             {
                 // padding 0 for nulls
@@ -68,7 +72,89 @@ void IntegerColumnWriter::writeCurPartLong(std::shared_ptr<ColumnVector> columnV
     curPixelIsNullIndex += curPartLength;
 }
 
+bool IntegerColumnWriter::decideNullsPadding(const PixelsWriterOption &writerOption)
+{
+    if (writerOption.getEncodingLevel().ge(EncodingLevel::Level::EL2))
+    {
+        return false;
+    }
+    return writerOption.isNullsPadding();
+}
+
 void IntegerColumnWriter::newPixel()
 {
-    // TODO impl
+    // write out current pixel vector
+    if (runlengthEncoding)
+    {
+        for (int i = 0; i < curPixelVectorIndex; i++)
+        {
+            pixelStatRecorder.updateInteger(curPixelVector[i], 1);
+        }
+        std::vector<byte> buffer(curPixelVectorIndex * sizeof(int));
+        int resLen;
+        encoder->encode(curPixelVector.data(), buffer.data(), curPixelVectorIndex, resLen);
+        outputStream->putBytes(buffer.data(), resLen);
+    }
+    else
+    {
+        std::shared_ptr<ByteBuffer> curVecPartitionBuffer;
+        EncodingUtils encodingUtils;
+        if (isLong)
+        {
+            curVecPartitionBuffer = std::make_shared<ByteBuffer>(curPixelVectorIndex * sizeof(long));
+            if (byteOrder == ByteOrder::PIXELS_LITTLE_ENDIAN)
+            {
+                for (int i = 0; i < curPixelVectorIndex; i++)
+                {
+                    encodingUtils.writeLongLE(curVecPartitionBuffer, curPixelVector[i]);
+                    pixelStatRecorder.updateInteger(curPixelVector[i], 1);
+                }
+            }
+            else
+            {
+                for (int i = 0; i < curPixelVectorIndex; i++)
+                {
+                    encodingUtils.writeLongBE(curVecPartitionBuffer, curPixelVector[i]);
+                    pixelStatRecorder.updateInteger(curPixelVector[i], 1);
+                }
+            }
+        }
+        else
+        {
+            curVecPartitionBuffer = std::make_shared<ByteBuffer>(curPixelVectorIndex * sizeof(int));
+            if (byteOrder == ByteOrder::PIXELS_LITTLE_ENDIAN)
+            {
+                for (int i = 0; i < curPixelVectorIndex; i++)
+                {
+                    encodingUtils.writeIntLE(curVecPartitionBuffer, (int)curPixelVector[i]);
+                    pixelStatRecorder.updateInteger(curPixelVector[i], 1);
+                }
+            }
+            else
+            {
+                for (int i = 0; i < curPixelVectorIndex; i++)
+                {
+                    encodingUtils.writeIntBE(curVecPartitionBuffer, (int)curPixelVector[i]);
+                    pixelStatRecorder.updateInteger(curPixelVector[i], 1);
+                }
+            }
+        }
+        outputStream->putBytes(curVecPartitionBuffer->getPointer(), curVecPartitionBuffer->getWritePos());
+    }
+
+    BaseColumnWriter::newPixel();
+}
+
+pixels::proto::ColumnEncoding IntegerColumnWriter::getColumnChunkEncoding() const
+{
+    pixels::proto::ColumnEncoding columnEncoding;
+    if (runlengthEncoding)
+    {
+        columnEncoding.set_kind(pixels::proto::ColumnEncoding::Kind::ColumnEncoding_Kind_RUNLENGTH);
+    }
+    else
+    {
+        columnEncoding.set_kind(pixels::proto::ColumnEncoding::Kind::ColumnEncoding_Kind_NONE);
+    }
+    return columnEncoding;
 }

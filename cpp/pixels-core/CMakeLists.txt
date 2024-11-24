@@ -35,9 +35,9 @@ set(pixels_core_cxx
         include/reader/DecimalColumnReader.h
         lib/reader/DecimalColumnReader.cpp
         lib/vector/DateColumnVector.cpp
+        lib/vector/DoubleColumnVector.cpp
         include/vector/DateColumnVector.h
         include/reader/DateColumnReader.h
-        lib/reader/DateColumnReader.cpp
         include/PixelsFilter.h
         lib/PixelsFilter.cpp
         include/PixelsBitMask.h

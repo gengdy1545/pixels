@@ -49,7 +49,8 @@ public:
         BINARY,
         VARCHAR,
         CHAR,
-        STRUCT
+        STRUCT,
+        VECTOR
     };
     TypeDescription() = default;
     TypeDescription(Category c);
@@ -76,7 +77,7 @@ public:
 	std::shared_ptr<VectorizedRowBatch> createRowBatch(int maxSize);
     std::shared_ptr<VectorizedRowBatch> createRowBatch(int maxSize, const std::vector<bool>& useEncodedVector);
     std::vector<std::shared_ptr<TypeDescription>> getChildren();
-    Category getCategory();
+    Category getCategory() const;
 	std::vector<std::string> getFieldNames();
 	int getPrecision();
 	int getScale();

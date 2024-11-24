@@ -312,7 +312,7 @@ std::shared_ptr<ColumnVector> TypeDescription::createColumn(int maxSize, std::ve
     }
 }
 
-TypeDescription::Category TypeDescription::getCategory() {
+TypeDescription::Category TypeDescription::getCategory() const{
     return category;
 }
 

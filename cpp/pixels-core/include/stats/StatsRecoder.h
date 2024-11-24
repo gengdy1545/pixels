@@ -33,7 +33,8 @@ public:
   virtual void updateDate(int value);
   virtual void updateTime(int value);
   virtual void updateTimestamp(long value);
-
+  virtual void updateVector();
+  
   bool isStatsExists() const;
   void merge(const StatsRecorder& stats);
   void reset();

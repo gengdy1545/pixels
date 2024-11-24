@@ -64,6 +64,9 @@ void StatsRecorder::updateTimestamp(long) {
   throw std::logic_error("Can't update timestamp");
 }
 
+void StatsRecorder::updateVector() {
+  throw std::logic_error("Can't update vector");
+}
 
 bool StatsRecorder::isStatsExists() const {
   return (numberOfValues > 0 || hasNull);
