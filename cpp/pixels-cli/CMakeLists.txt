@@ -22,12 +22,11 @@ endif()
 
 set(pixels_cli_cxx
         main.cpp
-        lib/executor/LoadExecutor.cpp)
+        lib/executor/LoadExecutor.cpp
+        lib/load/Parameters.cpp
+        lib/load/PixelsConsumer.cpp)
 add_executable(pixels-cli ${pixels_cli_cxx})
 include_directories(include)
 include_directories(../pixels-core/include)
-message("cmake source dir " ${CMAKE_SOURCE_DIR})
-#target_link_libraries(pixels-cli Boost::program_options pixels-core pixels-common)
-target_link_libraries(pixels-cli Boost::program_options
-        ${CMAKE_SOURCE_DIR}/../build/release/extension/pixels/pixels-core/libpixels-core.a
-        ${CMAKE_SOURCE_DIR}/../build/release/extension/pixels/pixels-common/libpixels-common.a)
+include_directories(../pixels-common/include)
+target_link_libraries(pixels-cli Boost::program_options pixels-core pixels-common)
