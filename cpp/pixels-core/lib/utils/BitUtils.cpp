@@ -1,6 +1,5 @@
 #include <stdexcept>
 #include "utils/BitUtils.h"
-#include "BitUtils.h"
 
 std::vector<uint8_t> BitUtils::bitWiseCompactLE(std::vector<bool> values)
 {

@@ -48,21 +48,21 @@ public:
   virtual bool decideNullsPadding(const PixelsWriterOption& writerOption) = 0;
   virtual int write(std::shared_ptr<ColumnVector> vector, int size) = 0;
 
-  std::vector<uint8_t> getColumnChunkContent() const;
-  int getColumnChunkSize() const;
+  virtual std::vector<uint8_t> getColumnChunkContent() const;
+  virtual int getColumnChunkSize() const;
 
 
 
-  const StatsRecorder& getColumnChunkStatRecorder() const;
+  virtual const StatsRecorder& getColumnChunkStatRecorder() const;
 
   virtual pixels::proto::ColumnStatistic getColumnChunkStat() const;
   virtual pixels::proto::ColumnChunkIndex getColumnChunkIndex() const;
   virtual pixels::proto::ColumnEncoding getColumnChunkEncoding() const;
 
-  void flush();
-  void newPixel();
-  void reset();
-  void close();
+  virtual void flush();
+  virtual void newPixel();
+  virtual void reset();
+  virtual void close();
   ByteOrder byteOrder;
 };
 

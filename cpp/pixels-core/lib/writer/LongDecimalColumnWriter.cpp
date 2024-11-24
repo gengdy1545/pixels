@@ -1,8 +1,8 @@
 //
 // Created by whz on 11/19/24.
 //
-#include "LongDecimalColumnWriter.h"
 #include "vector/LongDecimalColumnVector.h"
+#include "writer/LongDecimalColumnWriter.h"
 LongDecimalColumnWriter::LongDecimalColumnWriter(const TypeDescription &type, const PixelsWriterOption &writerOption)
      : BaseColumnWriter(type, writerOption), encodingUtils{std::make_unique<EncodingUtils>()} {}
 

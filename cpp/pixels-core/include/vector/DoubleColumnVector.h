@@ -18,7 +18,7 @@ class DoubleColumnVector : public ColumnVector
 {
 public:
     std::vector<long> vector;
-    static const double NULL_VALUE = std::numeric_limits<double>::quiet_NaN() ;
+    const double NULL_VALUE = std::numeric_limits<double>::quiet_NaN() ;
     // static constexpr int DEFAULT_SIZE = 1024; 
 
     DoubleColumnVector(bool encoding = false);       

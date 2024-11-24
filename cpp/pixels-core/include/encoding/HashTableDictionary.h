@@ -50,7 +50,7 @@ public:
     virtual void visit(VisitorFunc func);
 private:
     static const int NUM_DICTIONARIES = 41;
-    std::vector<std::unordered_map<KeyBuffer, int>> dictionaries;
+    std::vector<std::unordered_map<KeyBuffer, int, KeyBufferHash, KeyBufferEqual>> dictionaries;
     int originalPosition = 0;
 
     class VisitorContextImpl : public VisitorContext {

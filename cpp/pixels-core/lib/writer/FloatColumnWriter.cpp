@@ -49,3 +49,8 @@ int FloatColumnWriter::write(std::shared_ptr<ColumnVector> vector, int size)
     }
     return outputStream->getWritePos();
 }
+
+bool FloatColumnWriter::decideNullsPadding(const PixelsWriterOption &writerOption)
+{
+    return writerOption.isNullsPadding();
+}

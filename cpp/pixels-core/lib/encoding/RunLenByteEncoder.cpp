@@ -1,4 +1,4 @@
-#include "RunLenByteEncoder.h"
+#include "encoding/RunLenByteEncoder.h"
 
 void RunLenByteEncoder::write(uint8_t value)
 {

@@ -15,5 +15,6 @@ private:
 public:
     FloatColumnWriter(const TypeDescription &type, const PixelsWriterOption &writerOption);
     virtual int write(std::shared_ptr<ColumnVector> vector, int size);
+    virtual bool decideNullsPadding(const PixelsWriterOption& writerOption);
 };
 #endif // DUCKDB_FLOATCOLUMNWRITER_H

@@ -79,7 +79,7 @@ public:
     std::vector<std::shared_ptr<TypeDescription>> getChildren();
     Category getCategory() const;
 	std::vector<std::string> getFieldNames();
-	int getPrecision();
+	int getPrecision() const;
 	int getScale();
     uint32_t getMaxLength() const;
     static std::map<Category, CategoryProperty> categoryMap;

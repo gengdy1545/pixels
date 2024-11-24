@@ -33,3 +33,8 @@ int VarcharColumnWriter::getNumTruncated()
 {
     return numTruncated;
 }
+
+bool VarcharColumnWriter::decideNullsPadding(const PixelsWriterOption &writerOption)
+{
+    return writerOption.isNullsPadding();
+}

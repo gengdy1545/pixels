@@ -320,7 +320,7 @@ std::vector<std::string> TypeDescription::getFieldNames() {
 	return fieldNames;
 }
 
-int TypeDescription::getPrecision() {
+int TypeDescription::getPrecision() const{
 	return precision;
 }
 

@@ -110,4 +110,6 @@ bool Integer128::operator<(const Integer128& other) const {
 }
 
 bool Integer128::operator<=(const Integer128& other) const {
+  return high < other.high || (high == other.high && low <= other.low);
+}
 

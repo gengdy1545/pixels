@@ -28,6 +28,7 @@ set(pixels_core_cxx
         lib/encoding/Encoder.cpp
         lib/encoding/RunLenIntEncoder.cpp
         lib/encoding/RunLenByteEncoder.cpp
+        lib/encoding/HashTableDictionary.cpp
         lib/utils/EncodingUtils.cpp
         lib/utils/BitUtils.cpp
         include/vector/DecimalColumnVector.h

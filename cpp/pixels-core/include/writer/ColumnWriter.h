@@ -18,27 +18,27 @@ class ColumnWriter
 {
 public:
   //    ColumnWriter(std::shared_ptr<TypeDescriotion> type);
-  static std::unique_ptr<ColumnWriter> newColumnWriter(std::shared_ptr<TypeDescription> type, const PixelsWriterOption &writerOption);
+  static std::unique_ptr<ColumnWriter> newColumnWriter(const TypeDescription& type, const PixelsWriterOption &writerOption);
   /**
    * Write values from input buffers
    *
    */
 
-  virtual int write(std::shared_ptr<ColumnVector> columnVector, int length);
+  virtual int write(std::shared_ptr<ColumnVector> columnVector, int length) = 0;
 
-  std::vector<uint8_t> getColumnChunkContent() const;
-  virtual int getColumnChunkSize() = 0;
-  virtual bool decideNullsPadding(PixelsWriterOption writerOption) = 0;
+  virtual std::vector<uint8_t> getColumnChunkContent() const = 0;
+  virtual int getColumnChunkSize() const = 0;
+  virtual bool decideNullsPadding(const PixelsWriterOption& writerOption) = 0;
 
-  virtual pixels::proto::ColumnChunkIndex getColumnChunkIndex() = 0;
+  virtual pixels::proto::ColumnChunkIndex getColumnChunkIndex() const = 0;
 
-  virtual pixels::proto::ColumnStatistic getColumnChunkStat() = 0;
+  virtual pixels::proto::ColumnStatistic getColumnChunkStat() const= 0;
 
-  virtual pixels::proto::ColumnEncoding getColumnChunkEncoding() = 0;
+  virtual pixels::proto::ColumnEncoding getColumnChunkEncoding() const = 0;
 
-  StatsRecorder getColumnChunkStatRecorder();
+  virtual const StatsRecorder& getColumnChunkStatRecorder() const = 0;
 
-  void reset();
+  virtual void reset() = 0;
   virtual void flush() = 0;
   virtual void close() = 0;
 };

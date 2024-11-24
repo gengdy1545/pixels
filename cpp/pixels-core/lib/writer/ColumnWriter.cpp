@@ -26,9 +26,9 @@ int write(std::shared_ptr<ColumnVector> columnVector, int length)
   return 1;
 }
 
-std::unique_ptr<ColumnWriter> ColumnWriter::newColumnWriter(std::shared_ptr<TypeDescription> type, const PixelsWriterOption &writerOption)
+std::unique_ptr<ColumnWriter> ColumnWriter::newColumnWriter(const TypeDescription& type, const PixelsWriterOption &writerOption)
 {
-  switch (type->getCategory())
+  switch (type.getCategory())
   {
   case TypeDescription::TypeDescription::Category::BOOLEAN:
     return std::make_unique<BooleanColumnWriter>(type, writerOption);
@@ -43,7 +43,7 @@ std::unique_ptr<ColumnWriter> ColumnWriter::newColumnWriter(std::shared_ptr<Type
   case TypeDescription::Category::DOUBLE:
     return std::make_unique<DoubleColumnWriter>(type, writerOption);
   case TypeDescription::Category::DECIMAL:
-    if (type->getPrecision() <= TypeDescription::SHORT_DECIMAL_MAX_PRECISION)
+    if (type.getPrecision() <= TypeDescription::SHORT_DECIMAL_MAX_PRECISION)
     {
       return std::make_unique<DecimalColumnWriter>(type, writerOption);
     }
@@ -70,6 +70,6 @@ std::unique_ptr<ColumnWriter> ColumnWriter::newColumnWriter(std::shared_ptr<Type
   case TypeDescription::Category::VECTOR:
     return std::make_unique<VectorColumnWriter>(type, writerOption);
   default:
-    throw std::invalid_argument("Bad schema type: " + std::to_string(static_cast<int>(type->getCategory())));
+    throw std::invalid_argument("Bad schema type: " + std::to_string(static_cast<int>(type.getCategory())));
   }
 }

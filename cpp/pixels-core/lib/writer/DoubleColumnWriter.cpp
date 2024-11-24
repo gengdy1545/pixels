@@ -39,7 +39,7 @@ int DoubleColumnWriter::write(std::shared_ptr<ColumnVector> vector, int size)
                 {
                     encodingUtils->writeLongBE(outputStream, values[i]);
                 }
-                pixelStatRecorder.updateDouble(std::bit_cast<double, long>(values[i]));
+                pixelStatRecorder.updateDouble(*reinterpret_cast<double*>(&values[i]));
             }
             // if current pixel size satisfies the pixel stride, end the current pixel and start a new one
             if (curPixelEleIndex >= pixelStride)
