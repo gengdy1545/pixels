@@ -18,8 +18,8 @@
  * <https://www.gnu.org/licenses/>.
  */
 
-#include "visibility/Visibility_JNI.h"
-#include "visibility/Visibility.h"
+#include "visibility/visibility_JNI.h"
+#include "visibility/visibility.h"
 #include <cstdlib>
 
 /*

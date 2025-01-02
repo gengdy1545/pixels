@@ -1,0 +1,94 @@
+/*
+ * Copyright 2024 PixelsDB.
+ *
+ * This file is part of Pixels.
+ *
+ * Pixels is free software: you can redistribute it and/or modify
+ * it under the terms of the Affero GNU General Public License as
+ * published by the Free Software Foundation, either version 3 of
+ * the License, or (at your option) any later version.
+ *
+ * Pixels is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * Affero GNU General Public License for more details.
+ *
+ * You should have received a copy of the Affero GNU General Public
+ * License along with Pixels.  If not, see
+ * <https://www.gnu.org/licenses/>.
+ */
+
+// grpc protocol for pixels deleter.
+
+syntax = "proto3";
+
+option java_multiple_files = false;
+option java_package = "io.pixelsdb.pixels.daemon";
+option java_outer_classname = "DeleterProto";
+
+package deleter.proto;
+
+// the deleter services definition.
+service DeleterService {
+    rpc GetReadableBitmap (GetReadableBitmapRequest) returns (GetReadableBitmapResponse);
+    rpc CreatDeleteTrackers (CreatDeleteTrackersRequest) returns (CreatDeleteTrackersResponse);
+    rpc DeleteRows (DeleteRowsRequest) returns (DeleteRowsResponse);
+}
+
+// begin domain objects definition
+message File {
+    uint64 id = 1;
+    string name = 2;
+    int32 numRowGroup = 3;
+    uint64 pathId = 4;
+}
+
+message UniqueRecordKey {
+    uint64 fd = 1;
+    uint64 rgId = 2;
+    uint64 rowId = 3;
+}
+// end domain objects definitions
+
+// begin request/response definition for rpc services
+message RequestHeader {
+    string token = 1;
+}
+
+message ResponseHeader {
+    string token = 1;
+    int32 errorCode = 2; // errorCode == 0 means success
+    string errorMsg = 3; // empty if errorCode == 0
+}
+
+// getReadableBitmap
+message GetReadableBitmapRequest {
+    RequestHeader header = 1;
+    uint64 timestamp = 2;
+}
+
+message GetReadableBitmapResponse {
+    ResponseHeader header = 1;
+    repeated uint64 readableBitmap = 2;
+}
+
+// creatDeleteTrackers
+message CreatDeleteTrackersRequest {
+    RequestHeader header = 1;
+    repeated File files = 2;
+}
+
+message CreatDeleteTrackersResponse {
+    ResponseHeader header = 1;
+}
+
+// deleteRows
+message DeleteRowsRequest {
+    RequestHeader header = 1;
+    repeated UniqueRecordKey keys = 2;
+}
+
+message DeleteRowsResponse {
+    ResponseHeader header = 1;
+}
+// end request/response definition for rpc services
