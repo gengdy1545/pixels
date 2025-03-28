@@ -22,9 +22,14 @@ package io.pixelsdb.pixels.common.utils;
 import io.etcd.jetcd.ByteSequence;
 import io.etcd.jetcd.Client;
 import io.etcd.jetcd.KeyValue;
+import io.etcd.jetcd.Txn;
 import io.etcd.jetcd.Watch;
+import io.etcd.jetcd.kv.TxnResponse;
 import io.etcd.jetcd.kv.PutResponse;
 import io.etcd.jetcd.lease.LeaseGrantResponse;
+import io.etcd.jetcd.op.Cmp;
+import io.etcd.jetcd.op.CmpTarget;
+import io.etcd.jetcd.op.Op;
 import io.etcd.jetcd.options.DeleteOption;
 import io.etcd.jetcd.options.GetOption;
 import io.etcd.jetcd.options.PutOption;
@@ -277,5 +282,118 @@ public class EtcdUtil
         DeleteOption deleteOption = DeleteOption.newBuilder().withPrefix(
                 ByteSequence.from(prefix, StandardCharsets.UTF_8)).build();
         this.client.getKVClient().delete(ByteSequence.from(prefix, StandardCharsets.UTF_8), deleteOption);
+    }
+
+    /**
+     * create new transaction object
+     */
+    public Txn createTransaction()
+    {
+        return this.client.getKVClient().txn();
+    }
+
+    /**
+     * commit transaction
+     * 
+     * @param txn
+     */
+    public CompletableFuture<TxnResponse> commitTransaction(Txn txn)
+    {
+        return txn.commit();
+    }
+
+    /**
+     * add a condition to the transaction
+     * 
+     * @param txn
+     * @param key
+     * @param value
+     * @param compareType
+     */
+    public Txn ifThen(Txn txn, String key, String value, Cmp.Op compareType)
+    {
+        return txn.If(new Cmp(
+                ByteSequence.from(key, StandardCharsets.UTF_8),
+                compareType,
+                CmpTarget.value(ByteSequence.from(value, StandardCharsets.UTF_8))));
+    }
+    
+    /**
+     * add put operation to the transaction
+     * @param txn
+     * @param key
+     * @param value
+     */
+    public Txn thenPut(Txn txn, String key, String value)
+    {
+        return txn.Then(Op.put(
+            ByteSequence.from(key, StandardCharsets.UTF_8),
+            ByteSequence.from(value, StandardCharsets.UTF_8),
+            PutOption.DEFAULT
+        ));
+    }
+
+    /**
+     * add put operation to the transaction
+     * @param txn
+     * @param key
+     * @param value
+     */
+    public Txn thenPut(Txn txn, String key, byte[] value)
+    {
+        return txn.Then(Op.put(
+                ByteSequence.from(key, StandardCharsets.UTF_8),
+                ByteSequence.from(value),
+                PutOption.DEFAULT));
+    }
+    
+    /**
+     * add delete operation to the transaction
+     * @param txn
+     * @param key
+     */
+    public Txn thenDelete(Txn txn, String key)
+    {
+        return txn.Then(Op.delete(
+            ByteSequence.from(key, StandardCharsets.UTF_8),
+            DeleteOption.DEFAULT
+        ));
+    }
+    
+    /**
+     * add get operation to the transaction
+     * @param txn
+     * @param key
+     */
+    public Txn thenGet(Txn txn, String key)
+    {
+        return txn.Then(io.etcd.jetcd.op.Op.get(
+                ByteSequence.from(key, StandardCharsets.UTF_8),
+                GetOption.DEFAULT));
+    }
+    
+    /**
+     * else do this transaction
+     * @param txn
+     * @param key
+     */
+    public Txn elseDo(Txn txn)
+    {
+        return txn.Else();
+    }
+
+    /**
+     * add put operation to the transaction
+     * @param txn
+     * @param key
+     * @param value
+     */
+    public Txn elsePut(Txn txn, String key, String value)
+    {
+        return txn.Else(Op.put(
+            ByteSequence.from(key, StandardCharsets.UTF_8),
+            ByteSequence.from(value, StandardCharsets.UTF_8),
+            PutOption.DEFAULT
+        ));
     }
 }
