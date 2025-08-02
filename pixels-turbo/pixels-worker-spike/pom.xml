@@ -62,7 +62,6 @@
         <dependency>
             <groupId>io.pixelsdb</groupId>
             <artifactId>spike-java-handler</artifactId>
-            <optional>true</optional>
         </dependency>
 
         <dependency>
