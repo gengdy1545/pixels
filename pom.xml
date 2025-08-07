@@ -65,6 +65,7 @@
         <module>pixels-index/pixels-index-rocksdb</module>
         <module>pixels-index/pixels-index-rockset</module>
         <module>pixels-index/pixels-index-main-sqlite</module>
+        <module>pixels-grpc</module>
     </modules>
 
     <properties>
