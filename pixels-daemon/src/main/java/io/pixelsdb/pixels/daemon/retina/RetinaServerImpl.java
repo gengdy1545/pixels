@@ -21,6 +21,7 @@ package io.pixelsdb.pixels.daemon.retina;
 
 import com.google.protobuf.ByteString;
 import io.grpc.stub.StreamObserver;
+import io.grpc.stub.StreamObservers;
 import io.pixelsdb.pixels.common.exception.MetadataException;
 import io.pixelsdb.pixels.common.exception.RetinaException;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
@@ -159,6 +160,13 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
                     .build());
             responseObserver.onCompleted();
         }
+    }
+
+    @Override
+    public StreamObserver<RetinaProto.UpdateRecordRequest> streamUpdateRecord(
+                        StreamObserver<RetinaProto.UpdateRecordResponse> responseObserver)
+    {
+
     }
 
     @Override
