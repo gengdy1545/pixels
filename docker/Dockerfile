@@ -68,29 +68,29 @@ RUN sed -i 's|http://mirrors.cloud.aliyuncs.com|http://mirrors.aliyun.com|g' /et
 && echo "node.id=ffffffff-ffff-ffff-ffff-ffffffffffff" >> /root/opt/trino-server/etc/node.properties \
 && echo "node.data-dir=/root/opt/data" >> /root/opt/trino-server/etc/node.properties \
 # JVM configuration
-&& echo "-server" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-Xmx16G" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:InitialRAMPercentage=80" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:MaxRAMPercentage=80" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:G1HeapRegionSize=32M" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:+ExplicitGCInvokesConcurrent" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:+ExitOnOutOfMemoryError" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:+HeapDumpOnOutOfMemoryError" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:-OmitStackTraceInFastThrow" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:ReservedCodeCacheSize=512M" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:PerMethodRecompilationCutoff=10000" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:PerBytecodeRecompilationCutoff=10000" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-Djdk.attach.allowAttachSelf=true" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-Djdk.nio.maxCachedBufferSize=2000000" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-Dfile.encoding=UTF-8" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "-XX:+EnableDynamicAgentLoading" >> /root/opt/trino-server/etc/jvm.config \
+&& echo "-server" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-Xmx16G" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:InitialRAMPercentage=80" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:MaxRAMPercentage=80" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:G1HeapRegionSize=32M" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:+ExplicitGCInvokesConcurrent" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:+ExitOnOutOfMemoryError" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:+HeapDumpOnOutOfMemoryError" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:-OmitStackTraceInFastThrow" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:ReservedCodeCacheSize=512M" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:PerMethodRecompilationCutoff=10000" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:PerBytecodeRecompilationCutoff=10000" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-Djdk.attach.allowAttachSelf=true" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-Djdk.nio.maxCachedBufferSize=2000000" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-Dfile.encoding=UTF-8" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "-XX:+EnableDynamicAgentLoading" >> /root/opt/trino-server/etc/jvm.grpcConfig \
 
 # Development environment configuration (modify for production)
-&& echo "coordinator=true" >> /root/opt/trino-server/etc/config.properties \
+&& echo "coordinator=true" >> /root/opt/trino-server/etc/grpcConfig.properties \
 # Set coordinator=false for worker nodes
-&& echo "node-scheduler.include-coordinator=true" >> /root/opt/trino-server/etc/config.properties \
-&& echo "http-server.http.port=8080" >> /root/opt/trino-server/etc/config.properties \
-&& echo "discovery.uri=http://localhost:8080" >> /root/opt/trino-server/etc/config.properties \
+&& echo "node-scheduler.include-coordinator=true" >> /root/opt/trino-server/etc/grpcConfig.properties \
+&& echo "http-server.http.port=8080" >> /root/opt/trino-server/etc/grpcConfig.properties \
+&& echo "discovery.uri=http://localhost:8080" >> /root/opt/trino-server/etc/grpcConfig.properties \
 
 # Log configuration
 && echo "io.trino=INFO" > /root/opt/trino-server/etc/log.properties \
@@ -114,8 +114,8 @@ RUN sed -i 's|http://mirrors.cloud.aliyuncs.com|http://mirrors.aliyun.com|g' /et
 && echo "listened.query.type=SELECT" >> /root/opt/trino-server/etc/event-listener.properties \
 && echo "log.dir=/root/opt/pixels/listener/" >> /root/opt/trino-server/etc/event-listener.properties \
 # Append JVM arguments
-&& echo "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED" >> /root/opt/trino-server/etc/jvm.config \
-&& echo "--add-opens=java.base/java.nio=ALL-UNNAMED" >> /root/opt/trino-server/etc/jvm.config \
+&& echo "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED" >> /root/opt/trino-server/etc/jvm.grpcConfig \
+&& echo "--add-opens=java.base/java.nio=ALL-UNNAMED" >> /root/opt/trino-server/etc/jvm.grpcConfig \
 
 # Configure MySQL
 && cd /root \

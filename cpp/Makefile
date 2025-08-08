@@ -53,8 +53,8 @@ clean:
 # Main build
 debug: deps
 	cmake $(GENERATOR) $(FORCE_COLOR) $(EXTENSION_FLAGS) ${CLIENT_FLAGS} -DEXTENSION_STATIC_BUILD=1 -DCMAKE_BUILD_TYPE=Debug ${BUILD_FLAGS} -S pixels-duckdb/duckdb -B build/debug && \
-	cmake --build build/debug --config Debug
+	cmake --build build/debug --grpcConfig Debug
 
 release: deps
 	cmake $(GENERATOR) $(FORCE_COLOR) $(EXTENSION_FLAGS) ${CLIENT_FLAGS} -DEXTENSION_STATIC_BUILD=1 -DCMAKE_BUILD_TYPE=Release ${BUILD_FLAGS} -S pixels-duckdb/duckdb -B build/release && \
-	cmake --build build/release --config Release
+	cmake --build build/release --grpcConfig Release

@@ -23,7 +23,7 @@ Otherwise, fully install Pixels, and ensure you can start it as a worker using:
 ```bash
 $PIXELS_HOME/bin/start-daemon.sh worker -daemon
 ```
-For Trino, set `coordinator=false` in `config.properties`, thus Trino will be started as a worker.
+For Trino, set `coordinator=false` in `grpcConfig.properties`, thus Trino will be started as a worker.
 
 Then, copy `termination-handler.sh` into `/root/` of this instance and give its `rwx` permissions to the root user.
 Set valid values for `pixels_asg_name` (`Pixels-ASG` in this document) and `pixels_aws_region`.

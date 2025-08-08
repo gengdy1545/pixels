@@ -6,7 +6,7 @@ RUN apt-get update &&  \
     build-essential \
     autoconf \
     libtool \
-    pkg-config \
+    pkg-grpcConfig \
     cmake \
     git \
     libssl-dev \

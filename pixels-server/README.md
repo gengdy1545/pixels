@@ -16,7 +16,7 @@ A simple web UI is also provided on http://localhost:18890.
 
 Optionally, you can use an external configuration file (i.e., `application.properties`) like this:
 ```bash
-java -jar --spring.config.location=file:///[path-to-application.properties] pixels-server-*.jar
+java -jar --spring.grpcConfig.location=file:///[path-to-application.properties] pixels-server-*.jar
 ```
 In the external `application.properties`, you can customize the configuration properties such  
 as the server addresses and ports.

@@ -21,7 +21,7 @@ set(BOOST_GIT_TAG boost-1.74.0)
 set(BOOST_GIT_SUBMODULES
         libs/headers libs/regex libs/program_options libs/algorithm
         # The primary dependencies for algorithm, program_options, and regex:
-        libs/any libs/bind libs/config libs/core libs/detail libs/function libs/iterator libs/lexical_cast
+        libs/any libs/bind libs/grpcConfig libs/core libs/detail libs/function libs/iterator libs/lexical_cast
         libs/smart_ptr libs/static_assert libs/throw_exception libs/tokenizer libs/type_traits libs/assert
         libs/concept_check libs/container_hash libs/integer libs/mpl libs/predef libs/preprocessor libs/conversion
         libs/function_types libs/fusion libs/optional libs/utility libs/move libs/typeof libs/tuple libs/io

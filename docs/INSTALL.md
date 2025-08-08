@@ -140,7 +140,7 @@ Put `pixels-cli-*-full.jar` into `PIXELS_HOME/sbin`
 Put the jdbc connector of MySQL into `PIXELS_HOME/lib`.
 Put `pixels-common/src/main/resources/pixels.properties` into `PIXELS_HOME/etc`.
 Modify `pixels.properties` to ensure that the URLs, ports, paths, usernames, and passwords are valid.
-Leave the other config parameters as default.
+Leave the other grpcConfig parameters as default.
 
 Set `cache.enabled` to `false` in `PIXELS_HOME/etc/pixels.properties` if you don't use pixels-cache.
 
@@ -210,7 +210,7 @@ Hadoop is optional. It is only needed if you want to use HDFS as the underlying 
 Pixels has been tested on Hadoop-2.7.3 and Hadoop-3.3.1.
 Follow the official documents to install Hadoop.
 
-Modify `hdfs.config.dir` in `PIXELS_HOME/etc/pixels.properties`
+Modify `hdfs.grpcConfig.dir` in `PIXELS_HOME/etc/pixels.properties`
 and point it to the `etc/hadoop` directory under the home of Hadoop.
 Pixels will read the Hadoop configuration files `core-site.xml` and `hdfs-site.xml` from this directory.
 
@@ -249,7 +249,7 @@ export NODE_EXPORTER_HOME=$HOME/opt/node_exporter
 export PATH=$PATH:$PROMETHEUS_HOME:$NODE_EXPORTER_HOME
 ```
 
-Enter the home of Trino-server. Append this line to `etc/jvm.config`:
+Enter the home of Trino-server. Append this line to `etc/jvm.grpcConfig`:
 ```bash
 -javaagent:/home/ubuntu/opt/jmx_exporter/jmx_prometheus_javaagent-0.18.0.jar=9101:/home/ubuntu/opt/jmx_exporter/pixels-jmx.yml
 ```
@@ -278,7 +278,7 @@ The essential services of Pixels, such as the metadata server, transaction manag
 
 To start Pixels in a cluster, edit `PIXELS_HOME/sbin/workers` and list all the worker nodes in this file.
 Each line in this file is in the following format:
-```config
+```grpcConfig
 hostname_of_the_worker pixels_home_of_the_worker
 ```
 `pixels_home_of_the_worker` is optional if the worker has the same `PIXELS_HOME` as the coordinator node where you run
@@ -286,7 +286,7 @@ hostname_of_the_worker pixels_home_of_the_worker
 
 You can also start Pixels coordinator and workers separately using `PIXELS_HOME/start-coordinator` and `PIXELS_HOME/start-workers.sh`.
 
-> Note: You can also add JVM OPTS for Pixels daemons in `PIXELS_HOME/bin/coordinator-jvm.config` and `PIXELS_HOME/bin/worker-jvm.config`. 
+> Note: You can also add JVM OPTS for Pixels daemons in `PIXELS_HOME/bin/coordinator-jvm.grpcConfig` and `PIXELS_HOME/bin/worker-jvm.grpcConfig`. 
 > This is useful for profiling and remote debugging.
 
 After starting Pixels, enter the home of trino-server and start Trino:

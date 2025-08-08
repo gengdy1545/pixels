@@ -71,7 +71,7 @@ They have to be converted to other types and claimed as `logicalType` in avsc fi
 `Pixels-amphi` provides different strategies to generate the column-level cache plan for the worker.
 Given the metadata of the database and workload, the algorithm will decide which columns to cache in the local storage.
 
-First, we need a configuration file to specify the relevant information. We provide the example for the benchmarks: [TPC-H](../cpp/pixels-amphi-worker/benchmark/config/tpch.yaml):
+First, we need a configuration file to specify the relevant information. We provide the example for the benchmarks: [TPC-H](../cpp/pixels-amphi-worker/benchmark/grpcConfig/tpch.yaml):
 
 ```yaml
 ## Experiment level settings
@@ -120,7 +120,7 @@ The later two strategies, `most_coverage_columns` and `cost_optimal_columns`, ar
 
 To run the script, simply execute the following command:
 ```bash
-python cache_algorithm.py --config <config_file_path>
+python cache_algorithm.py --grpcConfig <config_file_path>
 ```
 where the `config_file_path` is the path to the configuration file (see [Experiment configuration](#2-experiment-configuration)).
 
@@ -130,12 +130,12 @@ Based on the generated cache plan, the worker will download the partial data fro
 
 After building the pixels project with `mvn clean install`, you will find `pixels-amphi-*.jar` in the target folder
 of [`pixels-amphi`](./pixels-amphi). It accepts the configuration file as the command parameter.
-Refer to the [example](./pixels-amphi/src/test/resources/config/tpch.json) in the test folder.
+Refer to the [example](./pixels-amphi/src/test/resources/grpcConfig/tpch.json) in the test folder.
 The `SchemaData` field comes from the cache plan generated in the previous step.
 
 To start the download process, simply run the following command:
 ```bash
-java -jar pixels-amphi-*.jar --config <config_file_path>
+java -jar pixels-amphi-*.jar --grpcConfig <config_file_path>
 ```
 
 Please note that depended on the network bandwidth, the download process may take a while. To quickly test the system, you can also directly download the full dataset and skip this step. The system will still work as if only the cached columns are stored in the local storage.
@@ -151,4 +151,4 @@ We have add the executable to run the benchmark task ([benchmark source code](..
 ```bash
 ./benchmark <worker_config_path> <experiment_config_path>
 ```
-where the `worker_config_path` is the path to the [amphi worker configuration file](../cpp/pixels-amphi-worker/config.yaml), and `experiment_config_path` is the configuration mentioned in [Experiment configuration](#2-experiment-configuration). The results of the task will be logged in the `cpp/pixels-amphi-worker/benchmark/results` folder.
+where the `worker_config_path` is the path to the [amphi worker configuration file](../cpp/pixels-amphi-worker/grpcConfig.yaml), and `experiment_config_path` is the configuration mentioned in [Experiment configuration](#2-experiment-configuration). The results of the task will be logged in the `cpp/pixels-amphi-worker/benchmark/results` folder.

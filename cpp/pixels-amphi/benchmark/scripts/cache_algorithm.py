@@ -308,18 +308,18 @@ def cache_cost_optimal_columns(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Read YAML config file.")
-    parser.add_argument("--config", type=str, help="Path to the config file.")
+    parser = argparse.ArgumentParser(description="Read YAML grpcConfig file.")
+    parser.add_argument("--grpcConfig", type=str, help="Path to the grpcConfig file.")
     args = parser.parse_args()
 
     # Load the configuration file
-    config = read_yaml_config(args.config)
-    benchmark_path = config["benchmark_path"]
-    schema_path = benchmark_path + config["schema_path"]
-    table_stat_path = benchmark_path + config["table_stat_path"]
-    workload_path = benchmark_path + config["workload_path"]
-    cache_plan_path = benchmark_path + config["cache_plan_path"]
-    workload_cost_path = benchmark_path + config["workload_cost_path"]
+    grpcConfig = read_yaml_config(args.grpcConfig)
+    benchmark_path = grpcConfig["benchmark_path"]
+    schema_path = benchmark_path + grpcConfig["schema_path"]
+    table_stat_path = benchmark_path + grpcConfig["table_stat_path"]
+    workload_path = benchmark_path + grpcConfig["workload_path"]
+    cache_plan_path = benchmark_path + grpcConfig["cache_plan_path"]
+    workload_cost_path = benchmark_path + grpcConfig["workload_cost_path"]
 
     # Load the schema (table name: List[column name])
     with open(schema_path) as f:
@@ -341,8 +341,8 @@ if __name__ == "__main__":
         workload_cost = list(json.load(f).values())[0]
 
     # Load the strategy and storage restriction
-    strategy = config["strategy"]
-    storage_restriction = (int)(config["storage_restriction"])
+    strategy = grpcConfig["strategy"]
+    storage_restriction = (int)(grpcConfig["storage_restriction"])
 
     # Print the total size
     print("The total size of the columns: ", sum(col_size))

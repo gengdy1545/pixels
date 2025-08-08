@@ -23,8 +23,8 @@ cmake .. \
 -DENABLE_TESTING=OFF \
 -DBUILD_SHARED_LIBS=ON \
 -DCMAKE_INSTALL_PREFIX=/usr/local
-cmake --build . --config=Release
-sudo cmake --install . --config=Release
+cmake --build . --grpcConfig=Release
+sudo cmake --install . --grpcConfig=Release
 ```
 
 2. Enter the cpp source directory of pixels-index-rockset, 

@@ -70,7 +70,7 @@ It can be used as an example to implement the auto-scaling manager for other clo
 In `etc/catalog/pixels.properties` under the installation directory of Trino, set `cloud.function.switch` to `auto` if you have installed the auto-scaling manager and 
 want to enable auto-scaling of MPP cluster and adaptive invocation of serverless workers; or set it to `on` if you want to always push the queries into serverless workers.
 ```properties
-# serverless config
+# serverless grpcConfig
 # it can be on, off, auto
 cloud.function.switch=auto
 local.scan.concurrency=0
