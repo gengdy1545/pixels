@@ -142,23 +142,27 @@ public class PixelsPlanner
 
     public Operator getRootOperator() throws IOException, MetadataException
     {
+        Operator rootOperator;
         if (this.rootTable.getTableType() == Table.TableType.BASE)
         {
-            return this.getScanOperator((BaseTable) this.rootTable);
+            rootOperator = this.getScanOperator((BaseTable) this.rootTable);
         }
         else if (this.rootTable.getTableType() == Table.TableType.JOINED)
         {
-            return this.getJoinOperator((JoinedTable) this.rootTable, Optional.empty());
+            rootOperator = this.getJoinOperator((JoinedTable) this.rootTable, Optional.empty());
         }
         else if (this.rootTable.getTableType() == Table.TableType.AGGREGATED)
         {
-            return this.getAggregationOperator((AggregatedTable) this.rootTable);
+            rootOperator = this.getAggregationOperator((AggregatedTable) this.rootTable);
         }
         else
         {
             throw new UnsupportedOperationException("root table type '" +
                     this.rootTable.getTableType() + "' is currently not supported");
         }
+
+        estimateRequiredResource(rootOperator);
+        return rootOperator;
     }
 
     public double getScanSize()
@@ -1935,5 +1939,53 @@ public class PixelsPlanner
         index = new InvertedProjectionsIndex(columnOrder, ProjectionPattern.buildPatterns(columnOrder, projections));
         IndexFactory.Instance().cacheProjectionsIndex(schemaTableName, index);
         return index;
+    }
+
+    /**
+     * estimate cpu and memory requirements for operator
+     * @param operator
+     */
+    private void estimateRequiredResource(Operator operator)
+    {
+        if (operator == null)
+        {
+            return;
+        }
+
+        if (operator instanceof ScanOperator)
+        {
+            estimateScanOperatorResource((ScanOperator) operator);
+        } else if (operator instanceof AggregationOperator)
+        {
+            estimateAggregationOperatorResource((AggregationOperator) operator);
+        } else if (operator instanceof JoinOperator)
+        {
+            estimateJoinOperatorResource((JoinOperator) operator);
+        } else
+        {
+            throw new UnsupportedOperationException("operator '" +
+                    operator.getName() + "' is currently not supported");
+        }
+    }
+
+    private void estimateScanOperatorResource(ScanOperator scanOperator)
+    {
+        List<ScanInput> scanInputs = scanOperator.getScanInputs();
+        if (scanInputs == null || scanInputs.isEmpty())
+        {
+            return;
+        }
+
+        
+    }
+
+    private void estimateAggregationOperatorResource(AggregationOperator aggregationOperator)
+    {
+
+    }
+
+    private void estimateJoinOperatorResource(JoinOperator joinOperator)
+    {
+
     }
 }
