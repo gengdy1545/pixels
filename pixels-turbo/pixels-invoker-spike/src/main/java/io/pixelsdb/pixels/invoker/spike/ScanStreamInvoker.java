@@ -44,8 +44,6 @@ public class ScanStreamInvoker extends SpikeInvoker
     @Override
     public CompletableFuture<Output> invoke(Input input)
     {
-        ScanInput scanInput = (ScanInput) input;
-        scanInput.setRequiredCpu(scanInput.getTableInfo().getInputSplits().size());
-        return super.invoke(scanInput);
+        return super.invoke((ScanInput) input);
     }
 }

@@ -145,7 +145,7 @@ public class PixelsPlanner
         Operator rootOperator;
         if (this.rootTable.getTableType() == Table.TableType.BASE)
         {
-            rootOperator = this.getScanOperator((BaseTable) this.rootTable);
+            return this.getScanOperator((BaseTable) this.rootTable);
         }
         else if (this.rootTable.getTableType() == Table.TableType.JOINED)
         {
@@ -210,6 +210,34 @@ public class PixelsPlanner
             scanInput.setPartialAggregationInfo(null);
             String folderName = intermediateBase + (outputId++) + "/";
             scanInput.setOutput(new OutputInfo(folderName, IntermediateStorageInfo, true));
+
+            /**
+             * Estimate required cpu and memory resource
+             */
+            double requiredMemory = 0;
+            int readSplitSize = tableInfo.getInputSplits().size();
+            double readRatio = readSplitSize / ((double) inputSplits.size());
+            List<Column> columns = metadataService.getColumns(scanTable.getSchemaName(),
+                    scanTable.getTableName(), true);
+            Map<String, Column> nameToColumnMap = new HashMap<>(columns.size());
+            for (Column column : columns)
+            {
+                nameToColumnMap.put(column.getName(), column);
+            }
+            for (String columnName : scanTable.getColumnNames())
+            {
+                requiredMemory += readRatio * nameToColumnMap.get(columnName).getSize();
+            }
+            requiredMemory = requiredMemory / 1024 / 1024; // convert to MB
+            // Count the files involved and estimate the fileTail size of each ordered file at 50MB
+            requiredMemory += 50 * tableInfo.getInputSplits().stream()
+                    .flatMap(split -> split.getInputInfos().stream())
+                    .map(InputInfo::getPath)
+                    .distinct()
+                    .count();
+            scanInput.setRequiredMemory((int) (requiredMemory));
+            scanInput.setRequiredCpu(readSplitSize * 1024); // 1 vCPU per read split
+
             scanInputsBuilder.add(scanInput);
         }
         return EnabledExchangeMethod == ExchangeMethod.batch ?
@@ -1952,10 +1980,7 @@ public class PixelsPlanner
             return;
         }
 
-        if (operator instanceof ScanOperator)
-        {
-            estimateScanOperatorResource((ScanOperator) operator);
-        } else if (operator instanceof AggregationOperator)
+        if (operator instanceof AggregationOperator)
         {
             estimateAggregationOperatorResource((AggregationOperator) operator);
         } else if (operator instanceof JoinOperator)
@@ -1968,24 +1993,34 @@ public class PixelsPlanner
         }
     }
 
-    private void estimateScanOperatorResource(ScanOperator scanOperator)
-    {
-        List<ScanInput> scanInputs = scanOperator.getScanInputs();
-        if (scanInputs == null || scanInputs.isEmpty())
-        {
-            return;
-        }
-
-        
-    }
+//    /**
+//     * Estimate the resource requirements for a scan operator.
+//     * @param scanTable
+//     * @param scanInput
+//     * @param totalSplitSize
+//     */
+//    private void estimateScanOperatorResource(BaseTable scanTable, ScanInput scanInput, int totalSplitSize)
+//    {
+//        double requiredMemory = 0;
+//        int readSplitSize = scanInput.getTableInfo().getInputSplits().size();
+//        double readRatio = readSplitSize / (double) totalSplitSize;
+//
+//    }
 
     private void estimateAggregationOperatorResource(AggregationOperator aggregationOperator)
     {
+        List<ScanInput> scanInputs = aggregationOperator.getScanInputs();
+        List<AggregationInput> aggregationInputs = aggregationOperator.getFinalAggrInputs();
 
     }
 
     private void estimateJoinOperatorResource(JoinOperator joinOperator)
     {
+        List<JoinInput> joinInputs = joinOperator.getJoinInputs();
+        if (joinInputs == null || joinInputs.isEmpty())
+        {
+            return;
+        }
 
     }
 }
