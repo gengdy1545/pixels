@@ -28,8 +28,6 @@ import io.pixelsdb.pixels.planner.plan.physical.output.JoinOutput;
 
 import java.util.concurrent.CompletableFuture;
 
-import static com.google.common.base.Preconditions.checkArgument;
-
 public class PartitionedChainJoinInvoker extends SpikeInvoker
 {
     protected PartitionedChainJoinInvoker(String functionName)
@@ -46,12 +44,6 @@ public class PartitionedChainJoinInvoker extends SpikeInvoker
     @Override
     public CompletableFuture<Output> invoke(Input input)
     {
-        PartitionedChainJoinInput partitionedChainJoinInput = (PartitionedChainJoinInput) input;
-        int leftParallelism = partitionedChainJoinInput.getSmallTable().getParallelism();
-        checkArgument(leftParallelism > 0, "leftParallelism is not positive");
-        int rightParallelism = partitionedChainJoinInput.getLargeTable().getParallelism();
-        checkArgument(rightParallelism > 0, "rightParallelism is not positive");
-        partitionedChainJoinInput.setRequiredCpu(Math.max(leftParallelism, rightParallelism) * 1024);
-        return super.invoke(partitionedChainJoinInput);
+        return super.invoke((PartitionedChainJoinInput)input);
     }
 }

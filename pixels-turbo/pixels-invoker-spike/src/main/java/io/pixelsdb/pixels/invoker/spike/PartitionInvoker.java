@@ -44,8 +44,6 @@ public class PartitionInvoker extends SpikeInvoker
     @Override
     public CompletableFuture<Output> invoke(Input input)
     {
-        PartitionInput partitionInput = (PartitionInput) input;
-        partitionInput.setRequiredCpu(partitionInput.getTableInfo().getInputSplits().size() * 1024);
-        return super.invoke(partitionInput);
+        return super.invoke((PartitionInput)input);
     }
 }

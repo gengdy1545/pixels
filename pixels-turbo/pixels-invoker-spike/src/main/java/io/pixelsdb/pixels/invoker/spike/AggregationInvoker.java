@@ -23,14 +23,10 @@ import com.alibaba.fastjson.JSON;
 import io.pixelsdb.pixels.common.turbo.Input;
 import io.pixelsdb.pixels.common.turbo.Output;
 import io.pixelsdb.pixels.common.turbo.WorkerType;
-import io.pixelsdb.pixels.planner.plan.physical.domain.AggregatedTableInfo;
 import io.pixelsdb.pixels.planner.plan.physical.input.AggregationInput;
 import io.pixelsdb.pixels.planner.plan.physical.output.AggregationOutput;
 
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
-
-import static java.util.Objects.requireNonNull;
 
 public class AggregationInvoker extends SpikeInvoker
 {
@@ -49,12 +45,6 @@ public class AggregationInvoker extends SpikeInvoker
     @Override
     public CompletableFuture<Output> invoke(Input input)
     {
-        AggregationInput aggregationInput = (AggregationInput) input;
-        AggregatedTableInfo aggregatedTableInfo = requireNonNull(aggregationInput.getAggregatedTableInfo(),
-                "event.aggregatedTableInfo is null");
-        List<String> inputFiles = requireNonNull(aggregatedTableInfo.getInputFiles(),
-                "aggregatedTableInfo.inputFiles is null");
-        aggregationInput.setRequiredCpu(inputFiles.size() * 1024);
-        return super.invoke(aggregationInput);
+        return super.invoke((AggregationInput)input);
     }
 }
