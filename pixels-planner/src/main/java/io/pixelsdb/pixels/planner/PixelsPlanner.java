@@ -290,6 +290,7 @@ public class PixelsPlanner
                 scanInput.setPartialAggregationInfo(partialAggregationInfo);
                 String fileName = intermediateBase + (outputId++) + "/partial_aggr";
                 scanInput.setOutput(new OutputInfo(fileName, IntermediateStorageInfo, true));
+                // TODO: estimate cpu and memory resource required for scan operator.
                 scanInputsBuilder.add(scanInput);
                 aggrInputFilesBuilder.add(fileName);
             }
@@ -359,6 +360,7 @@ public class PixelsPlanner
             finalAggrInput.setAggregationInfo(aggregationInfo);
             String fileName = intermediateBase + (hash) + "/final_aggr";
             finalAggrInput.setOutput(new OutputInfo(fileName, IntermediateStorageInfo, true));
+            // TODO: estimate cpu and memory resource required for final aggregation operator.
             finalAggrInputsBuilder.add(finalAggrInput);
         }
 
@@ -462,7 +464,7 @@ public class PixelsPlanner
                                 .setLargeTable(rightTableInfo)
                                 .setJoinInfo(joinInfo)
                                 .setOutput(output).build();
-
+                        // TODO: estimate cpu and memory resource required for the join input.
                         joinInputs.add(complete);
                     }
 
@@ -506,6 +508,7 @@ public class PixelsPlanner
                         chainJoinInput.setLargeTable(rightJoinInput.getLargeTable());
                         chainJoinInput.setChainTables(chainTables);
                         chainJoinInput.setChainJoinInfos(chainJoinInfos);
+                        // TODO: estimate cpu and memory resource required for the join input.
                         joinInputs.add(chainJoinInput);
                     }
 
@@ -678,6 +681,7 @@ public class PixelsPlanner
                 List<ChainJoinInfo> chainJoinInfos = new ArrayList<>();
                 chainJoinInfos.add(chainJoinInfo);
                 broadcastChainJoinInput.setChainJoinInfos(chainJoinInfos);
+                // TODO: estimate cpu and memory resource required for the join input.
 
                 return EnabledExchangeMethod == ExchangeMethod.batch ?
                         new SingleStageJoinBatchOperator(joinedTable.getTableName(), false,
@@ -789,7 +793,7 @@ public class PixelsPlanner
                                 .setLargeTable(rightTableInfo)
                                 .setJoinInfo(joinInfo)
                                 .setOutput(output).build();
-
+                        // TODO: estimate cpu and memory resource required for the join input.
                         joinInputs.add(complete);
                     }
 
@@ -903,7 +907,7 @@ public class PixelsPlanner
                     BroadcastJoinInput joinInput = new BroadcastJoinInput(
                             transId, timestamp, leftTableInfo, rightTableInfo, joinInfo,
                             false, null, output);
-
+                    // TODO: estimate cpu and memory resource required for the join input.
                     joinInputs.add(joinInput);
                 }
             }
@@ -951,7 +955,7 @@ public class PixelsPlanner
                     BroadcastJoinInput joinInput = new BroadcastJoinInput(
                             transId, timestamp, rightTableInfo, leftTableInfo, joinInfo,
                             false, null, output);
-
+                    // TODO: estimate cpu and memory resource required for the join input.
                     joinInputs.add(joinInput);
                 }
             }
@@ -1454,6 +1458,7 @@ public class PixelsPlanner
             }
             int[] newKeyColumnIds = rewriteColumnIdsForPartitionedJoin(keyColumnIds, partitionProjection);
             partitionInput.setPartitionInfo(new PartitionInfo(newKeyColumnIds, numPartition));
+            // TODO: estimate the cpu and memory resource required for the partition input.
             partitionInputsBuilder.add(partitionInput);
         }
 
@@ -1500,6 +1505,7 @@ public class PixelsPlanner
             int[] newKeyColumnIds = rewriteColumnIdsForPartitionedJoin(keyColumnIds, partitionProjection); // todo: Rename this function
             sortInput.setKeyColumnIds(newKeyColumnIds);
             sortInput.setSorted(true);
+            // TODO: estimate the cpu and memory resource required for the partition input.
             sortInputsBuilder.add(sortInput);
         }
         return sortInputsBuilder.build();
@@ -1584,7 +1590,7 @@ public class PixelsPlanner
                 joinInput = new PartitionedJoinInput(transId, timestamp, rightTableInfo, leftTableInfo, joinInfo,
                         false, null, output);
             }
-
+            // TODO: estimate the cpu and memory resource required for the join input.
             joinInputs.add(joinInput);
         }
         return joinInputs.build();
@@ -1657,6 +1663,7 @@ public class PixelsPlanner
                 joinInput = new SortedJoinInput(transId, timestamp, rightTableInfo, leftTableInfo, joinInfo,
                         false, null, output);
             }
+            // TODO: estimate the cpu and memory resource required for the join input.
             joinInputs.add(joinInput);
         }
         return joinInputs.build();
