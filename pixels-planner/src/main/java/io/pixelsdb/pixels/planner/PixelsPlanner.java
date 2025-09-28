@@ -177,6 +177,7 @@ public class PixelsPlanner
                 scanTable.getSchemaName() + "/" + scanTable.getTableName() + "/";
         ImmutableList.Builder<ScanInput> scanInputsBuilder = ImmutableList.builder();
         List<InputSplit> inputSplits = this.getInputSplits(scanTable);
+        List<Column> columns = metadataService.getColumns(scanTable.getSchemaName(), scanTable.getTableName(), true);
         int outputId = 0;
         boolean[] scanProjection = new boolean[scanTable.getColumnNames().length];
         Arrays.fill(scanProjection, true);
@@ -194,7 +195,8 @@ public class PixelsPlanner
                 // We assign a number of IntraWorkerParallelism input-splits to each partition worker.
                 inputsBuilder.add(inputSplits.get(i));
             }
-            tableInfo.setInputSplits(inputsBuilder.build());
+            ImmutableList<InputSplit> currentInputSplits = inputsBuilder.build();
+            tableInfo.setInputSplits(currentInputSplits);
             tableInfo.setColumnsToRead(scanTable.getColumnNames());
             tableInfo.setTableName(scanTable.getTableName());
             tableInfo.setFilter(JSON.toJSONString(scanTable.getFilter()));
@@ -206,6 +208,22 @@ public class PixelsPlanner
             scanInput.setPartialAggregationInfo(null);
             String folderName = intermediateBase + (outputId++) + "/";
             scanInput.setOutput(new OutputInfo(folderName, IntermediateStorageInfo, true));
+
+            // Estimate cpu and memory resource required for scan operator.
+            long requiredMemory = 0;
+            double scanRatio = currentInputSplits.size() * 1.0 / inputSplits.size();
+            Map<String, Column> nameToColumnMap = new HashMap<>(columns.size());
+            for (Column column : columns)
+            {
+                nameToColumnMap.put(column.getName(), column);
+            }
+            for (String columnName : scanTable.getColumnNames())
+            {
+                requiredMemory += (nameToColumnMap.get(columnName).getSize() * scanRatio);
+            }
+            scanInput.setRequiredMemory((int) requiredMemory);
+            scanInput.setRequiredCpu(currentInputSplits.size() * 1024);
+
             scanInputsBuilder.add(scanInput);
         }
         return EnabledExchangeMethod == ExchangeMethod.batch ?
