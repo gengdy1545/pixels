@@ -203,6 +203,17 @@ public class TestRocksDBPerf
             for (byte[] name : existingCfNames)
             {
                 cfDescriptors.add(new ColumnFamilyDescriptor(name, new ColumnFamilyOptions()));
+
+                if (config.tsType.equals("embed_desc"))
+                {
+                    BlockBasedTableConfig tableConfig = new BlockBasedTableConfig();
+                    tableConfig.setFilterPolicy(new BloomFilter(10, false));
+                    tableConfig.setWholeKeyFiltering(false);
+                    ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
+                    cfOptions.setTableFormatConfig(tableConfig);
+                    cfOptions.useFixedLengthPrefixExtractor(8);
+                    cfDescriptors.add(new ColumnFamilyDescriptor(name, cfOptions));
+                }
             }
 
             dbOptions = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
