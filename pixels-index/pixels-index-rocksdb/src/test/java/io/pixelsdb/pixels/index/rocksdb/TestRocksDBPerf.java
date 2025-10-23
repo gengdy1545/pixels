@@ -383,6 +383,7 @@ public class TestRocksDBPerf
                     // C++ 对应: seek(Key(ID + Key + MAX-T_query))
 
                     byte[] targetKey = RocksDBUtil.encodeKey(config, indexId, key, tQuery);
+                    ropt.setPrefixSameAsStart(true);
                     it.seek(targetKey);
                 }
 
