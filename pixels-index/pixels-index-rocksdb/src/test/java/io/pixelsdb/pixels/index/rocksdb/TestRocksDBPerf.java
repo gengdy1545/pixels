@@ -64,7 +64,7 @@ public class TestRocksDBPerf
         public final int idRange;
         public final TsType tsType;
 
-        private static final String DB_PATH_PREFIX = "/home/ubuntu/disk1/rocksdb";
+        private static final String DB_PATH_PREFIX = "/data/9a3-01/rocksdb";
 
         public Config(Preset preset)
         {
@@ -204,7 +204,7 @@ public class TestRocksDBPerf
             {
                 cfDescriptors.add(new ColumnFamilyDescriptor(name, new ColumnFamilyOptions()));
 
-                if (config.tsType.equals("embed_desc"))
+                if (config.tsType == TsType.EMBED_DESC)
                 {
                     BlockBasedTableConfig tableConfig = new BlockBasedTableConfig();
                     tableConfig.setFilterPolicy(new BloomFilter(10, false));
@@ -213,6 +213,7 @@ public class TestRocksDBPerf
                     cfOptions.setTableFormatConfig(tableConfig);
                     cfOptions.useFixedLengthPrefixExtractor(8);
                     cfDescriptors.add(new ColumnFamilyDescriptor(name, cfOptions));
+                    System.out.println("Using EMBED_DESC options for column family.");
                 }
             }
 
