@@ -62,7 +62,7 @@ public class TestRocksDBPerf
         public final int idRange;
         public final TsType tsType;
 
-        private static final String DB_PATH_PREFIX = "/home/disk1";
+        private static final String DB_PATH_PREFIX = "/home/ubuntu/disk1";
 
         public Config(Preset preset)
         {
