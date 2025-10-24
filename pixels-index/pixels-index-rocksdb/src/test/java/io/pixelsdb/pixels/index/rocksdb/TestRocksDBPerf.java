@@ -157,6 +157,44 @@ public class TestRocksDBPerf
         }
     }
 
+    private void fillSequentialData() throws Exception
+    {
+        final long timestamp = 0; // 对应 C++ 中的 long long timestamp = 0;
+        final ColumnFamilyHandle cfh = handles.get(0);
+
+        System.out.println("Start sequential data load: " + config.idRange + " entries per thread * " + config.threadNum + " threads");
+
+        List<Thread> threads = new ArrayList<>();
+        AtomicLong counter = new AtomicLong(0);
+
+        for (int t = 0; t < config.threadNum; ++t) {
+            final int threadId = t;
+            threads.add(new Thread(() -> {
+                try (WriteOptions wopt = new WriteOptions()) {
+                    for (int key = 0; key < config.idRange; ++key) {
+                        byte[] k = RocksDBUtil.encodeKey(config, threadId, key, timestamp);
+                        byte[] v = RocksDBUtil.encodeValue(key); // C++: encodeValue(key)
+
+                        // 由于 Java 代码只测试 EMBED_ASC/DESC，直接 put key/value 即可
+                        db.put(cfh, wopt, k, v);
+                        counter.incrementAndGet();
+                    }
+                } catch (RocksDBException e) {
+                    System.err.println("Load thread " + threadId + " failed: " + e.getMessage());
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+
+        long start = System.currentTimeMillis();
+        for (Thread t : threads) t.start();
+        for (Thread t : threads) t.join();
+        long end = System.currentTimeMillis();
+
+        System.out.printf("Total loaded: %d entries, time: %.2fs%n",
+                counter.get(), (end - start) / 1000.0);
+    }
+
     private RocksDB setupDb(Config config) throws RocksDBException
     {
         this.config = config;
@@ -255,6 +293,9 @@ public class TestRocksDBPerf
     void testMultiThreadPerf(Preset preset) throws Exception {
         System.out.println("\n--- Starting MultiThreadPerf " + preset + " ---");
         db = setupDb(new Config(preset));
+
+        fillSequentialData();
+        System.out.println("Data loading complete. Starting update test.");
 
         System.err.println("Start update test");
         AtomicLong totalOps = new AtomicLong(0);
