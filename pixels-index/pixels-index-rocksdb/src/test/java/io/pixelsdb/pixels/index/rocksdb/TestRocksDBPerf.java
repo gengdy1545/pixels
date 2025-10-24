@@ -280,6 +280,7 @@ public class TestRocksDBPerf
             for (byte[] name : existingCfNames)
             {
                 ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
+                cfOptions.setWriteBufferSize(6 * 1024 * 1024 * 1024); // 6 GB
                 if (config.tsType == TsType.EMBED_DESC)
                 {
                     BlockBasedTableConfig tableConfig = new BlockBasedTableConfig();
