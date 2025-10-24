@@ -62,7 +62,7 @@ public class TestRocksDBPerf
         public final int idRange;
         public final TsType tsType;
 
-        private static final String DB_PATH_PREFIX = "/home/ubuntu/disk1";
+        private static final String DB_PATH_PREFIX = "/data/9a3-01/rocksdb";
 
         public Config(Preset preset)
         {
@@ -195,18 +195,18 @@ public class TestRocksDBPerf
 
             for (byte[] name : existingCfNames)
             {
-                cfDescriptors.add(new ColumnFamilyDescriptor(name, new ColumnFamilyOptions()));
+                ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
 
                 if (config.tsType == TsType.EMBED_DESC)
                 {
                     BlockBasedTableConfig tableConfig = new BlockBasedTableConfig();
                     tableConfig.setFilterPolicy(new BloomFilter(10, false));
                     tableConfig.setWholeKeyFiltering(false);
-                    ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
                     cfOptions.setTableFormatConfig(tableConfig);
                     cfOptions.useFixedLengthPrefixExtractor(8);
-                    cfDescriptors.add(new ColumnFamilyDescriptor(name, cfOptions));
                 }
+
+                cfDescriptors.add(new ColumnFamilyDescriptor(name, cfOptions));
             }
 
             dbOptions = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
