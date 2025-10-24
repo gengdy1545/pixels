@@ -50,8 +50,6 @@ public class TestRocksDBPerf
     {
         Asc10m,
         Desc10m,
-        Asc1k,
-        Desc1k
     }
 
     public static class Config
@@ -89,17 +87,12 @@ public class TestRocksDBPerf
         {
             Objects.requireNonNull(preset);
             final int scale10m = 10000000;
-            final int scale1k = 1000;
             switch (preset)
             {
                 case Asc10m:
                     return new ScaleTypePair(scale10m, TsType.EMBED_ASC);
                 case Desc10m:
                     return new ScaleTypePair(scale10m, TsType.EMBED_DESC);
-                case Asc1k:
-                    return new ScaleTypePair(scale1k, TsType.EMBED_ASC);
-                case Desc1k:
-                    return new ScaleTypePair(scale1k, TsType.EMBED_DESC);
                 default:
                     throw new IllegalArgumentException("Unknown preset: " + preset);
             }
