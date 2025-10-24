@@ -62,7 +62,7 @@ public class TestRocksDBPerf
         public final int idRange;
         public final TsType tsType;
 
-        private static final String DB_PATH_PREFIX = "/home/ubuntu/disk1/rocksdb";
+        private static final String DB_PATH_PREFIX = "/data/9a3-01/rocksdb";
 
         public Config(Preset preset)
         {
@@ -248,43 +248,6 @@ public class TestRocksDBPerf
             handles.clear();
             handles = null;
         }
-    }
-
-    @ParameterizedTest(name = "SequentialLoad_{0}")
-    @EnumSource(Preset.class)
-    void testSequentialLoad(Preset preset) throws Exception
-    {
-        System.out.println("\n--- Starting SequentialLoad " + preset + " ---");
-        db = setupDb(new Config(preset));
-        fillSequentialData();
-    }
-
-    private void fillSequentialData() throws InterruptedException {
-        List<Thread> threads = new ArrayList<>();
-        AtomicLong counter = new AtomicLong(0);
-        ColumnFamilyHandle cfh = handles.get(0);
-
-        for (int t = 0; t < config.threadNum; ++t) {
-            final int threadId = t;
-            threads.add(new Thread(() -> {
-                try (WriteOptions wopt = new WriteOptions()) {
-                    long timestamp = 0; // 加载数据时的固定时间戳
-                    for (int key = 0; key < config.idRange; ++key) {
-                        byte[] k = RocksDBUtil.encodeKey(config, threadId, key, timestamp);
-                        byte[] v = RocksDBUtil.encodeValue(key);
-                        db.put(cfh, wopt, k, v);
-                        counter.incrementAndGet();
-                    }
-                } catch (RocksDBException e) {
-                    System.err.println("RocksDB Put failed in thread " + threadId + ": " + e.getMessage());
-                }
-            }));
-        }
-
-        for (Thread th : threads) th.start();
-        for (Thread th : threads) th.join();
-
-        System.out.println("Total loaded: " + counter.get() + " entries");
     }
 
     @ParameterizedTest(name = "MultiThreadPerf_{0}")
