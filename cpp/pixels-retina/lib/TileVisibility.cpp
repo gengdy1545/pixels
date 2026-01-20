@@ -24,7 +24,9 @@
 #include <cstring>
 #include <stdexcept>
 
+#ifdef RETINA_SIMD
 #include <immintrin.h>
+#endif
 
 TileVisibility::TileVisibility() {
     VersionedData* initialVersion = new VersionedData();
@@ -137,10 +139,10 @@ void TileVisibility::deleteTileRecord(uint8_t rowId, uint64_t ts) {
     }
 }
 
-
-inline void process_bitmap_block_256(const DeleteIndexBlock *blk,
+#ifdef RETINA_SIMD
+inline bool process_bitmap_block_256(const DeleteIndexBlock *blk,
                                      uint32_t offset,
-                                     uint64_t outBitmap[4],
+                                     uint64_t deltaBitmap[4],
                                      const __m256i &vThrFlip,
                                      const __m256i &tsMask,
                                      const __m256i &signBit) {
@@ -155,30 +157,31 @@ inline void process_bitmap_block_256(const DeleteIndexBlock *blk,
 
     uint8_t mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp));
 
-    if (!mask)
-        return;
+    if (!mask) {
+        return false;
+    }
 
     __m256i vRow = _mm256_srli_epi64(vItems, 56); // extract rowid
-    alignas(32) uint64_t rowTmp[8];
+    alignas(32) uint64_t rowTmp[4];
     _mm256_storeu_si256((__m256i *)rowTmp, vRow);
     for (int i = 0; i < 4; i++) {
         if (mask & (1 << i)) {
             auto rowId = static_cast<uint8_t>(rowTmp[i]);
-            SET_BITMAP_BIT(outBitmap, rowId);
+            SET_BITMAP_BIT(deltaBitmap, rowId);
         }
     }
+    return mask == 0xF;
 }
+#endif
 
 void TileVisibility::getTileVisibilityBitmap(uint64_t ts, uint64_t outBitmap[4]) const {
-    // Enter epoch protection
     EpochGuard guard;
-    
-    // Load current version under epoch protection
     VersionedData* ver = currentVersion.load(std::memory_order_acquire);
     
     if (ts < ver->baseTimestamp) {
         throw std::runtime_error("need to read checkpoint from disk");
     }
+    
     std::memcpy(outBitmap, ver->baseBitmap, 4 * sizeof(uint64_t));
     if (ts == ver->baseTimestamp) {
         return;
@@ -186,6 +189,7 @@ void TileVisibility::getTileVisibilityBitmap(uint64_t ts, uint64_t outBitmap[4])
 
     DeleteIndexBlock *blk = ver->head;
 #ifdef RETINA_SIMD
+    alignas(32) uint64_t deltaBitmap[4] = {0, 0, 0, 0};
     const __m256i signBit = _mm256_set1_epi64x(0x8000000000000000ULL);
     const __m256i vThrFlip = _mm256_xor_si256(_mm256_set1_epi64x(ts), signBit);
     const __m256i tsMask = _mm256_set1_epi64x(0x00FFFFFFFFFFFFFFULL);
@@ -198,25 +202,53 @@ void TileVisibility::getTileVisibilityBitmap(uint64_t ts, uint64_t outBitmap[4])
                            ? currentTailUsed
                            : DeleteIndexBlock::BLOCK_CAPACITY;
         if (count > DeleteIndexBlock::BLOCK_CAPACITY) {
-            continue; // retry get count
+            continue;
         }
         uint64_t start_blk_offset = 0;
 #ifdef RETINA_SIMD
+        bool allMatched = true;
         if (count == DeleteIndexBlock::BLOCK_CAPACITY) {
-            process_bitmap_block_256(blk, 0, outBitmap, vThrFlip, tsMask, signBit);
-            process_bitmap_block_256(blk, 4, outBitmap, vThrFlip, tsMask, signBit);
-        } else if (count >= 4) {
-            start_blk_offset = 4;
-            process_bitmap_block_256(blk, 0, outBitmap, vThrFlip, tsMask, signBit);
+            allMatched = process_bitmap_block_256(blk, 0, deltaBitmap, vThrFlip, tsMask, signBit);
+            if (allMatched) {
+                allMatched = process_bitmap_block_256(blk, 4, deltaBitmap, vThrFlip, tsMask, signBit);
+            }
+            if (!allMatched) {
+                __m256i base = _mm256_loadu_si256((const __m256i *)outBitmap);
+                __m256i delta = _mm256_loadu_si256((const __m256i *)deltaBitmap);
+                __m256i merged = _mm256_or_si256(base, delta);
+                _mm256_storeu_si256((__m256i *)outBitmap, merged);
+                return;
+            }
+        } else {
+            if (count >= 4) {
+                allMatched = process_bitmap_block_256(blk, 0, deltaBitmap, vThrFlip, tsMask, signBit);
+                start_blk_offset = 4;
+                if (!allMatched) {
+                    __m256i base = _mm256_loadu_si256((const __m256i *)outBitmap);
+                    __m256i delta = _mm256_loadu_si256((const __m256i *)deltaBitmap);
+                    __m256i merged = _mm256_or_si256(base, delta);
+                    _mm256_storeu_si256((__m256i *)outBitmap, merged);
+                    return;
+                }
+            }
         }
 #endif
         for (uint64_t i = start_blk_offset; i < count; i++) {
             uint64_t item = blk->items[i];
             uint64_t delTs = extractTimestamp(item);
             if (delTs <= ts) {
+#ifdef RETINA_SIMD
+                SET_BITMAP_BIT(deltaBitmap, extractRowId(item));
+#else
                 SET_BITMAP_BIT(outBitmap, extractRowId(item));
+#endif
             } else {
-                // delTs is increasing, so no need to check further
+#ifdef RETINA_SIMD
+                __m256i base = _mm256_loadu_si256((const __m256i *)outBitmap);
+                __m256i delta = _mm256_loadu_si256((const __m256i *)deltaBitmap);
+                __m256i merged = _mm256_or_si256(base, delta);
+                _mm256_storeu_si256((__m256i *)outBitmap, merged);
+#endif
                 return;
             }
         }
@@ -224,24 +256,26 @@ void TileVisibility::getTileVisibilityBitmap(uint64_t ts, uint64_t outBitmap[4])
         if (blk == currentTail) {
             if (currentTail != tail.load(std::memory_order_acquire) ||
                 currentTailUsed != tailUsed.load(std::memory_order_acquire)) {
-                // no need to reset outBitmap, just lost the latest deletion
                 continue;
             }
         }
 
         blk = blk->next.load(std::memory_order_relaxed);
     }
+#ifdef RETINA_SIMD
+    __m256i base = _mm256_loadu_si256((const __m256i *)outBitmap);
+    __m256i delta = _mm256_loadu_si256((const __m256i *)deltaBitmap);
+    __m256i merged = _mm256_or_si256(base, delta);
+    _mm256_storeu_si256((__m256i *)outBitmap, merged);
+#endif
 }
 
 void TileVisibility::collectTileGarbage(uint64_t ts) {
-    // Load old version
     VersionedData* oldVer = currentVersion.load(std::memory_order_acquire);
-    
     if (ts <= oldVer->baseTimestamp) {
         return;
     }
 
-    // Find the last block that should be compacted
     DeleteIndexBlock *blk = oldVer->head;
     DeleteIndexBlock *lastFullBlk = nullptr;
     uint64_t newBaseTimestamp = oldVer->baseTimestamp;
@@ -251,8 +285,7 @@ void TileVisibility::collectTileGarbage(uint64_t ts) {
                            ? tailUsed.load(std::memory_order_acquire)
                            : DeleteIndexBlock::BLOCK_CAPACITY;
         if (count > DeleteIndexBlock::BLOCK_CAPACITY) {
-            throw std::runtime_error(
-                "The number of item in block is bigger than BLOCK_CAPACITY");
+            throw std::runtime_error("Invalid block count");
         }
 
         uint64_t lastItemTs = extractTimestamp(blk->items[count - 1]);
@@ -267,29 +300,44 @@ void TileVisibility::collectTileGarbage(uint64_t ts) {
     }
 
     if (!lastFullBlk) {
-        // Nothing to compact
         return;
     }
 
-    // Create new version with Copy-on-Write
-    // Manually compute the new base bitmap from oldVer
-    uint64_t newBaseBitmap[4];
+    alignas(32) uint64_t newBaseBitmap[4];
     std::memcpy(newBaseBitmap, oldVer->baseBitmap, 4 * sizeof(uint64_t));
+
+#ifdef RETINA_SIMD
+    alignas(32) uint64_t deltaBitmap[4] = {0, 0, 0, 0};
+    const __m256i signBit = _mm256_set1_epi64x(0x8000000000000000ULL);
+    const __m256i vThrFlip = _mm256_xor_si256(_mm256_set1_epi64x(ts), signBit);
+    const __m256i tsMask = _mm256_set1_epi64x(0x00FFFFFFFFFFFFFFULL);
+#endif
     
-    // Apply deletes from oldVer->head up to lastFullBlk
     blk = oldVer->head;
     while (blk) {
-        size_t count = (blk == lastFullBlk) 
-                           ? ((blk == tail.load(std::memory_order_acquire))
-                               ? tailUsed.load(std::memory_order_acquire)
-                               : DeleteIndexBlock::BLOCK_CAPACITY)
+        size_t count = (blk == lastFullBlk && blk == tail.load(std::memory_order_acquire))
+                           ? tailUsed.load(std::memory_order_acquire)
                            : DeleteIndexBlock::BLOCK_CAPACITY;
         
-        for (size_t i = 0; i < count; i++) {
+        uint64_t start_blk_offset = 0;
+#ifdef RETINA_SIMD
+        if (count == DeleteIndexBlock::BLOCK_CAPACITY) {
+            process_bitmap_block_256(blk, 0, deltaBitmap, vThrFlip, tsMask, signBit);
+            process_bitmap_block_256(blk, 4, deltaBitmap, vThrFlip, tsMask, signBit);
+        } else if (count >= 4) {
+            process_bitmap_block_256(blk, 0, deltaBitmap, vThrFlip, tsMask, signBit);
+            start_blk_offset = 4;
+        }
+#endif
+        for (size_t i = start_blk_offset; i < count; i++) {
             uint64_t item = blk->items[i];
             uint64_t delTs = extractTimestamp(item);
             if (delTs <= ts) {
+#ifdef RETINA_SIMD
+                SET_BITMAP_BIT(deltaBitmap, extractRowId(item));
+#else
                 SET_BITMAP_BIT(newBaseBitmap, extractRowId(item));
+#endif
             }
         }
         
@@ -298,56 +346,46 @@ void TileVisibility::collectTileGarbage(uint64_t ts) {
         }
         blk = blk->next.load(std::memory_order_acquire);
     }
+
+#ifdef RETINA_SIMD
+    __m256i base = _mm256_loadu_si256((const __m256i *)newBaseBitmap);
+    __m256i delta = _mm256_loadu_si256((const __m256i *)deltaBitmap);
+    __m256i merged = _mm256_or_si256(base, delta);
+    _mm256_storeu_si256((__m256i *)newBaseBitmap, merged);
+#endif
     
-    // Get new head and break the chain to avoid double-free
     DeleteIndexBlock* newHead = lastFullBlk->next.load(std::memory_order_acquire);
     lastFullBlk->next.store(nullptr, std::memory_order_release);
     
-    // Create new version with new head - this is the atomic COW update
     VersionedData* newVer = new VersionedData(newBaseTimestamp, newBaseBitmap, newHead);
 
-    // CAS to install new version atomically
-    if (currentVersion.compare_exchange_strong(oldVer, newVer, 
-                                               std::memory_order_acq_rel)) {
-        // Successfully updated
-        // Retire old version and its delete chain
+    if (currentVersion.compare_exchange_strong(oldVer, newVer, std::memory_order_acq_rel)) {
         uint64_t retireEpoch = EpochManager::getInstance().advanceEpoch();
         retired.emplace_back(oldVer, oldVer->head, retireEpoch);
-        
-        // Update tail if needed (if all blocks were compacted)
         if (!newHead) {
             tail.store(nullptr, std::memory_order_release);
             tailUsed.store(0, std::memory_order_release);
         }
-        
-        // Try to reclaim retired versions
         reclaimRetiredVersions();
     } else {
-        // CAS failed, another GC happened concurrently
-        // Restore the chain link
         lastFullBlk->next.store(newHead, std::memory_order_release);
         delete newVer;
     }
 }
 
 void TileVisibility::reclaimRetiredVersions() {
-    // Remove retired versions that can be safely reclaimed
     auto it = retired.begin();
     while (it != retired.end()) {
         if (EpochManager::getInstance().canReclaim(it->retireEpoch)) {
-            // Safe to delete
             if (it->data) {
                 delete it->data;
             }
-            
-            // Delete the chain of blocks
             DeleteIndexBlock* blk = it->blocksToDelete;
             while (blk) {
                 DeleteIndexBlock* next = blk->next.load(std::memory_order_acquire);
                 delete blk;
                 blk = next;
             }
-            
             it = retired.erase(it);
         } else {
             ++it;
