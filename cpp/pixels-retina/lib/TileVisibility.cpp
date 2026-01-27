@@ -229,6 +229,12 @@ void TileVisibility<CAPACITY>::collectTileGarbage(uint64_t ts) {
         size_t count = (blk == tail.load(std::memory_order_acquire))
                            ? tailUsed.load(std::memory_order_acquire)
                            : DeleteIndexBlock::BLOCK_CAPACITY;
+
+        // Unfilled blocks are not reclaimed.
+        if (count < DeleteIndexBlock::BLOCK_CAPACITY) {
+            break;
+        }
+
         uint64_t lastItemTs = extractTimestamp(blk->items[count - 1]);
         if (lastItemTs <= ts) {
             lastFullBlk = blk;
