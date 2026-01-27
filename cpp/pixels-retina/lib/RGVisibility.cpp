@@ -104,5 +104,14 @@ uint64_t RGVisibility<CAPACITY>::getBitmapSize() const {
     return tileCount * BITMAP_SIZE_PER_TILE_VISIBILITY;
 }
 
+template<size_t CAPACITY>
+double RGVisibility<CAPACITY>::getInvalidRatio() const {
+    uint64_t totalInvalid = 0;
+    for (uint64_t i = 0; i < tileCount; i++) {
+        totalInvalid += tileVisibilities[i].getInvalidCount();
+    }
+    return static_cast<double>(totalInvalid) / (tileCount * CAPACITY);
+}
+
 // Explicit Instantiations for JNI use
 template class RGVisibility<RETINA_CAPACITY>;

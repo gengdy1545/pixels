@@ -143,6 +143,22 @@ JNIEXPORT void JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_garbageCollec
 
 /*
  * Class:     io_pixelsdb_pixels_retina_RGVisibility
+ * Method:    getInvalidRatio
+ * Signature: (J)D
+ */
+JNIEXPORT jdouble JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getInvalidRatio
+  (JNIEnv* env, jobject, jlong handle) {
+    try {
+        auto* rgVisibility = reinterpret_cast<RGVisibilityInstance*>(handle);
+        return static_cast<jdouble>(rgVisibility->getInvalidRatio());
+    } catch (const std::exception& e) {
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
+        return 0.0;
+    }
+}
+
+/*
+ * Class:     io_pixelsdb_pixels_retina_RGVisibility
  * Method:    getNativeMemoryUsage
  * Returns the total bytes currently allocated by the process as tracked by jemalloc.
  */
@@ -193,3 +209,4 @@ JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getRetinaObj
     // Read the atomic object counter from RetinaBase namespace
     return static_cast<jlong>(pixels::g_retina_object_count.load(std::memory_order_relaxed));
 }
+
