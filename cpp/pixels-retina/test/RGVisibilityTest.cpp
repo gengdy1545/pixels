@@ -67,6 +67,34 @@ TEST_F(RGVisibilityTest, BasicDeleteAndVisibility) {
     delete[] bitmap2;
 }
 
+TEST_F(RGVisibilityTest, InvalidRatio) {
+    // Fill one block (8 items) in Tile 0 with timestamp 100
+    for(int i = 0; i < 8; ++i) {
+        rgVisibility->deleteRGRecord(i, 100);
+    }
+    // Fill second block (8 items) with timestamp 200
+    for(int i = 0; i < 8; ++i) {
+        rgVisibility->deleteRGRecord(8 + i, 200);
+    }
+
+    // GC(150) -> Should reclaim first block (8 items) but not second
+    rgVisibility->collectRGGarbage(150);
+    
+    double ratio = rgVisibility->getInvalidRatio();
+    // Total Capacity depends on RETINA_CAPACITY
+    uint64_t tileCount = (ROW_COUNT + RETINA_CAPACITY - 1) / RETINA_CAPACITY;
+    double totalCapacity = (double)tileCount * RETINA_CAPACITY;
+
+    double expected = 8.0 / totalCapacity;
+    EXPECT_DOUBLE_EQ(ratio, expected);
+
+    // GC(250) -> Should reclaim second block (8 items) -> Total 16
+    rgVisibility->collectRGGarbage(250);
+    ratio = rgVisibility->getInvalidRatio();
+    expected = 16.0 / totalCapacity;
+    EXPECT_DOUBLE_EQ(ratio, expected);
+}
+
 TEST_F(RGVisibilityTest, MultiThread) {
     struct DeleteRecord {
         uint64_t timestamp;
