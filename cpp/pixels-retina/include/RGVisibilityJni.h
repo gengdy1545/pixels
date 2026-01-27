@@ -57,6 +57,14 @@ JNIEXPORT void JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_garbageCollec
 
 /*
  * Class:     io_pixelsdb_pixels_retina_RGVisibility
+ * Method:    getInvalidRatio
+ * Signature: (J)D
+ */
+JNIEXPORT jdouble JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getInvalidRatio
+  (JNIEnv *, jobject, jlong);
+
+/*
+ * Class:     io_pixelsdb_pixels_retina_RGVisibility
  * Method:    getNativeMemoryUsage
  * Signature: ()J
  */

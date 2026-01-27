@@ -36,6 +36,9 @@ public:
     void collectRGGarbage(uint64_t timestamp);
 
     uint64_t getBitmapSize() const;
+    
+    // Calculates total invalid ratio using (tileCount * CAPACITY) as total rows approximation
+    double getInvalidRatio() const;
 
 private:
     static constexpr uint32_t VISIBILITY_RECORD_CAPACITY = CAPACITY;
