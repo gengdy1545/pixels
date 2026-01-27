@@ -26,12 +26,6 @@
 
 #include <immintrin.h>
 
-#include "TileVisibility.h"
-#include "EpochManager.h"
-#include <cstring>
-#include <stdexcept>
-#include <immintrin.h>
-
 template<size_t CAPACITY>
 TileVisibility<CAPACITY>::TileVisibility() {
     VersionedData<CAPACITY>* initialVersion = new VersionedData<CAPACITY>();
@@ -221,7 +215,10 @@ template<size_t CAPACITY>
 void TileVisibility<CAPACITY>::collectTileGarbage(uint64_t ts) {
     // Load old version
     VersionedData<CAPACITY>* oldVer = currentVersion.load(std::memory_order_acquire);
-    if (ts <= oldVer->baseTimestamp) return;
+    // If no GC happens, just return
+    if (ts <= oldVer->baseTimestamp) {
+        return;
+    }
 
     // Find the last block that should be compacted
     DeleteIndexBlock *blk = oldVer->head;
@@ -240,7 +237,10 @@ void TileVisibility<CAPACITY>::collectTileGarbage(uint64_t ts) {
         blk = blk->next.load(std::memory_order_acquire);
     }
 
-    if (!lastFullBlk) return;
+    // If nothing to compact, return
+    if (!lastFullBlk) {
+        return;
+    }
 
     // Create new version with Copy-on-Write
     // Manually compute the new base bitmap from oldVer
@@ -289,6 +289,13 @@ void TileVisibility<CAPACITY>::collectTileGarbage(uint64_t ts) {
         lastFullBlk->next.store(newHead, std::memory_order_release);
         delete newVer;
     }
+}
+
+template<size_t CAPACITY>
+uint64_t TileVisibility<CAPACITY>::getInvalidCount() const {
+    EpochGuard guard;
+    VersionedData<CAPACITY>* ver = currentVersion.load(std::memory_order_acquire);
+    return ver->baseInvalidCount;
 }
 
 template<size_t CAPACITY>

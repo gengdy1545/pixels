@@ -63,15 +63,20 @@ struct VersionedData : public pixels::RetinaBase<VersionedData<CAPACITY>> {
     static constexpr size_t NUM_WORDS = BITMAP_WORDS(CAPACITY);
     uint64_t baseBitmap[NUM_WORDS];
     uint64_t baseTimestamp;
+    uint64_t baseInvalidCount;
     DeleteIndexBlock* head; // Delete chain head, part of the version
 
-    VersionedData() : baseTimestamp(0), head(nullptr) {
+    VersionedData() : baseTimestamp(0), baseInvalidCount(0), head(nullptr) {
         std::memset(baseBitmap, 0, sizeof(baseBitmap));
     }
 
     VersionedData(uint64_t ts, const uint64_t* bitmap, DeleteIndexBlock* h)
         : baseTimestamp(ts), head(h) {
         std::memcpy(baseBitmap, bitmap, NUM_WORDS * sizeof(uint64_t));
+        baseInvalidCount = 0;
+        for (size_t i = 0; i < NUM_WORDS; ++i) {
+            baseInvalidCount += __builtin_popcountll(baseBitmap[i]);
+        }
     }
 };
 
@@ -98,6 +103,8 @@ class TileVisibility : public pixels::RetinaBase<TileVisibility<CAPACITY>> {
     void deleteTileRecord(uint16_t rowId, uint64_t ts);
     void getTileVisibilityBitmap(uint64_t ts, uint64_t* outBitmap) const;
     void collectTileGarbage(uint64_t ts);
+
+    uint64_t getInvalidCount() const;
 
   private:
     TileVisibility(const TileVisibility &) = delete;
