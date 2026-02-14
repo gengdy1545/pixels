@@ -70,6 +70,7 @@ service MetadataService {
     rpc GetFileType (GetFileTypeRequest) returns (GetFileTypeResponse);
     rpc UpdateFile (UpdateFileRequest) returns (UpdateFileResponse);
     rpc DeleteFiles (DeleteFilesRequest) returns (DeleteFilesResponse);
+    rpc AtomicSwapFiles (AtomicSwapFilesRequest) returns (AtomicSwapFilesResponse);
     rpc CreatePeerPath (CreatePeerPathRequest) returns (CreatePeerPathResponse);
     rpc GetPeerPaths (GetPeerPathsRequest) returns (GetPeerPathsResponse);
     rpc UpdatePeerPath (UpdatePeerPathRequest) returns (UpdatePeerPathResponse);
@@ -722,6 +723,16 @@ message DeleteFilesRequest {
 }
 
 message DeleteFilesResponse {
+    ResponseHeader header = 1;
+}
+
+message AtomicSwapFilesRequest {
+    RequestHeader header = 1;
+    repeated File filesToAdd = 2;
+    repeated uint64 fileIdsToDelete = 3;
+}
+
+message AtomicSwapFilesResponse {
     ResponseHeader header = 1;
 }
 

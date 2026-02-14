@@ -87,6 +87,30 @@ JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getRetinaTra
 JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getRetinaObjectCount
   (JNIEnv *, jclass);
 
+/*
+ * Class:     io_pixelsdb_pixels_retina_RGVisibility
+ * Method:    exportDeletionBlocks
+ * Signature: (J)[J
+ */
+JNIEXPORT jlongArray JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_exportDeletionBlocks
+  (JNIEnv *, jobject, jlong);
+
+/*
+ * Class:     io_pixelsdb_pixels_retina_RGVisibility
+ * Method:    prependDeletionBlocks
+ * Signature: ([JJ)V
+ */
+JNIEXPORT void JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_prependDeletionBlocks
+  (JNIEnv *, jobject, jlongArray, jlong);
+
+/*
+ * Class:     io_pixelsdb_pixels_retina_RGVisibility
+ * Method:    getBaseBitmap
+ * Signature: (J)[J
+ */
+JNIEXPORT jlongArray JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getBaseBitmap
+  (JNIEnv *, jobject, jlong);
+
 #ifdef __cplusplus
 }
 #endif

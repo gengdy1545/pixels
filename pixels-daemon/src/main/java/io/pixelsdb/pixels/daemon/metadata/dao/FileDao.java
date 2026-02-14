@@ -73,4 +73,14 @@ public abstract class FileDao implements Dao<MetadataProto.File>
     abstract public boolean update (MetadataProto.File file);
 
     abstract public boolean deleteByIds (List<Long> ids);
+
+    /**
+     * Atomically swap files: delete old files and insert new files in a single transaction.
+     * Used by Storage GC to ensure atomic metadata updates.
+     *
+     * @param filesToAdd list of new files to insert
+     * @param fileIdsToDelete list of old file IDs to delete
+     * @return true if the operation succeeds, false otherwise
+     */
+    abstract public boolean atomicSwapFiles(List<MetadataProto.File> filesToAdd, List<Long> fileIdsToDelete);
 }

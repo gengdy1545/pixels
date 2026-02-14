@@ -60,6 +60,10 @@ public class RetinaResourceManager
     private final Map<String, Map<Integer, PixelsWriteBuffer>> pixelsWriteBufferMap;
     private String retinaHostName;
 
+    // Storage GC dual-write mapping fields
+    private final Map<Long, RedirectInfo> forwardMap;  // oldFileId -> (newFileId, mapping)
+    private final Map<Long, RedirectInfo> backwardMap; // newFileId -> (oldFileId, reverseMapping)
+
     // GC related fields
     private final ScheduledExecutorService gcExecutor;
 
@@ -95,11 +99,29 @@ public class RetinaResourceManager
         OFFLOAD
     }
 
+    /**
+     * Redirect information for Storage GC dual-write strategy.
+     * Maps row IDs from one file to another during GC rewrite.
+     */
+    private static class RedirectInfo
+    {
+        final long targetFileId;
+        final int[] rowIdMapping;  // mapping[oldRowId] = newRowId, -1 if deleted
+
+        RedirectInfo(long targetFileId, int[] rowIdMapping)
+        {
+            this.targetFileId = targetFileId;
+            this.rowIdMapping = rowIdMapping;
+        }
+    }
+
     private RetinaResourceManager()
     {
         this.metadataService = MetadataService.Instance();
         this.rgVisibilityMap = new ConcurrentHashMap<>();
         this.pixelsWriteBufferMap = new ConcurrentHashMap<>();
+        this.forwardMap = new ConcurrentHashMap<>();
+        this.backwardMap = new ConcurrentHashMap<>();
         this.offloadedCheckpoints = new ConcurrentHashMap<>();
         this.checkpointFutures = new ConcurrentHashMap<>();
 
@@ -171,6 +193,31 @@ public class RetinaResourceManager
         }
 
         rgVisibilityMap.put(rgKey, new RGVisibility(recordNum));
+    }
+    /**
+     * Create a new RGVisibility instance for Storage GC.
+     * This method creates a new RGVisibility and registers it in the visibility map.
+     * 
+     * @param fileId the file ID
+     * @param rgId the row group ID
+     * @param recordNum the number of records in the row group
+     * @return the created RGVisibility instance
+     */
+    public RGVisibility createRGVisibility(long fileId, int rgId, int recordNum)
+    {
+        String rgKey = fileId + "_" + rgId;
+        RGVisibility rgVisibility = new RGVisibility(recordNum);
+        rgVisibilityMap.put(rgKey, rgVisibility);
+        return rgVisibility;
+    }
+
+    public void finishRecovery()
+    {
+        if (!recoveryCache.isEmpty())
+        {
+            logger.info("Dropping {} orphaned entries from recovery cache.", recoveryCache.size());
+            recoveryCache.clear();
+        }
     }
 
     public void addVisibility(String filePath) throws RetinaException
@@ -451,6 +498,46 @@ public class RetinaResourceManager
     {
         RGVisibility rgVisibility = checkRGVisibility(fileId, rgId);
         rgVisibility.deleteRecord(rgRowOffset, timestamp);
+        
+        // Storage GC dual-write: Forward mapping (old -> new)
+        RedirectInfo forwardInfo = forwardMap.get(fileId);
+        if (forwardInfo != null && rgRowOffset < forwardInfo.rowIdMapping.length)
+        {
+            int newRowId = forwardInfo.rowIdMapping[rgRowOffset];
+            if (newRowId >= 0)  // Not physically deleted
+            {
+                try
+                {
+                    RGVisibility newRgVisibility = checkRGVisibility(forwardInfo.targetFileId, rgId);
+                    newRgVisibility.deleteRecord(newRowId, timestamp);
+                }
+                catch (RetinaException e)
+                {
+                    logger.warn("Failed to forward delete to new file: fileId={}, rgId={}, newRowId={}", 
+                               forwardInfo.targetFileId, rgId, newRowId, e);
+                }
+            }
+        }
+        
+        // Storage GC dual-write: Backward mapping (new -> old)
+        RedirectInfo backwardInfo = backwardMap.get(fileId);
+        if (backwardInfo != null && rgRowOffset < backwardInfo.rowIdMapping.length)
+        {
+            int oldRowId = backwardInfo.rowIdMapping[rgRowOffset];
+            if (oldRowId >= 0)
+            {
+                try
+                {
+                    RGVisibility oldRgVisibility = checkRGVisibility(backwardInfo.targetFileId, rgId);
+                    oldRgVisibility.deleteRecord(oldRowId, timestamp);
+                }
+                catch (RetinaException e)
+                {
+                    logger.warn("Failed to backward delete to old file: fileId={}, rgId={}, oldRowId={}", 
+                               backwardInfo.targetFileId, rgId, oldRowId, e);
+                }
+            }
+        }
     }
 
     public void deleteRecord(IndexProto.RowLocation rowLocation, long timestamp) throws RetinaException
@@ -621,6 +708,20 @@ public class RetinaResourceManager
     }
 
     /**
+     * Get RGVisibility for Storage GC.
+     * Returns null if not found (instead of throwing exception).
+     *
+     * @param fileId the file id.
+     * @param rgId the row group id.
+     * @return RGVisibility or null if not found
+     */
+    public RGVisibility getRGVisibility(long fileId, int rgId)
+    {
+        String retinaKey = fileId + "_" + rgId;
+        return this.rgVisibilityMap.get(retinaKey);
+    }
+
+    /**
      * Check if the writer buffer exists for the given schema and table.
      */
     private PixelsWriteBuffer checkPixelsWriteBuffer(String schema, String table, int vNodeId) throws RetinaException
@@ -660,12 +761,16 @@ public class RetinaResourceManager
         {
             // 1. Persist first
             createCheckpoint(timestamp, CheckpointType.GC);
-            // 2. Then clean memory
+            // 2. Then clean memory (Memory GC)
             for (Map.Entry<String, RGVisibility> entry: this.rgVisibilityMap.entrySet())
             {
                 RGVisibility rgVisibility = entry.getValue();
                 rgVisibility.garbageCollect(timestamp);
             }
+            
+            // 3. Run Storage GC after Memory GC
+            StorageGarbageCollector storageGC = new StorageGarbageCollector(this, metadataService);
+            storageGC.runStorageGC();
         } catch (Exception e)
         {
             logger.error("Error while running GC", e);
@@ -768,5 +873,55 @@ public class RetinaResourceManager
         {
             logger.error("Failed to recover checkpoints", e);
         }
+    /**
+     * Register redirection mapping for Storage GC dual-write.
+     * This enables dual-write during index update phase.
+     * 
+     * @param oldFileId old file ID
+     * @param newFileId new file ID
+     * @param mapping row ID mapping array (mapping[oldRowId] = newRowId, -1 if deleted)
+     */
+    public void registerRedirection(long oldFileId, long newFileId, int[] mapping)
+    {
+        // Build reverse mapping
+        int maxNewRowId = 0;
+        for (int newRowId : mapping)
+        {
+            if (newRowId > maxNewRowId)
+            {
+                maxNewRowId = newRowId;
+            }
+        }
+        
+        int[] reverseMapping = new int[maxNewRowId + 1];
+        Arrays.fill(reverseMapping, -1);
+        for (int oldRowId = 0; oldRowId < mapping.length; oldRowId++)
+        {
+            int newRowId = mapping[oldRowId];
+            if (newRowId >= 0)
+            {
+                reverseMapping[newRowId] = oldRowId;
+            }
+        }
+        
+        forwardMap.put(oldFileId, new RedirectInfo(newFileId, mapping));
+        backwardMap.put(newFileId, new RedirectInfo(oldFileId, reverseMapping));
+        
+        logger.info("Registered redirection: oldFileId={}, newFileId={}, mappingSize={}", 
+                    oldFileId, newFileId, mapping.length);
+    }
+
+    /**
+     * Unregister redirection mapping after Storage GC completes.
+     * This should be called after metadata atomic swap succeeds.
+     * 
+     * @param oldFileId old file ID
+     * @param newFileId new file ID
+     */
+    public void unregisterRedirection(long oldFileId, long newFileId)
+    {
+        forwardMap.remove(oldFileId);
+        backwardMap.remove(newFileId);
+        logger.info("Unregistered redirection: oldFileId={}, newFileId={}", oldFileId, newFileId);
     }
 }

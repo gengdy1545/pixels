@@ -1505,6 +1505,42 @@ public class MetadataService
         return false;
     }
 
+    /**
+     * Atomically swap files in metadata: delete old files and add new files in a single transaction.
+     * This is used by Storage GC to ensure atomic metadata updates.
+     * 
+     * @param filesToAdd new files to add
+     * @param fileIdsToDelete old file IDs to delete
+     * @return true if swap succeeded, false otherwise
+     * @throws MetadataException if the operation fails
+     */
+    public boolean atomicSwapFiles(Collection<File> filesToAdd, List<Long> fileIdsToDelete) throws MetadataException
+    {
+        String token = UUID.randomUUID().toString();
+        MetadataProto.AtomicSwapFilesRequest request = MetadataProto.AtomicSwapFilesRequest.newBuilder()
+                .setHeader(MetadataProto.RequestHeader.newBuilder().setToken(token))
+                .addAllFilesToAdd(filesToAdd.stream().map(File::toProto).collect(Collectors.toList()))
+                .addAllFileIdsToDelete(fileIdsToDelete).build();
+        try
+        {
+            MetadataProto.AtomicSwapFilesResponse response = this.stub.atomicSwapFiles(request);
+            if (response.getHeader().getErrorCode() != 0)
+            {
+                throw new MetadataException("error code=" + response.getHeader().getErrorCode()
+                        + ", error message=" + response.getHeader().getErrorMsg());
+            }
+            if (!response.getHeader().getToken().equals(token))
+            {
+                throw new MetadataException("response token does not match.");
+            }
+            return true;
+        }
+        catch (Exception e)
+        {
+            throw new MetadataException("failed to atomic swap files", e);
+        }
+    }
+
     public boolean createPeerPath(String uri, List<Column> columns, Path path, Peer peer) throws MetadataException
     {
         String token = UUID.randomUUID().toString();
