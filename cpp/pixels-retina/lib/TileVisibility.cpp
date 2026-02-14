@@ -305,6 +305,112 @@ uint64_t TileVisibility<CAPACITY>::getInvalidCount() const {
 }
 
 template<size_t CAPACITY>
+std::vector<uint64_t> TileVisibility<CAPACITY>::exportDeletionBlocks() const {
+    EpochGuard guard;
+    std::vector<uint64_t> result;
+    
+    VersionedData<CAPACITY>* ver = currentVersion.load(std::memory_order_acquire);
+    DeleteIndexBlock* blk = ver->head;
+    
+    while (blk) {
+        DeleteIndexBlock* curTail = tail.load(std::memory_order_acquire);
+        size_t count = (blk == curTail) 
+                       ? tailUsed.load(std::memory_order_acquire) 
+                       : DeleteIndexBlock::BLOCK_CAPACITY;
+        
+        for (size_t i = 0; i < count; i++) {
+            result.push_back(blk->items[i]);
+        }
+        
+        blk = blk->next.load(std::memory_order_acquire);
+    }
+    
+    return result;
+}
+
+template<size_t CAPACITY>
+void TileVisibility<CAPACITY>::prependDeletionBlocks(const uint64_t* items, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    
+    // Build new chain of blocks
+    DeleteIndexBlock* newHead = nullptr;
+    DeleteIndexBlock* newTail = nullptr;
+    size_t itemIndex = 0;
+    
+    while (itemIndex < count) {
+        auto* blk = new DeleteIndexBlock();
+        size_t itemsInBlock = std::min(count - itemIndex, DeleteIndexBlock::BLOCK_CAPACITY);
+        
+        // Copy items to this block
+        for (size_t i = 0; i < itemsInBlock; i++) {
+            blk->items[i] = items[itemIndex++];
+        }
+        
+        // CRITICAL: Padding logic
+        // If this is the last block and it's not full, pad it with the last item
+        if (itemIndex == count && itemsInBlock < DeleteIndexBlock::BLOCK_CAPACITY) {
+            uint64_t lastItem = blk->items[itemsInBlock - 1];
+            for (size_t i = itemsInBlock; i < DeleteIndexBlock::BLOCK_CAPACITY; i++) {
+                blk->items[i] = lastItem;
+            }
+        }
+        
+        // Link blocks
+        if (newHead == nullptr) {
+            newHead = blk;
+            newTail = blk;
+        } else {
+            newTail->next.store(blk, std::memory_order_release);
+            newTail = blk;
+        }
+    }
+    
+    // Atomically prepend to existing chain
+    while (true) {
+        VersionedData<CAPACITY>* oldVer = currentVersion.load(std::memory_order_acquire);
+        DeleteIndexBlock* oldHead = oldVer->head;
+        
+        // Link new tail to old head
+        newTail->next.store(oldHead, std::memory_order_release);
+        
+        // Create new version with new head
+        VersionedData<CAPACITY>* newVer = new VersionedData<CAPACITY>(
+            oldVer->baseTimestamp, oldVer->baseBitmap, newHead);
+        
+        if (currentVersion.compare_exchange_strong(oldVer, newVer, 
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+            // Success: retire old version
+            uint64_t epoch = EpochManager::getInstance().getCurrentEpoch();
+            retired.emplace_back(oldVer, nullptr, epoch);
+            reclaimRetiredVersions();
+            
+            // Update tail if the old chain was empty
+            if (oldHead == nullptr) {
+                tail.store(newTail, std::memory_order_release);
+                tailUsed.store(DeleteIndexBlock::BLOCK_CAPACITY, std::memory_order_release);
+            }
+            
+            return;
+        } else {
+            // CAS failed, need to retry
+            // Unlink the new tail from old head before retrying
+            newTail->next.store(nullptr, std::memory_order_release);
+            delete newVer;
+        }
+    }
+}
+
+template<size_t CAPACITY>
+const uint64_t* TileVisibility<CAPACITY>::getBaseBitmap() const {
+    EpochGuard guard;
+    VersionedData<CAPACITY>* ver = currentVersion.load(std::memory_order_acquire);
+    return ver->baseBitmap;
+}
+
+template<size_t CAPACITY>
 void TileVisibility<CAPACITY>::reclaimRetiredVersions() {
     auto it = retired.begin();
     while (it != retired.end()) {

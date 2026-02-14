@@ -75,9 +75,9 @@ Visibility = Base Bitmap + Deletion Chain
 ```cpp
 template<size_t CAPACITY>
 struct VersionedData {
-    uint64_t* baseBitmap;           // Memory GC compact 后的基准位图
+    uint64_t baseBitmap[NUM_WORDS]; // Memory GC compact 后的基准位图（数组，不是指针）
     uint64_t baseTimestamp;         // baseBitmap 对应的 Safe GC Timestamp
-    uint32_t baseInvalidCount;      // baseBitmap 中的无效行数（0 位）
+    uint64_t baseInvalidCount;      // baseBitmap 中的无效行数（1 位的数量）
     DeleteIndexBlock* head;         // Deletion Chain 的头指针（未 compact 的删除）
 };
 ```
@@ -89,34 +89,34 @@ struct VersionedData {
 **时间线**：
 1. **T0**: 初始状态，所有行有效
    ```
-   Base Bitmap:    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+   Base Bitmap:    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  (0 = valid)
    Deletion Chain: []
    ```
 
 2. **T1**: 删除 Row 2, Row 5
    ```
-   Base Bitmap:    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]  (未变)
+   Base Bitmap:    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  (未变)
    Deletion Chain: [(2, ts=T1), (5, ts=T1)]
    ```
 
-3. **T2**: Memory GC 执行（Safe Timestamp = T1.5）
+2. **T2**: Memory GC 执行（Safe Timestamp = T1.5）
    ```
-   Base Bitmap:    [1, 1, 0, 1, 1, 0, 1, 1, 1, 1]  (compact 了 T1 的删除)
+   Base Bitmap:    [0, 0, 1, 0, 0, 1, 0, 0, 0, 0]  (compact 了 T1 的删除)
                           ↑           ↑
                        Row 2        Row 5
+                    (1 = deleted)
    Deletion Chain: []  (已清空)
    ```
-
 4. **T3**: 删除 Row 7, Row 9
    ```
-   Base Bitmap:    [1, 1, 0, 1, 1, 0, 1, 1, 1, 1]  (未变)
+   Base Bitmap:    [0, 0, 1, 0, 0, 1, 0, 0, 0, 0]  (未变)
    Deletion Chain: [(7, ts=T3), (9, ts=T3)]
    ```
 
 5. **T4**: Storage GC 执行
    - **错误做法** ❌: 调用 `queryVisibility(T4)` 获取完整的 Visibility Bitmap
      ```
-     Visibility Bitmap: [1, 1, 0, 1, 1, 0, 0, 1, 0, 1]
+     Visibility Bitmap: [0, 0, 1, 0, 0, 1, 1, 0, 1, 0]
                                           ↑      ↑
                                        Row 7  Row 9 (来自 Deletion Chain)
      ```
@@ -124,11 +124,11 @@ struct VersionedData {
    
    - **正确做法** ✅: 仅使用 `getBaseBitmap()` 获取 Base Bitmap
      ```
-     Base Bitmap: [1, 1, 0, 1, 1, 0, 1, 1, 1, 1]
+     Base Bitmap: [0, 0, 1, 0, 0, 1, 0, 0, 0, 0]
      ```
      **结果**: 
-     - 跳过 Row 2, Row 5（可以物理删除）
-     - **保留** Row 7, Row 9（虽然在 Deletion Chain 中被标记删除，但必须写入新文件）
+     - 跳过 Row 2, Row 5（可以物理删除，bitmap = 1）
+     - **保留** Row 7, Row 9（虽然在 Deletion Chain 中被标记删除，但 bitmap = 0，必须写入新文件）
      - 然后将 Deletion Chain `[(7, ts=T3), (9, ts=T3)]` 迁移到新文件
 
 #### 3.2.3 为什么必须保留 Deletion Chain？
@@ -151,8 +151,8 @@ struct VersionedData {
 
 **数据重写时**：
 - ✅ 正确：调用 `rgVisibility.getBaseBitmap()` 获取 Base Bitmap（需要新增此方法）
-- ✅ 仅跳过 Base Bitmap 中为 0 的行（Memory GC 已 compact 的删除）
-- ✅ 保留 Base Bitmap 中为 1 的行（包括 Deletion Chain 中的行）
+- ✅ 仅跳过 Base Bitmap 中为 1 的行（Memory GC 已 compact 的删除，1 = deleted）
+- ✅ 保留 Base Bitmap 中为 0 的行（包括 Deletion Chain 中的行，0 = valid）
 - ❌ 错误：调用 `queryVisibility(timestamp)` 会包含 Deletion Chain，导致删除信息丢失
 
 **Visibility 同步时**：

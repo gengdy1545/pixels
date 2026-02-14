@@ -40,6 +40,11 @@ public:
     // Calculates total invalid ratio using (tileCount * CAPACITY) as total rows approximation
     double getInvalidRatio() const;
 
+    // Storage GC methods
+    std::vector<uint64_t> exportDeletionBlocks() const;
+    void prependDeletionBlocks(const uint64_t* items, size_t count);
+    std::vector<uint64_t> getBaseBitmap() const;
+
 private:
     static constexpr uint32_t VISIBILITY_RECORD_CAPACITY = CAPACITY;
     static constexpr uint32_t BITMAP_SIZE_PER_TILE_VISIBILITY = BITMAP_WORDS(CAPACITY);

@@ -106,6 +106,11 @@ class TileVisibility : public pixels::RetinaBase<TileVisibility<CAPACITY>> {
 
     uint64_t getInvalidCount() const;
 
+    // Storage GC methods
+    std::vector<uint64_t> exportDeletionBlocks() const;
+    void prependDeletionBlocks(const uint64_t* items, size_t count);
+    const uint64_t* getBaseBitmap() const;
+
   private:
     TileVisibility(const TileVisibility &) = delete;
     TileVisibility &operator=(const TileVisibility &) = delete;
