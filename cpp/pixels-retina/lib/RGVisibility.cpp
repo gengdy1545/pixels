@@ -113,5 +113,75 @@ double RGVisibility<CAPACITY>::getInvalidRatio() const {
     return static_cast<double>(totalInvalid) / (tileCount * CAPACITY);
 }
 
+template<size_t CAPACITY>
+std::vector<uint64_t> RGVisibility<CAPACITY>::exportDeletionBlocks() const {
+    std::vector<uint64_t> result;
+    
+    for (uint64_t tileIndex = 0; tileIndex < tileCount; tileIndex++) {
+        std::vector<uint64_t> tileItems = tileVisibilities[tileIndex].exportDeletionBlocks();
+        
+        // Convert tile-local rowId to RG-global rowId
+        for (uint64_t item : tileItems) {
+            uint16_t localRowId = extractRowId(item);
+            uint64_t timestamp = extractTimestamp(item);
+            uint32_t globalRowId = tileIndex * CAPACITY + localRowId;
+            
+            // Pack global rowId (32-bit) and timestamp (48-bit) into uint64_t
+            // Use high 16 bits for rowId, low 48 bits for timestamp
+            uint64_t globalItem = (static_cast<uint64_t>(globalRowId) << 48) | (timestamp & 0x0000FFFFFFFFFFFFULL);
+            result.push_back(globalItem);
+        }
+    }
+    
+    return result;
+}
+
+template<size_t CAPACITY>
+void RGVisibility<CAPACITY>::prependDeletionBlocks(const uint64_t* items, size_t count) {
+    // Group items by tile
+    std::vector<std::vector<uint64_t>> tileItems(tileCount);
+    
+    for (size_t i = 0; i < count; i++) {
+        uint64_t item = items[i];
+        uint32_t globalRowId = static_cast<uint32_t>(item >> 48);
+        uint64_t timestamp = item & 0x0000FFFFFFFFFFFFULL;
+        
+        uint32_t tileIndex = globalRowId / CAPACITY;
+        uint16_t localRowId = globalRowId % CAPACITY;
+        
+        if (tileIndex >= tileCount) {
+            throw std::runtime_error("Row id is out of range during prepend.");
+        }
+        
+        // Pack local rowId and timestamp
+        uint64_t localItem = makeDeleteIndex(localRowId, timestamp);
+        tileItems[tileIndex].push_back(localItem);
+    }
+    
+    // Prepend to each tile
+    for (uint64_t tileIndex = 0; tileIndex < tileCount; tileIndex++) {
+        if (!tileItems[tileIndex].empty()) {
+            tileVisibilities[tileIndex].prependDeletionBlocks(
+                tileItems[tileIndex].data(), 
+                tileItems[tileIndex].size());
+        }
+    }
+}
+
+template<size_t CAPACITY>
+std::vector<uint64_t> RGVisibility<CAPACITY>::getBaseBitmap() const {
+    std::vector<uint64_t> result;
+    result.reserve(tileCount * BITMAP_SIZE_PER_TILE_VISIBILITY);
+    
+    for (uint64_t i = 0; i < tileCount; i++) {
+        const uint64_t* tileBitmap = tileVisibilities[i].getBaseBitmap();
+        for (size_t j = 0; j < BITMAP_SIZE_PER_TILE_VISIBILITY; j++) {
+            result.push_back(tileBitmap[j]);
+        }
+    }
+    
+    return result;
+}
+
 // Explicit Instantiations for JNI use
 template class RGVisibility<RETINA_CAPACITY>;

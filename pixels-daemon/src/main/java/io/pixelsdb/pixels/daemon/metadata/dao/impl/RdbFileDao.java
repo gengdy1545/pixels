@@ -269,4 +269,90 @@ public class RdbFileDao extends FileDao
 
         return false;
     }
+
+    /**
+     * Atomically swap files: delete old files and insert new files in a single transaction.
+     * Used by Storage GC to ensure atomic metadata updates.
+     *
+     * @param filesToAdd list of new files to insert
+     * @param fileIdsToDelete list of old file IDs to delete
+     * @return true if the operation succeeds, false otherwise
+     */
+    @Override
+    public boolean atomicSwapFiles(List<MetadataProto.File> filesToAdd, List<Long> fileIdsToDelete)
+    {
+        Connection conn = db.getConnection();
+        try
+        {
+            // Start transaction
+            conn.setAutoCommit(false);
+
+            // Delete old files
+            if (fileIdsToDelete != null && !fileIdsToDelete.isEmpty())
+            {
+                String deleteSql = "DELETE FROM FILES WHERE FILE_ID=?";
+                try (PreparedStatement pst = conn.prepareStatement(deleteSql))
+                {
+                    for (Long id : fileIdsToDelete)
+                    {
+                        pst.setLong(1, id);
+                        pst.addBatch();
+                    }
+                    pst.executeBatch();
+                }
+            }
+
+            // Insert new files
+            if (filesToAdd != null && !filesToAdd.isEmpty())
+            {
+                String insertSql = "INSERT INTO FILES(" +
+                        "`FILE_NAME`," +
+                        "`FILE_TYPE`," +
+                        "`FILE_NUM_RG`," +
+                        "`FILE_MIN_ROW_ID`," +
+                        "`FILE_MAX_ROW_ID`," +
+                        "`PATHS_PATH_ID`) VALUES (?,?,?,?,?,?)";
+                try (PreparedStatement pst = conn.prepareStatement(insertSql))
+                {
+                    for (MetadataProto.File file : filesToAdd)
+                    {
+                        pst.setString(1, file.getName());
+                        pst.setInt(2, file.getTypeValue());
+                        pst.setInt(3, file.getNumRowGroup());
+                        pst.setLong(4, file.getMinRowId());
+                        pst.setLong(5, file.getMaxRowId());
+                        pst.setLong(6, file.getPathId());
+                        pst.addBatch();
+                    }
+                    pst.executeBatch();
+                }
+            }
+
+            // Commit transaction
+            conn.commit();
+            return true;
+        } catch (SQLException e)
+        {
+            log.error("atomicSwapFiles in RdbFileDao", e);
+            try
+            {
+                // Rollback on error
+                conn.rollback();
+            } catch (SQLException rollbackEx)
+            {
+                log.error("Failed to rollback transaction in atomicSwapFiles", rollbackEx);
+            }
+            return false;
+        } finally
+        {
+            try
+            {
+                // Restore auto-commit
+                conn.setAutoCommit(true);
+            } catch (SQLException e)
+            {
+                log.error("Failed to restore auto-commit in atomicSwapFiles", e);
+            }
+        }
+    }
 }

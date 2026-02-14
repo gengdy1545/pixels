@@ -98,6 +98,9 @@ public class RGVisibility implements AutoCloseable
     private native long[] getVisibilityBitmap(long timestamp, long nativeHandle);
     private native void garbageCollect(long timestamp, long nativeHandle);
     private native double getInvalidRatio(long nativeHandle);
+    private native long[] exportDeletionBlocks(long nativeHandle);
+    private native void prependDeletionBlocks(long[] items, long nativeHandle);
+    private native long[] getBaseBitmap(long nativeHandle);
     private static native long getNativeMemoryUsage();
     private static native long getRetinaTrackedMemoryUsage();
     private static native long getRetinaObjectCount();
@@ -144,6 +147,54 @@ public class RGVisibility implements AutoCloseable
             throw new IllegalStateException("RGVisibility instance has been closed.");
         }
         return getInvalidRatio(handle);
+    }
+
+    /**
+     * Export all deletion blocks from the deletion chain.
+     * Used by Storage GC to migrate deletion history to new files.
+     *
+     * @return array of deletion items (rowId + timestamp packed in uint64)
+     */
+    public long[] exportDeletionBlocks()
+    {
+        long handle = this.nativeHandle.get();
+        if (handle == 0)
+        {
+            throw new IllegalStateException("RGVisibility instance has been closed.");
+        }
+        return exportDeletionBlocks(handle);
+    }
+
+    /**
+     * Prepend deletion blocks to the head of the deletion chain.
+     * Used by Storage GC to restore deletion history in new files.
+     *
+     * @param items array of deletion items (rowId + timestamp packed in uint64)
+     */
+    public void prependDeletionBlocks(long[] items)
+    {
+        long handle = this.nativeHandle.get();
+        if (handle == 0)
+        {
+            throw new IllegalStateException("RGVisibility instance has been closed.");
+        }
+        prependDeletionBlocks(items, handle);
+    }
+
+    /**
+     * Get the base bitmap (Memory GC compacted bitmap).
+     * Used by Storage GC to determine which rows can be physically deleted.
+     *
+     * @return base bitmap as long array
+     */
+    public long[] getBaseBitmap()
+    {
+        long handle = this.nativeHandle.get();
+        if (handle == 0)
+        {
+            throw new IllegalStateException("RGVisibility instance has been closed.");
+        }
+        return getBaseBitmap(handle);
     }
 
     /**

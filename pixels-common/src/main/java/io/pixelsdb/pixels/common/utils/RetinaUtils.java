@@ -127,4 +127,47 @@ import io.pixelsdb.pixels.daemon.NodeProto;
         }
         return null;
     }
+
+    /**
+     * Extract Retina Node ID from file path.
+     * File naming convention: <Host>_<Timestamp>_<Counter>.pxl
+     * Parse from right to left to handle hostnames containing underscores.
+     *
+     * @param path the file path
+     * @return the Retina Node ID (hostname), or null if cannot be extracted
+     */
+    public static String extractRetinaNodeIdFromPath(String path)
+    {
+        if (path == null || path.isEmpty())
+        {
+            return null;
+        }
+
+        // Extract base filename
+        int lastSlashIndex = path.lastIndexOf('/');
+        String baseName = (lastSlashIndex == -1) ? path : path.substring(lastSlashIndex + 1);
+
+        // Remove .pxl extension if present
+        if (baseName.endsWith(".pxl"))
+        {
+            baseName = baseName.substring(0, baseName.length() - 4);
+        }
+
+        // Parse from right to left: first find the last underscore (before Counter)
+        int lastUnderscoreIndex = baseName.lastIndexOf('_');
+        if (lastUnderscoreIndex <= 0)
+        {
+            return null;
+        }
+
+        // Find the second-to-last underscore (before Timestamp)
+        int secondLastUnderscoreIndex = baseName.lastIndexOf('_', lastUnderscoreIndex - 1);
+        if (secondLastUnderscoreIndex <= 0)
+        {
+            return null;
+        }
+
+        // Everything before the second-to-last underscore is the hostname
+        return baseName.substring(0, secondLastUnderscoreIndex);
+    }
 }

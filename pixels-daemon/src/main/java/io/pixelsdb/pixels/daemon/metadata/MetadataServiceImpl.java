@@ -1492,6 +1492,28 @@ public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImpl
     }
 
     @Override
+    public void atomicSwapFiles(MetadataProto.AtomicSwapFilesRequest request,
+                                StreamObserver<MetadataProto.AtomicSwapFilesResponse> responseObserver)
+    {
+        MetadataProto.ResponseHeader.Builder headerBuilder = MetadataProto.ResponseHeader.newBuilder()
+                .setToken(request.getHeader().getToken());
+
+        if (this.fileDao.atomicSwapFiles(request.getFilesToAddList(), request.getFileIdsToDeleteList()))
+        {
+            headerBuilder.setErrorCode(SUCCESS).setErrorMsg("");
+        }
+        else
+        {
+            headerBuilder.setErrorCode(METADATA_DELETE_FILES_FAILED).setErrorMsg("atomic swap files failed");
+        }
+
+        MetadataProto.AtomicSwapFilesResponse response = MetadataProto.AtomicSwapFilesResponse.newBuilder()
+                .setHeader(headerBuilder).build();
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+
+    @Override
     public void createPeerPath(MetadataProto.CreatePeerPathRequest request,
                                StreamObserver<MetadataProto.CreatePeerPathResponse> responseObserver)
     {
