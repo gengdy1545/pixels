@@ -283,3 +283,20 @@ JNIEXPORT jlongArray JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getBase
         return nullptr;
     }
 }
+
+/*
+ * Class:     io_pixelsdb_pixels_retina_RGVisibility
+ * Method:    getInvalidCount
+ * Signature: (J)J
+ */
+JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getInvalidCount
+  (JNIEnv* env, jobject, jlong handle) {
+    try {
+        auto* rgVisibility = reinterpret_cast<RGVisibilityInstance*>(handle);
+        return static_cast<jlong>(rgVisibility->getInvalidCount());
+    } catch (const std::exception& e) {
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
+        return 0;
+    }
+}
+

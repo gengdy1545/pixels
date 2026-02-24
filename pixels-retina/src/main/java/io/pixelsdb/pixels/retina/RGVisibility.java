@@ -65,15 +65,22 @@ public class RGVisibility implements AutoCloseable
     private final AtomicLong nativeHandle = new AtomicLong();
     private final long recordNum;
 
+    /**
+     * The actual number of rows in this row-group, as provided at construction time.
+     * Stored here to avoid a JNI call for getTotalRowCount(), and more accurate than
+     * the C++ tileCount * CAPACITY (which rounds up to tile boundaries).
+     */
+    private final long rgRecordNum;
+
     public RGVisibility(long rgRecordNum)
     {
-        this.recordNum = rgRecordNum;
+        this.rgRecordNum = rgRecordNum;
         this.nativeHandle.set(createNativeObject(rgRecordNum));
     }
 
     public RGVisibility(long rgRecordNum, long timestamp, long[] initialBitmap)
     {
-        this.recordNum = rgRecordNum;
+        this.rgRecordNum = rgRecordNum;
         if (initialBitmap == null)
         {
             this.nativeHandle.set(createNativeObject(rgRecordNum));
@@ -109,6 +116,7 @@ public class RGVisibility implements AutoCloseable
     private native long[] exportDeletionBlocks(long nativeHandle);
     private native void prependDeletionBlocks(long[] items, long nativeHandle);
     private native long[] getBaseBitmap(long nativeHandle);
+    private native long getInvalidCount(long nativeHandle);
     private static native long getNativeMemoryUsage();
     private static native long getRetinaTrackedMemoryUsage();
     private static native long getRetinaObjectCount();
@@ -203,6 +211,37 @@ public class RGVisibility implements AutoCloseable
             throw new IllegalStateException("RGVisibility instance has been closed.");
         }
         return getBaseBitmap(handle);
+    }
+
+    /**
+     * Get the total number of invalid rows (baseBitmap 1-bits) across all tiles.
+     * Used by Storage GC for accurate file-level invalid ratio calculation:
+     * fileInvalidRatio = Σ(RG invalid count) / Σ(RG total row count)
+     *
+     * @return total invalid row count
+     */
+    public long getInvalidCount()
+    {
+        long handle = this.nativeHandle.get();
+        if (handle == 0)
+        {
+            throw new IllegalStateException("RGVisibility instance has been closed.");
+        }
+        return getInvalidCount(handle);
+    }
+
+    /**
+     * Get the actual number of rows in this row-group.
+     * Returns the {@code rgRecordNum} stored at construction time, which is more accurate
+     * than the C++ {@code tileCount * CAPACITY} (the latter rounds up to tile boundaries).
+     * Used together with {@link #getInvalidCount()} to compute file-level invalid ratio:
+     * {@code fileInvalidRatio = Σ(invalid count) / Σ(total row count)}
+     *
+     * @return actual row count of this RG
+     */
+    public long getTotalRowCount()
+    {
+        return this.rgRecordNum;
     }
 
     /**

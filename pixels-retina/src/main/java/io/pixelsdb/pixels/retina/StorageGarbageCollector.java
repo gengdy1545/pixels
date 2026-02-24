@@ -588,7 +588,9 @@ public class StorageGarbageCollector
     }
 
     /**
-     * Calculate invalid ratio for a file by aggregating all RG invalid ratios.
+     * Calculate invalid ratio for a file by aggregating row counts across all RGs.
+     * Uses accurate weighted calculation: Σ(RG invalid rows) / Σ(RG total rows),
+     * rather than a simple arithmetic average of per-RG ratios.
      *
      * @param file file metadata
      * @return invalid ratio (0.0 to 1.0)
@@ -598,20 +600,20 @@ public class StorageGarbageCollector
         try
         {
             int numRowGroups = file.getNumRowGroup();
-            double totalInvalidRatio = 0.0;
-            int validRGCount = 0;
+            long totalInvalidCount = 0;
+            long totalRowCount = 0;
 
             for (int rgId = 0; rgId < numRowGroups; rgId++)
             {
                 RGVisibility rgVisibility = resourceManager.getRGVisibility(file.getId(), rgId);
                 if (rgVisibility != null)
                 {
-                    totalInvalidRatio += rgVisibility.getInvalidRatio();
-                    validRGCount++;
+                    totalInvalidCount += rgVisibility.getInvalidCount();
+                    totalRowCount += rgVisibility.getTotalRowCount();
                 }
             }
 
-            return validRGCount > 0 ? totalInvalidRatio / validRGCount : 0.0;
+            return totalRowCount > 0 ? (double) totalInvalidCount / totalRowCount : 0.0;
         }
         catch (Exception e)
         {

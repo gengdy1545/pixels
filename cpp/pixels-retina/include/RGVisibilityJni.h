@@ -111,6 +111,14 @@ JNIEXPORT void JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_prependDeleti
 JNIEXPORT jlongArray JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getBaseBitmap
   (JNIEnv *, jobject, jlong);
 
+/*
+ * Class:     io_pixelsdb_pixels_retina_RGVisibility
+ * Method:    getInvalidCount
+ * Signature: (J)J
+ */
+JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getInvalidCount
+  (JNIEnv *, jobject, jlong);
+
 #ifdef __cplusplus
 }
 #endif
