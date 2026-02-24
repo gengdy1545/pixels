@@ -40,6 +40,14 @@ public:
     // Calculates total invalid ratio using (tileCount * CAPACITY) as total rows approximation
     double getInvalidRatio() const;
 
+    // Returns the total number of invalid rows (baseBitmap 1-bits) across all tiles.
+    // Used by Storage GC for accurate file-level invalid ratio: Σ(RG invalid) / Σ(RG total).
+    uint64_t getInvalidCount() const;
+
+    // Returns the total row capacity of this RG (tileCount * CAPACITY).
+    // Used together with getInvalidCount() to compute accurate file-level invalid ratio.
+    uint64_t getTotalRowCount() const;
+
     // Storage GC methods
     std::vector<uint64_t> exportDeletionBlocks() const;
     void prependDeletionBlocks(const uint64_t* items, size_t count);

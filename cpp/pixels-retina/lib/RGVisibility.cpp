@@ -114,6 +114,20 @@ double RGVisibility<CAPACITY>::getInvalidRatio() const {
 }
 
 template<size_t CAPACITY>
+uint64_t RGVisibility<CAPACITY>::getInvalidCount() const {
+    uint64_t totalInvalid = 0;
+    for (uint64_t i = 0; i < tileCount; i++) {
+        totalInvalid += tileVisibilities[i].getInvalidCount();
+    }
+    return totalInvalid;
+}
+
+template<size_t CAPACITY>
+uint64_t RGVisibility<CAPACITY>::getTotalRowCount() const {
+    return tileCount * CAPACITY;
+}
+
+template<size_t CAPACITY>
 std::vector<uint64_t> RGVisibility<CAPACITY>::exportDeletionBlocks() const {
     std::vector<uint64_t> result;
     
