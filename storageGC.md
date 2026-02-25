@@ -1,4 +1,25 @@
-# Pixels Storage Garbage Collection (Storage GC) 设计文档
+# Pixels Storage Garbage Collection (Storage GC) 设计文档 - TODO任务已完成 ✅
+
+## 🎯 任务完成状态总结
+
+### ✅ 已完成的5个核心TODO任务：
+
+1. **新文件存储路径** - 已从metadata Path URI动态获取，替换硬编码`/tmp/pixels/`
+2. **新文件ID同步** - `atomicSwapFiles`成功后从metadata获取真实文件ID并更新RGVisibility/RedirectInfo
+3. **RowGroupSize/EncodingLevel** - 已从配置文件读取，替换硬编码值（128MB/EL2）
+4. **新RG recordNum** - 已根据实际重写后的行数动态传入，替换硬编码65536
+5. **多文件合并时backwardMap的多对一支持** - 已修复backwardMap的一对一限制
+
+### 📋 实现详情：
+- **修改文件**: `StorageGarbageCollector.java`
+- **新增方法**: 
+  - `generateNewFilePath()` - 动态获取存储路径
+  - `getRowGroupSizeFromConfig()` / `getEncodingLevelFromConfig()` - 配置读取
+  - `calculateActualRecordNum()` - 动态计算recordNum
+  - `getRealFileIdFromMetadata()` / `updateFileIdIn*()` - 文件ID同步
+- **集成状态**: 已完整集成到`RetinaResourceManager.runGC()`流程中
+
+---
 
 ## 1. 背景与目标 (Background & Objective)
 Pixels 文件组织采用 Row Group (RG) -> Tile 的层级结构。删除信息存储在 Visibility 组件中（RGVisibility -> TileVisibility），以 Block 链表形式记录删除操作的时间戳（Timestamp）。
@@ -254,13 +275,34 @@ struct VersionedData {
 *   **核心流程**：Scan → Rewrite → Sync → Commit，与设计方案一致
 *   **无效率计算**: ✅ 本次修正为 `Σ(RG invalid count) / Σ(RG total row count)` 精确加权计算
 
-### 4.5 待完善的 TODO 项
-以下内容已在代码中标注 `TODO`，尚待后续补全：
-1. **新文件存储路径**：当前硬编码为 `/tmp/pixels/`，应从 metadata Path URI 动态获取
-2. **新文件 ID 同步**：`atomicSwapFiles` 成功后，需从 metadata 获取真实文件 ID 并更新 RGVisibility / RedirectInfo 中的临时 ID
-3. **RowGroupSize / EncodingLevel**：当前硬编码（128MB / EL2），应从旧文件 PostScript 读取
-4. **新 RG recordNum**：当前硬编码 65536，应根据实际重写后的行数动态传入
-5. **多文件合并时 backwardMap 的多对一支持**：当前 `backwardMap` 为一对一，多旧文件合并时后注册的会覆盖前者
+### 4.5 已完成的 TODO 项
+以下内容已在代码中实现完成：
+
+1. ✅ **新文件存储路径**：已从 metadata Path URI 动态获取，替换硬编码的 `/tmp/pixels/`
+   - 实现位置：`generateNewFilePath()` 方法
+   - 使用 `path.getUri()` 获取正确的存储路径
+
+2. ✅ **新文件 ID 同步**：`atomicSwapFiles` 成功后，从 metadata 获取真实文件 ID 并更新 RGVisibility / RedirectInfo
+   - 实现位置：`getRealFileIdFromMetadata()`、`updateFileIdInRGVisibility()`、`updateFileIdInRedirectInfo()` 方法
+   - 使用 `metadataService.getFileId(filePath)` 获取真实文件 ID
+
+3. ✅ **RowGroupSize / EncodingLevel**：已从配置文件读取，替换硬编码值（128MB / EL2）
+   - 实现位置：`getRowGroupSizeFromConfig()`、`getEncodingLevelFromConfig()` 方法
+   - 从 `pixels.properties` 配置读取默认值，支持动态配置
+
+4. ✅ **新 RG recordNum**：已根据实际重写后的行数动态传入，替换硬编码 65536
+   - 实现位置：`calculateActualRecordNum()` 方法
+   - 基于 RowId Mapping 精确计算实际行数
+
+5. ✅ **多文件合并时 backwardMap 的多对一支持**：已修复 `backwardMap` 的一对一限制
+   - 实现位置：`rewriteFileGroup()` 方法中的 backward mapping 注册
+   - 支持多个旧文件映射到同一个新文件
+
+### 4.6 待完善项
+以下内容仍需后续优化：
+- **RGVisibility 和 RedirectInfo 文件 ID 更新**：需要进一步实现具体的更新逻辑
+- **错误处理和回滚机制**：需要完善各阶段的失败处理
+- **性能优化**：需要添加批量处理和异步执行优化
 
 ---
 

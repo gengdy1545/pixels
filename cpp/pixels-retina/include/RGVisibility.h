@@ -37,14 +37,15 @@ public:
 
     uint64_t getBitmapSize() const;
     
-    // Calculates total invalid ratio using (tileCount * CAPACITY) as total rows approximation
+    // Calculates total invalid ratio using actual rgRecordNum for accurate file-level statistics
     double getInvalidRatio() const;
 
     // Returns the total number of invalid rows (baseBitmap 1-bits) across all tiles.
     // Used by Storage GC for accurate file-level invalid ratio: Σ(RG invalid) / Σ(RG total).
     uint64_t getInvalidCount() const;
 
-    // Returns the total row capacity of this RG (tileCount * CAPACITY).
+    // Returns the actual number of rows in this RG (rgRecordNum from constructor).
+    // More accurate than tileCount * CAPACITY (which rounds up to tile boundaries).
     // Used together with getInvalidCount() to compute accurate file-level invalid ratio.
     uint64_t getTotalRowCount() const;
 
@@ -59,6 +60,7 @@ private:
 
     TileVisibility<CAPACITY>* tileVisibilities;
     const uint64_t tileCount;
+    const uint64_t rgRecordNum;  // Actual number of rows in this RG
 
     TileVisibility<CAPACITY>* getTileVisibility(uint32_t rowId) const;
 };
