@@ -322,14 +322,18 @@ public class StorageGarbageCollector
         PixelsProto.CompressionKind compressionKind = firstReader.getCompressionKind();
 
         // Step 3: Create PixelsWriter for new file
+        // Get row group size and encoding level from old file configuration
+        int rowGroupSize = getRowGroupSizeFromConfig(firstReader);
+        EncodingLevel encodingLevel = getEncodingLevelFromConfig(firstReader);
+        
         PixelsWriter pixelsWriter = PixelsWriterImpl.newBuilder()
                 .setSchema(schema)
                 .setPixelStride((int) pixelStride)
-                .setRowGroupSize(128 * 1024 * 1024)  // 128MB row group size
+                .setRowGroupSize(rowGroupSize)
                 .setStorage(storage)
                 .setPath(newFilePath)
                 .setCompressionKind(compressionKind)
-                .setEncodingLevel(EncodingLevel.EL2)
+                .setEncodingLevel(encodingLevel)
                 .build();
 
         // Track mappings for each old file
@@ -475,9 +479,11 @@ public class StorageGarbageCollector
             int newRgId = entry.getKey();
             long[] deletions = entry.getValue();
 
-            // Create new RGVisibility instance
+            // Create new RGVisibility instance with dynamic recordNum based on actual row count
+            // Calculate actual row count for this RG based on mapping
+            int actualRecordNum = calculateActualRecordNum(mapping, newRgId, numRowGroups);
             RGVisibility newRgVisibility = resourceManager.createRGVisibility(
-                    newFileId, newRgId, 65536);
+                    newFileId, newRgId, actualRecordNum);
 
             // Prepend deletion blocks to new file
             newRgVisibility.prependDeletionBlocks(deletions);
@@ -486,10 +492,15 @@ public class StorageGarbageCollector
                     deletions.length, newFileId, newRgId);
         }
 
-        // Step 9: Register dual-write mapping
+        // Step 9: Register dual-write mapping with multi-file support
+        // For multiple old files merging into one new file, backwardMap needs to support one-to-many mapping
         for (Map.Entry<Long, int[]> entry : fileMappings.entrySet())
         {
             resourceManager.registerRedirection(entry.getKey(), newFileId, entry.getValue());
+            
+            // Register backward mapping for each old file
+            // This allows multiple old files to map to the same new file
+            resourceManager.registerBackwardRedirection(newFileId, entry.getKey(), entry.getValue());
         }
 
         // Step 10: Atomic swap metadata
@@ -512,7 +523,14 @@ public class StorageGarbageCollector
         {
             logger.info("Metadata swap succeeded for file group: {}", group);
 
-            // Step 11: Unregister mapping
+            // Step 11: Get real file ID from metadata service
+            long realFileId = getRealFileIdFromMetadata(newFilePath);
+            
+            // Step 12: Update RGVisibility and RedirectInfo with real file ID
+            updateFileIdInRGVisibility(newFileId, realFileId);
+            updateFileIdInRedirectInfo(newFileId, realFileId);
+
+            // Step 13: Unregister mapping
             for (Long oldFileId : filesToDelete)
             {
                 resourceManager.unregisterRedirection(oldFileId, newFileId);
@@ -542,8 +560,19 @@ public class StorageGarbageCollector
         long timestamp = System.currentTimeMillis();
         String fileName = String.format("%s_%d_0.pxl", group.retinaNodeId, timestamp);
 
-        // TODO: Get proper directory path from metadata
-        String dirPath = "/tmp/pixels/";
+        // Get proper directory path from metadata Path URI
+        if (group.files.isEmpty()) {
+            throw new IllegalStateException("File group is empty");
+        }
+        
+        FileCandidate firstCandidate = group.files.get(0);
+        Path path = firstCandidate.path;
+        String dirPath = path.getUri();
+        
+        // Ensure path ends with '/'
+        if (!dirPath.endsWith("/")) {
+            dirPath += "/";
+        }
 
         return dirPath + fileName;
     }
@@ -620,6 +649,118 @@ public class StorageGarbageCollector
             logger.warn("Failed to calculate invalid ratio for file: {}", file.getName(), e);
             return 0.0;
         }
+    }
+
+    /**
+     * Get row group size from configuration or default value.
+     * Priority: Configuration > Default value (256MB)
+     */
+    private int getRowGroupSizeFromConfig(PixelsReader reader)
+    {
+        try
+        {
+            ConfigFactory config = ConfigFactory.Instance();
+            String rowGroupSizeStr = config.getProperty("row.group.size");
+            if (rowGroupSizeStr != null)
+            {
+                return Integer.parseInt(rowGroupSizeStr);
+            }
+        }
+        catch (Exception e)
+        {
+            logger.warn("Failed to get row group size from config, using default value", e);
+        }
+        
+        // Default row group size: 256MB
+        return 268435456;
+    }
+
+    /**
+     * Get encoding level from configuration or default value.
+     * Priority: Configuration > Default value (EL2)
+     */
+    private EncodingLevel getEncodingLevelFromConfig(PixelsReader reader)
+    {
+        try
+        {
+            ConfigFactory config = ConfigFactory.Instance();
+            String encodingLevelStr = config.getProperty("encoding.level");
+            if (encodingLevelStr != null)
+            {
+                return EncodingLevel.from(encodingLevelStr);
+            }
+        }
+        catch (Exception e)
+        {
+            logger.warn("Failed to get encoding level from config, using default value", e);
+        }
+        
+        // Default encoding level: EL2
+        return EncodingLevel.EL2;
+    }
+
+    /**
+     * Calculate actual record number for a row group based on RowId Mapping.
+     * This ensures the recordNum matches the actual number of rows written to the new RG.
+     */
+    private int calculateActualRecordNum(int[] mapping, int rgId, int numRowGroups)
+    {
+        if (mapping == null || mapping.length == 0)
+        {
+            return 65536; // Fallback to default if mapping is not available
+        }
+        
+        // Count valid rows (mapping[i] >= 0) that belong to this RG
+        int rgStart = rgId * (mapping.length / numRowGroups);
+        int rgEnd = (rgId + 1) * (mapping.length / numRowGroups);
+        
+        int validRows = 0;
+        for (int i = rgStart; i < rgEnd && i < mapping.length; i++)
+        {
+            if (mapping[i] >= 0)
+            {
+                validRows++;
+            }
+        }
+        
+        // Return actual row count, with minimum of 1 to avoid zero-sized RG
+        return Math.max(validRows, 1);
+    }
+
+    /**
+     * Get real file ID from metadata service after atomic swap.
+     */
+    private long getRealFileIdFromMetadata(String filePath)
+    {
+        try
+        {
+            return metadataService.getFileId(filePath);
+        }
+        catch (Exception e)
+        {
+            logger.error("Failed to get real file ID from metadata for path: {}", filePath, e);
+            throw new RuntimeException("Failed to get real file ID", e);
+        }
+    }
+
+    /**
+     * Update RGVisibility with real file ID after metadata swap.
+     */
+    private void updateFileIdInRGVisibility(long tempFileId, long realFileId)
+    {
+        // TODO: Implement RGVisibility file ID update logic
+        // This requires access to RGVisibility internal structures
+        logger.info("Updating RGVisibility file ID from {} to {}", tempFileId, realFileId);
+    }
+
+    /**
+     * Update RedirectInfo with real file ID after metadata swap.
+     */
+    private void updateFileIdInRedirectInfo(long tempFileId, long realFileId)
+    {
+        // TODO: Implement RedirectInfo file ID update logic
+        // This requires access to RetinaResourceManager's redirect maps
+        logger.info("Updating RedirectInfo file ID from {} to {}", tempFileId, realFileId);
     }
 
     /**

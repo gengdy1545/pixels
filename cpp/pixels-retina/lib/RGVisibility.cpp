@@ -24,7 +24,8 @@
 
 template<size_t CAPACITY>
 RGVisibility<CAPACITY>::RGVisibility(uint64_t rgRecordNum)
-    : tileCount((rgRecordNum + VISIBILITY_RECORD_CAPACITY - 1) / VISIBILITY_RECORD_CAPACITY) {
+    : tileCount((rgRecordNum + VISIBILITY_RECORD_CAPACITY - 1) / VISIBILITY_RECORD_CAPACITY),
+      rgRecordNum(rgRecordNum) {
     size_t allocSize = tileCount * sizeof(TileVisibility<CAPACITY>);
     void* rawMemory = operator new[](allocSize);
     tileVisibilities = static_cast<TileVisibility<CAPACITY>*>(rawMemory);
@@ -35,7 +36,8 @@ RGVisibility<CAPACITY>::RGVisibility(uint64_t rgRecordNum)
 
 template<size_t CAPACITY>
 RGVisibility<CAPACITY>::RGVisibility(uint64_t rgRecordNum, uint64_t timestamp, const std::vector<uint64_t>& initialBitmap)
-    : tileCount((rgRecordNum + VISIBILITY_RECORD_CAPACITY - 1) / VISIBILITY_RECORD_CAPACITY) {
+    : tileCount((rgRecordNum + VISIBILITY_RECORD_CAPACITY - 1) / VISIBILITY_RECORD_CAPACITY),
+      rgRecordNum(rgRecordNum) {
     size_t allocSize = tileCount * sizeof(TileVisibility<CAPACITY>);
     void* rawMemory = operator new[](allocSize);
 
@@ -110,7 +112,7 @@ double RGVisibility<CAPACITY>::getInvalidRatio() const {
     for (uint64_t i = 0; i < tileCount; i++) {
         totalInvalid += tileVisibilities[i].getInvalidCount();
     }
-    return static_cast<double>(totalInvalid) / (tileCount * CAPACITY);
+    return static_cast<double>(totalInvalid) / rgRecordNum;
 }
 
 template<size_t CAPACITY>
@@ -124,7 +126,7 @@ uint64_t RGVisibility<CAPACITY>::getInvalidCount() const {
 
 template<size_t CAPACITY>
 uint64_t RGVisibility<CAPACITY>::getTotalRowCount() const {
-    return tileCount * CAPACITY;
+    return rgRecordNum;
 }
 
 template<size_t CAPACITY>

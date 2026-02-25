@@ -117,9 +117,6 @@ public class RGVisibility implements AutoCloseable
     private native void prependDeletionBlocks(long[] items, long nativeHandle);
     private native long[] getBaseBitmap(long nativeHandle);
     private native long getInvalidCount(long nativeHandle);
-    private static native long getNativeMemoryUsage();
-    private static native long getRetinaTrackedMemoryUsage();
-    private static native long getRetinaObjectCount();
 
     public void deleteRecord(int rgRowOffset, long timestamp)
     {
@@ -244,69 +241,5 @@ public class RGVisibility implements AutoCloseable
         return this.rgRecordNum;
     }
 
-    /**
-     * Retrieves the total number of bytes allocated by the native library.
-     * This corresponds to the 'stats.allocated' metric in jemalloc.
-     *
-     * @return The number of bytes allocated.
-     * @throws RuntimeException if jemalloc is disabled or fails to retrieve statistics.
-     */
-    public static long getMemoryUsage()
-    {
-        return handleMemoryMetric(getNativeMemoryUsage(), "Allocated Memory");
-    }
 
-    /**
-     * Retrieves the total number of bytes currently tracked by RetinaBase.
-     * This represents the net memory used by specific Retina business objects
-     * (e.g., TileVisibility, DeleteIndexBlock).
-     *
-     * @return The number of tracked bytes.
-     * @throws RuntimeException if the native library fails to retrieve statistics.
-     */
-    public static long getTrackedMemoryUsage()
-    {
-        return handleMemoryMetric(getRetinaTrackedMemoryUsage(), "Tracked Retina Memory");
-    }
-
-    public static long getRetinaTrackedObjectCount() {
-        return handleMemoryMetric(getRetinaObjectCount(), "Retina Object Count");
-    }
-
-    /**
-     * Translates native error codes into meaningful Java exceptions.
-     * * Error Code Mapping:
-     * -1: Feature disabled (ENABLE_JEMALLOC=OFF)
-     * -2: Failed to refresh jemalloc epoch (internal cache update failed)
-     * -3: Failed to read metric via mallctl
-     *
-     * @param result The value returned from the JNI layer.
-     * @param metricName The name of the metric for the error message.
-     * @return The valid metric value if non-negative.
-     */
-    private static long handleMemoryMetric(long result, String metricName)
-    {
-        if (result >= 0)
-        {
-            return result;
-        }
-
-        String errorMessage;
-        switch ((int) result)
-        {
-            case -1:
-                errorMessage = metricName + " monitoring is disabled. Build with -DENABLE_JEMALLOC=ON.";
-                break;
-            case -2:
-                errorMessage = "Failed to refresh jemalloc epoch. Statistics might be stale or unreachable.";
-                break;
-            case -3:
-                errorMessage = "Mallctl failed to read " + metricName + ". Check jemalloc configuration/prefix.";
-                break;
-            default:
-                errorMessage = "An unexpected error occurred in native memory monitoring (Code: " + result + ")";
-                break;
-        }
-        throw new RuntimeException(errorMessage);
-    }
 }
