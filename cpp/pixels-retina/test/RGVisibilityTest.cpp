@@ -67,7 +67,7 @@ TEST_F(RGVisibilityTest, BasicDeleteAndVisibility) {
     delete[] bitmap2;
 }
 
-TEST_F(RGVisibilityTest, InvalidRatio) {
+TEST_F(RGVisibilityTest, InvalidCount) {
     // Fill one block (8 items) in Tile 0 with timestamp 100
     for(int i = 0; i < 8; ++i) {
         rgVisibility->deleteRGRecord(i, 100);
@@ -80,7 +80,7 @@ TEST_F(RGVisibilityTest, InvalidRatio) {
     // GC(150) -> Should reclaim first block (8 items) but not second
     rgVisibility->collectRGGarbage(150);
     
-    // Test getInvalidCount instead of getInvalidRatio
+    // Test getInvalidCount instead of getInvalidCount
     uint64_t invalidCount = rgVisibility->getInvalidCount();
     EXPECT_EQ(invalidCount, 8UL);
 
@@ -258,4 +258,112 @@ TEST_F(RGVisibilityTest, MultiThread) {
     
     delete[] finalBitmap;
     delete[] expectedFinalBitmap;
+}
+
+// Test: verify that getInvalidCount() returns the correct value after one GC,
+// even while delete and read threads are still running concurrently.
+TEST_F(RGVisibilityTest, InvalidCountAfterGC) {
+    // Number of rows to delete in the first batch (must fill at least one full
+    // DeleteIndexBlock so that collectRGGarbage has something to compact).
+    // We delete 64 rows so that 8 full blocks (8 items each) are produced.
+    static constexpr uint32_t FIRST_BATCH_SIZE = 64;
+
+    std::atomic<bool> stopThreads{false};
+    // Signals that the first batch of deletes has been committed
+    std::atomic<bool> firstBatchDone{false};
+
+    // Timestamp counter shared across threads; each delete gets a unique ts
+    std::atomic<uint64_t> tsCounter{1};
+
+    // -----------------------------------------------------------------------
+    // Delete thread
+    // Phase 1: delete FIRST_BATCH_SIZE distinct rows with increasing timestamps,
+    //          then signal firstBatchDone.
+    // Phase 2: keep deleting remaining rows until stopThreads is set.
+    // -----------------------------------------------------------------------
+    std::thread deleteThread([&]() {
+        // Phase 1 – first batch (rows 0 .. FIRST_BATCH_SIZE-1)
+        for (uint32_t rowId = 0; rowId < FIRST_BATCH_SIZE; ++rowId) {
+            uint64_t ts = tsCounter.fetch_add(1, std::memory_order_relaxed);
+            rgVisibility->deleteRGRecord(rowId, ts);
+        }
+        firstBatchDone.store(true, std::memory_order_release);
+
+        // Phase 2 – continue deleting remaining rows until told to stop
+        uint32_t nextRow = FIRST_BATCH_SIZE;
+        while (!stopThreads.load(std::memory_order_acquire)) {
+            if (nextRow < ROW_COUNT) {
+                uint64_t ts = tsCounter.fetch_add(1, std::memory_order_relaxed);
+                rgVisibility->deleteRGRecord(nextRow, ts);
+                ++nextRow;
+            } else {
+                // All rows deleted; just spin-wait
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    // -----------------------------------------------------------------------
+    // Read threads – continuously call getRGVisibilityBitmap() until stopped
+    // -----------------------------------------------------------------------
+    static constexpr int NUM_READ_THREADS = 4;
+    std::vector<std::thread> readThreads;
+    readThreads.reserve(NUM_READ_THREADS);
+    for (int i = 0; i < NUM_READ_THREADS; ++i) {
+        readThreads.emplace_back([&]() {
+            while (!stopThreads.load(std::memory_order_acquire)) {
+                // Use UINT64_MAX so the query timestamp is always >= baseTimestamp,
+                // even after GC advances baseTimestamp. We only care that the call
+                // doesn't crash; bitmap correctness is covered by MultiThread test.
+                uint64_t* bmp = rgVisibility->getRGVisibilityBitmap(UINT64_MAX);
+                delete[] bmp;
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Main thread: wait for first batch, run GC, snapshot getInvalidCount()
+    // -----------------------------------------------------------------------
+
+    // Wait until the first batch of deletes is done
+    while (!firstBatchDone.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    // GC with the timestamp that covers all first-batch deletes.
+    // tsCounter has been incremented FIRST_BATCH_SIZE times (values 1..64),
+    // so the max first-batch timestamp is FIRST_BATCH_SIZE.
+    uint64_t gcTimestamp = FIRST_BATCH_SIZE;
+    rgVisibility->collectRGGarbage(gcTimestamp);
+
+    // Snapshot getInvalidCount() while delete/read threads are still running
+    uint64_t snapshot = rgVisibility->getInvalidCount();
+
+    // Stop all threads and wait for them to finish
+    stopThreads.store(true, std::memory_order_release);
+    deleteThread.join();
+    for (auto& t : readThreads) {
+        t.join();
+    }
+
+    // -----------------------------------------------------------------------
+    // Ground-truth: count set bits in baseBitmap across all tiles.
+    // Because no second GC was triggered, the baseBitmap is frozen at the
+    // state produced by the single collectRGGarbage() call above.
+    // -----------------------------------------------------------------------
+    std::vector<uint64_t> baseBitmap = rgVisibility->getBaseBitmap();
+    uint64_t baseBitmapCount = 0;
+    for (uint64_t word : baseBitmap) {
+        baseBitmapCount += static_cast<uint64_t>(__builtin_popcountll(word));
+    }
+
+    std::cout << "InvalidCountAfterGC: snapshot=" << snapshot
+              << " baseBitmapCount=" << baseBitmapCount << std::endl;
+
+    // The two values must be identical: both reflect exactly the rows that
+    // were merged into baseBitmap by the single GC call.
+    EXPECT_EQ(snapshot, baseBitmapCount)
+        << "snapshot=" << snapshot
+        << " baseBitmapCount=" << baseBitmapCount;
 }
