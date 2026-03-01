@@ -81,8 +81,8 @@ public class RetinaCheckpointReader
             // Actually footer structure is: ... [Part Count 4B] [Magic 4B] [Footer Len 4B]
             // We read last 8 bytes first to check Magic and get Footer Length.
             fsReader.seek(fileLen - 8);
-            int magic = fsReader.readInt();
-            int footerLength = fsReader.readInt();
+            int magic = fsReader.readInt(ByteOrder.BIG_ENDIAN);
+            int footerLength = fsReader.readInt(ByteOrder.BIG_ENDIAN);
 
             if (magic != CHECKPOINT_MAGIC)
             {
