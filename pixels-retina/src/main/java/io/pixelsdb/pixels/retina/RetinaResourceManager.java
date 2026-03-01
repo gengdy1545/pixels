@@ -73,6 +73,12 @@ public class RetinaResourceManager
 
     private final Map<Long, AtomicInteger> checkpointRefCounts;
 
+    /**
+     * Magic Checkpoint "PXCK"
+     */
+    private static final int CHECKPOINT_MAGIC = 0x5058434B;
+    private static final int CHECKPOINT_PART_SIZE = 4 * 1024 * 1024; // 4MB per part
+
     private static class CheckpointEntry
     {
         final long fileId;
@@ -86,6 +92,20 @@ public class RetinaResourceManager
             this.rgId = rgId;
             this.recordNum = recordNum;
             this.bitmap = bitmap;
+        }
+    }
+
+    private static class CheckpointPartMetadata
+    {
+        long offset;
+        int length;
+        int count;
+
+        CheckpointPartMetadata(long offset, int length, int count)
+        {
+            this.offset = offset;
+            this.length = length;
+            this.count = count;
         }
     }
 
@@ -366,23 +386,73 @@ public class RetinaResourceManager
                 {
                     Storage storage = StorageFactory.Instance().getStorage(filePath);
                     // Use a temporary file to ensure atomic commit
-                    // Although LocalFS lacks rename, using a synchronized block here 
+                    // Although LocalFS lacks rename, using a synchronized block here
                     // makes it safe within this JVM instance.
                     try (DataOutputStream out = storage.create(filePath, true, 8 * 1024 * 1024))
                     {
-                        out.writeInt(totalRgs);
+                        List<CheckpointPartMetadata> parts = new ArrayList<>();
+                        long currentOffset = 0;
+                        int currentPartCount = 0;
+                        ByteArrayOutputStream buffer = new ByteArrayOutputStream(CHECKPOINT_PART_SIZE);
+                        DataOutputStream bufferDataOut = new DataOutputStream(buffer);
+
                         for (int i = 0; i < totalRgs; i++)
                         {
                             CheckpointEntry entry = queue.take();
-                            out.writeLong(entry.fileId);
-                            out.writeInt(entry.rgId);
-                            out.writeInt(entry.recordNum);
-                            out.writeInt(entry.bitmap.length);
+                            // Serialize entry to buffer
+                            bufferDataOut.writeLong(entry.fileId);
+                            bufferDataOut.writeInt(entry.rgId);
+                            bufferDataOut.writeInt(entry.recordNum);
+                            bufferDataOut.writeInt(entry.bitmap.length);
                             for (long l : entry.bitmap)
                             {
-                                out.writeLong(l);
+                                bufferDataOut.writeLong(l);
+                            }
+                            currentPartCount++;
+
+                            // If buffer exceeds threshold, flush as a part
+                            if (buffer.size() >= CHECKPOINT_PART_SIZE)
+                            {
+                                byte[] data = buffer.toByteArray();
+                                out.write(data);
+                                parts.add(new CheckpointPartMetadata(currentOffset, data.length, currentPartCount));
+                                currentOffset += data.length;
+
+                                buffer.reset();
+                                currentPartCount = 0;
                             }
                         }
+
+                        // Flush remaining buffer
+                        if (buffer.size() > 0)
+                        {
+                            byte[] data = buffer.toByteArray();
+                            out.write(data);
+                            parts.add(new CheckpointPartMetadata(currentOffset, data.length, currentPartCount));
+                            currentOffset += data.length;
+                        }
+
+                        // Write Footer
+                        long footerStart = currentOffset;
+                        // Write Part Metadata
+                        for (CheckpointPartMetadata part : parts)
+                        {
+                            out.writeLong(part.offset);
+                            out.writeInt(part.length);
+                            out.writeInt(part.count);
+                        }
+                        out.writeInt(parts.size()); // Part Count
+                        out.writeInt(CHECKPOINT_MAGIC);
+
+                        // Footer Length (Current Pos - Footer Start)
+                        // Note: DataOutputStream doesn't give us direct position easily, so we calculate
+                        // Part Metadata Size: (8 + 4 + 4) * numParts
+                        // Part Count Size: 4
+                        // Magic Size: 4
+                        // Footer Length Size: 4
+                        int footerLength = (16 * parts.size()) + 4 + 4 + 4;
+                        out.writeInt(footerLength);
+
                         out.flush();
                     }
                     long endWrite = System.currentTimeMillis();
@@ -736,6 +806,95 @@ public class RetinaResourceManager
                 Storage latestStorage = StorageFactory.Instance().getStorage(latestPath);
                 if (latestStorage.exists(latestPath))
                 {
+                    // Try improved loading first (Read fully + Parallel processing)
+                    try (PhysicalReader fsReader = PhysicalReaderUtil.newPhysicalReader(latestStorage, latestPath))
+                    {
+                        long fileLen = fsReader.getFileLength();
+                        if (fileLen > 12) // Minimum size check (Magic + Footer Len + at least some data)
+                        {
+                            // Read entire file into memory
+                            // Note: Assuming checkpoint file size < 2GB
+                            ByteBuffer buffer = ByteBuffer.allocate((int) fileLen);
+                            fsReader.readFully(buffer.array());
+                            
+                            // Check Footer
+                            buffer.position((int) fileLen - 8);
+                            int magic = buffer.getInt();
+                            int footerLength = buffer.getInt();
+                            
+                            if (magic == CHECKPOINT_MAGIC)
+                            {
+                                logger.info("Detected new checkpoint format with footer, using parallel loading.");
+                                // Parse Footer
+                                int footerStart = (int) fileLen - footerLength;
+                                buffer.position(footerStart);
+                                
+                                List<CheckpointPartMetadata> parts = new ArrayList<>();
+                                // Footer doesn't store part count first, it's: [Parts...] [Count] [Magic] [Len]
+                                // We need to read backwards? No, we know footer start.
+                                // But we don't know part count until we read it at the end of parts list?
+                                // Let's check write structure: 
+                                // [Parts Data] [Part Metas...] [Part Count] [Magic] [Footer Len]
+                                // So at footerStart, we have Part Metas.
+                                // We need to calculate how many parts or read until [Part Count].
+                                // Wait, the footer length includes Part Metas.
+                                // Footer Size = (16 * parts.size()) + 12
+                                // 16 * N + 12 = FooterLength -> N = (FooterLength - 12) / 16
+                                int partCount = (footerLength - 12) / 16;
+                                
+                                for (int i = 0; i < partCount; i++) {
+                                    long offset = buffer.getLong();
+                                    int length = buffer.getInt();
+                                    int count = buffer.getInt();
+                                    parts.add(new CheckpointPartMetadata(offset, length, count));
+                                }
+                                
+                                // Verify part count matches
+                                int recordedPartCount = buffer.getInt();
+                                if (recordedPartCount != partCount) {
+                                    logger.warn("Part count mismatch in checkpoint footer. Calculated: {}, Recorded: {}", partCount, recordedPartCount);
+                                }
+                                
+                                // Parallel Processing
+                                List<CompletableFuture<Void>> futures = new ArrayList<>();
+                                for (CheckpointPartMetadata part : parts)
+                                {
+                                    futures.add(CompletableFuture.runAsync(() -> {
+                                        // Create a view of the buffer for this part
+                                        // Duplicate to allow concurrent position modification
+                                        ByteBuffer partBuffer = buffer.duplicate();
+                                        partBuffer.order(ByteOrder.BIG_ENDIAN);
+                                        partBuffer.position((int) part.offset);
+                                        // We don't strictly need limit if we loop by count
+                                        
+                                        for (int i = 0; i < part.count; i++)
+                                        {
+                                            long fileId = partBuffer.getLong();
+                                            int rgId = partBuffer.getInt();
+                                            int recordNum = partBuffer.getInt();
+                                            int len = partBuffer.getInt();
+                                            long[] bitmap = new long[len];
+                                            for (int j = 0; j < len; j++)
+                                            {
+                                                bitmap[j] = partBuffer.getLong();
+                                            }
+                                            rgVisibilityMap.put(fileId + "_" + rgId, new RGVisibility(recordNum, latestTs, bitmap));
+                                        }
+                                    }, checkpointExecutor));
+                                }
+                                
+                                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+                                logger.info("Parallel checkpoint loading completed for {} parts.", parts.size());
+                                
+                                // Skip legacy loading
+                                return;
+                            }
+                        }
+                    } catch (Exception e) {
+                        logger.warn("Failed to load checkpoint with new format, falling back to legacy.", e);
+                    }
+
+                    // Legacy loading (Fall back)
                     try (DataInputStream in = latestStorage.open(latestPath))
                     {
                         int rgCount = in.readInt();
