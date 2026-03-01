@@ -452,7 +452,7 @@ public class TestRetinaCheckpoint
 
         // File Size
         String checkpointPath = resolve(testCheckpointDir, getOffloadFileName(timestamp));
-        long fileSizeBytes = storage.getFileLength(checkpointPath);
+        long fileSizeBytes = storage.getStatus(checkpointPath).getLength();
         double fileSizeMb = fileSizeBytes / (1024.0 * 1024.0);
         System.out.printf("Checkpoint File Size: %.2f MB%n", fileSizeMb);
 
