@@ -34,6 +34,65 @@
 #include <cstdint>
 #include <vector>
 
+#ifdef RETINA_SIMD
+#include <immintrin.h>
+
+/**
+ * Count the number of set bits in an array of uint64_t words using AVX2.
+ *
+ * Uses the VPSHUFB-based 4-bit lookup table algorithm (Muła et al.):
+ *   - Split each byte into two 4-bit nibbles.
+ *   - Use VPSHUFB to look up the popcount of each nibble in a 16-entry table.
+ *   - Accumulate byte-level counts with VPSADBW against zero.
+ *
+ * This processes 32 bytes (4 × uint64_t) per AVX2 iteration, making it
+ * efficient when NUM_WORDS >= 4. For the tail (< 4 words), falls back to
+ * scalar __builtin_popcountll.
+ *
+ * @param words  Pointer to the uint64_t array.
+ * @param n      Number of uint64_t elements.
+ * @return       Total number of set bits.
+ */
+inline uint64_t popcountBitmapAVX2(const uint64_t* words, size_t n) {
+    // 4-bit popcount lookup table: popcount_table[i] = popcount(i) for i in [0,15]
+    const __m256i lookup = _mm256_set_epi8(
+        4, 3, 3, 2, 3, 2, 2, 1,
+        3, 2, 2, 1, 2, 1, 1, 0,
+        4, 3, 3, 2, 3, 2, 2, 1,
+        3, 2, 2, 1, 2, 1, 1, 0
+    );
+    const __m256i low_mask = _mm256_set1_epi8(0x0F);
+    __m256i acc = _mm256_setzero_si256();
+
+    // Process 4 words (32 bytes) per iteration
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(words + i));
+        __m256i lo = _mm256_and_si256(v, low_mask);
+        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), low_mask);
+        __m256i cnt = _mm256_add_epi8(
+            _mm256_shuffle_epi8(lookup, lo),
+            _mm256_shuffle_epi8(lookup, hi)
+        );
+        // Accumulate byte counts into 64-bit lanes via SAD against zero
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(cnt, _mm256_setzero_si256()));
+    }
+
+    // Horizontal sum of the four 64-bit lanes in acc
+    __m128i lo128 = _mm256_castsi256_si128(acc);
+    __m128i hi128 = _mm256_extracti128_si256(acc, 1);
+    __m128i sum128 = _mm_add_epi64(lo128, hi128);
+    uint64_t result = static_cast<uint64_t>(_mm_cvtsi128_si64(sum128))
+                    + static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_unpackhi_epi64(sum128, sum128)));
+
+    // Scalar tail for remaining words
+    for (; i < n; ++i) {
+        result += static_cast<uint64_t>(__builtin_popcountll(words[i]));
+    }
+    return result;
+}
+#endif // RETINA_SIMD
+
 // rowId supports up to 65535, timestamp uses 48 bits
 inline uint64_t makeDeleteIndex(uint16_t rowId, uint64_t ts) {
     return (static_cast<uint64_t>(rowId) << 48 | (ts & 0x0000FFFFFFFFFFFFULL));
@@ -78,10 +137,14 @@ struct VersionedData : public pixels::RetinaBase<VersionedData<CAPACITY>> {
     VersionedData(uint64_t ts, const uint64_t* bitmap, DeleteIndexBlock* h)
         : baseTimestamp(ts), head(h) {
         std::memcpy(baseBitmap, bitmap, NUM_WORDS * sizeof(uint64_t));
+#ifdef RETINA_SIMD
+        baseInvalidCount = popcountBitmapAVX2(baseBitmap, NUM_WORDS);
+#else
         baseInvalidCount = 0;
         for (size_t i = 0; i < NUM_WORDS; ++i) {
             baseInvalidCount += __builtin_popcountll(baseBitmap[i]);
         }
+#endif
     }
 };
 
