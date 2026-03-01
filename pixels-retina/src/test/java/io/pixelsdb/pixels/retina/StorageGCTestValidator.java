@@ -116,7 +116,7 @@ public class StorageGCTestValidator
             return result;
         }
         
-        long totalRows = rgVisibility.getTotalRowCount();
+        long totalRows = file.getNumRows(); // Use file's actual row count instead of RG-level count
         long invalidRows = rgVisibility.getInvalidCount();
         
         if (totalRows <= 0)

@@ -36,18 +36,9 @@ public:
     void collectRGGarbage(uint64_t timestamp);
 
     uint64_t getBitmapSize() const;
-    
-    // Calculates total invalid ratio using actual rgRecordNum for accurate file-level statistics
-    double getInvalidRatio() const;
 
     // Returns the total number of invalid rows (baseBitmap 1-bits) across all tiles.
-    // Used by Storage GC for accurate file-level invalid ratio: Σ(RG invalid) / Σ(RG total).
     uint64_t getInvalidCount() const;
-
-    // Returns the actual number of rows in this RG (rgRecordNum from constructor).
-    // More accurate than tileCount * CAPACITY (which rounds up to tile boundaries).
-    // Used together with getInvalidCount() to compute accurate file-level invalid ratio.
-    uint64_t getTotalRowCount() const;
 
     // Storage GC methods
     std::vector<uint64_t> exportDeletionBlocks() const;
