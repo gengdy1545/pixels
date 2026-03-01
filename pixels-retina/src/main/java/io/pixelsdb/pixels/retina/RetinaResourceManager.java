@@ -815,7 +815,10 @@ public class RetinaResourceManager
                             // Read entire file into memory
                             // Note: Assuming checkpoint file size < 2GB
                             ByteBuffer buffer = ByteBuffer.allocate((int) fileLen);
+                            long startDownload = System.currentTimeMillis();
                             fsReader.readFully(buffer.array());
+                            long endDownload = System.currentTimeMillis();
+                            logger.info("Checkpoint Download Time: {} ms", (endDownload - startDownload));
                             
                             // Check Footer
                             buffer.position((int) fileLen - 8);
