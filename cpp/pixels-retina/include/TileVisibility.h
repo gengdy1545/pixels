@@ -53,6 +53,11 @@ struct DeleteIndexBlock : public pixels::RetinaBase<DeleteIndexBlock> {
     std::atomic<DeleteIndexBlock *> next{nullptr};
 };
 
+// C++11 compatibility: ODR definition for constexpr static member
+#if __cplusplus < 201703L
+inline constexpr size_t DeleteIndexBlock::BLOCK_CAPACITY;
+#endif
+
 /**
  * VersionedData - A versioned snapshot of the base state
  * Used for Copy-on-Write during garbage collection
