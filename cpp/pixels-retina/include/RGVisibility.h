@@ -51,7 +51,6 @@ private:
 
     TileVisibility<CAPACITY>* tileVisibilities;
     const uint64_t tileCount;
-    const uint64_t rgRecordNum;  // Actual number of rows in this RG
 
     TileVisibility<CAPACITY>* getTileVisibility(uint32_t rowId) const;
 };
