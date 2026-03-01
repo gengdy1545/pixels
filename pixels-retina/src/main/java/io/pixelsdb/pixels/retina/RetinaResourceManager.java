@@ -806,95 +806,17 @@ public class RetinaResourceManager
                 Storage latestStorage = StorageFactory.Instance().getStorage(latestPath);
                 if (latestStorage.exists(latestPath))
                 {
-                    // Try improved loading first (Read fully + Parallel processing)
-                    try (PhysicalReader fsReader = PhysicalReaderUtil.newPhysicalReader(latestStorage, latestPath))
+                    // Try parallel range download first
+                    try
                     {
-                        long fileLen = fsReader.getFileLength();
-                        if (fileLen > 12) // Minimum size check (Magic + Footer Len + at least some data)
-                        {
-                            // Read entire file into memory
-                            // Note: Assuming checkpoint file size < 2GB
-                            ByteBuffer buffer = ByteBuffer.allocate((int) fileLen);
-                            long startDownload = System.currentTimeMillis();
-                            fsReader.readFully(buffer.array());
-                            long endDownload = System.currentTimeMillis();
-                            logger.info("Checkpoint Download Time: {} ms", (endDownload - startDownload));
-                            
-                            // Check Footer
-                            buffer.position((int) fileLen - 8);
-                            int magic = buffer.getInt();
-                            int footerLength = buffer.getInt();
-                            
-                            if (magic == CHECKPOINT_MAGIC)
-                            {
-                                logger.info("Detected new checkpoint format with footer, using parallel loading.");
-                                // Parse Footer
-                                int footerStart = (int) fileLen - footerLength;
-                                buffer.position(footerStart);
-                                
-                                List<CheckpointPartMetadata> parts = new ArrayList<>();
-                                // Footer doesn't store part count first, it's: [Parts...] [Count] [Magic] [Len]
-                                // We need to read backwards? No, we know footer start.
-                                // But we don't know part count until we read it at the end of parts list?
-                                // Let's check write structure: 
-                                // [Parts Data] [Part Metas...] [Part Count] [Magic] [Footer Len]
-                                // So at footerStart, we have Part Metas.
-                                // We need to calculate how many parts or read until [Part Count].
-                                // Wait, the footer length includes Part Metas.
-                                // Footer Size = (16 * parts.size()) + 12
-                                // 16 * N + 12 = FooterLength -> N = (FooterLength - 12) / 16
-                                int partCount = (footerLength - 12) / 16;
-                                
-                                for (int i = 0; i < partCount; i++) {
-                                    long offset = buffer.getLong();
-                                    int length = buffer.getInt();
-                                    int count = buffer.getInt();
-                                    parts.add(new CheckpointPartMetadata(offset, length, count));
-                                }
-                                
-                                // Verify part count matches
-                                int recordedPartCount = buffer.getInt();
-                                if (recordedPartCount != partCount) {
-                                    logger.warn("Part count mismatch in checkpoint footer. Calculated: {}, Recorded: {}", partCount, recordedPartCount);
-                                }
-                                
-                                // Parallel Processing
-                                List<CompletableFuture<Void>> futures = new ArrayList<>();
-                                for (CheckpointPartMetadata part : parts)
-                                {
-                                    futures.add(CompletableFuture.runAsync(() -> {
-                                        // Create a view of the buffer for this part
-                                        // Duplicate to allow concurrent position modification
-                                        ByteBuffer partBuffer = buffer.duplicate();
-                                        partBuffer.order(ByteOrder.BIG_ENDIAN);
-                                        partBuffer.position((int) part.offset);
-                                        // We don't strictly need limit if we loop by count
-                                        
-                                        for (int i = 0; i < part.count; i++)
-                                        {
-                                            long fileId = partBuffer.getLong();
-                                            int rgId = partBuffer.getInt();
-                                            int recordNum = partBuffer.getInt();
-                                            int len = partBuffer.getInt();
-                                            long[] bitmap = new long[len];
-                                            for (int j = 0; j < len; j++)
-                                            {
-                                                bitmap[j] = partBuffer.getLong();
-                                            }
-                                            rgVisibilityMap.put(fileId + "_" + rgId, new RGVisibility(recordNum, latestTs, bitmap));
-                                        }
-                                    }, checkpointExecutor));
-                                }
-                                
-                                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-                                logger.info("Parallel checkpoint loading completed for {} parts.", parts.size());
-                                
-                                // Skip legacy loading
-                                return;
-                            }
+                        boolean success = RetinaCheckpointReader.read(latestStorage, latestPath, checkpointExecutor, (fileId, rgId, recordNum, bitmap) -> {
+                            rgVisibilityMap.put(fileId + "_" + rgId, new RGVisibility(recordNum, latestTs, bitmap));
+                        });
+                        if (success) {
+                            return;
                         }
                     } catch (Exception e) {
-                        logger.warn("Failed to load checkpoint with new format, falling back to legacy.", e);
+                        logger.warn("Parallel range read failed, falling back to legacy scan.", e);
                     }
 
                     // Legacy loading (Fall back)

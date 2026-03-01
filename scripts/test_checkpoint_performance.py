@@ -20,7 +20,8 @@ PATTERNS = {
     "Cold Load Time (ms)": r"First Load Time \(Cold\):\s+([\d.]+) ms",
     "Load Memory (MB)": r"Load Memory Overhead:\s+([\d.]+) MB",
     "Read Throughput (MB/s)": r"Read/Parse Throughput:\s+([\d.]+) MB/s",
-    "Avg Memory Hit Latency (ms)": r"Avg Memory Hit Latency:\s+([\d.]+) ms"
+    "Avg Memory Hit Latency (ms)": r"Avg Memory Hit Latency:\s+([\d.]+) ms",
+    "Download Time (ms)": r"Checkpoint Download Time:\s+([\d.]+) ms"
 }
 
 def run_maven_test(ratio):
