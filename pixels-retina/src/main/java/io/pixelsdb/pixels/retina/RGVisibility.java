@@ -67,8 +67,7 @@ public class RGVisibility implements AutoCloseable
 
     /**
      * The actual number of rows in this row-group, as provided at construction time.
-     * Stored here to avoid a JNI call for getTotalRowCount(), and more accurate than
-     * the C++ tileCount * CAPACITY (which rounds up to tile boundaries).
+     * More accurate than the C++ tileCount * CAPACITY (which rounds up to tile boundaries).
      */
     private final long rgRecordNum;
 
@@ -112,7 +111,6 @@ public class RGVisibility implements AutoCloseable
     private native void deleteRecord(int rgRowOffset, long timestamp, long nativeHandle);
     private native long[] getVisibilityBitmap(long timestamp, long nativeHandle);
     private native void garbageCollect(long timestamp, long nativeHandle);
-    private native double getInvalidRatio(long nativeHandle);
     private native long[] exportDeletionBlocks(long nativeHandle);
     private native void prependDeletionBlocks(long[] items, long nativeHandle);
     private native long[] getBaseBitmap(long nativeHandle);
@@ -150,16 +148,6 @@ public class RGVisibility implements AutoCloseable
         }
 
         garbageCollect(timestamp, handle);
-    }
-
-    public double getInvalidRatio()
-    {
-        long handle = this.nativeHandle.get();
-        if (handle == 0)
-        {
-            throw new IllegalStateException("RGVisibility instance has been closed.");
-        }
-        return getInvalidRatio(handle);
     }
 
     /**
@@ -226,20 +214,5 @@ public class RGVisibility implements AutoCloseable
         }
         return getInvalidCount(handle);
     }
-
-    /**
-     * Get the actual number of rows in this row-group.
-     * Returns the {@code rgRecordNum} stored at construction time, which is more accurate
-     * than the C++ {@code tileCount * CAPACITY} (the latter rounds up to tile boundaries).
-     * Used together with {@link #getInvalidCount()} to compute file-level invalid ratio:
-     * {@code fileInvalidRatio = Σ(invalid count) / Σ(total row count)}
-     *
-     * @return actual row count of this RG
-     */
-    public long getTotalRowCount()
-    {
-        return this.rgRecordNum;
-    }
-
 
 }

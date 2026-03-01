@@ -630,7 +630,7 @@ public class StorageGarbageCollector
         {
             int numRowGroups = file.getNumRowGroup();
             long totalInvalidCount = 0;
-            long totalRowCount = 0;
+            long totalRowCount = file.getNumRows(); // Use actual file row count instead of RG-level count
 
             for (int rgId = 0; rgId < numRowGroups; rgId++)
             {
@@ -638,7 +638,6 @@ public class StorageGarbageCollector
                 if (rgVisibility != null)
                 {
                     totalInvalidCount += rgVisibility.getInvalidCount();
-                    totalRowCount += rgVisibility.getTotalRowCount();
                 }
             }
 

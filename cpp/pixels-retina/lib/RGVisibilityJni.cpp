@@ -143,24 +143,6 @@ JNIEXPORT void JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_garbageCollec
 
 /*
  * Class:     io_pixelsdb_pixels_retina_RGVisibility
- * Method:    getInvalidRatio
- * Signature: (J)D
- */
-JNIEXPORT jdouble JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getInvalidRatio
-  (JNIEnv* env, jobject, jlong handle) {
-    try {
-        auto* rgVisibility = reinterpret_cast<RGVisibilityInstance*>(handle);
-        return static_cast<jdouble>(rgVisibility->getInvalidRatio());
-    } catch (const std::exception& e) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
-        return 0.0;
-    }
-}
-
-
-
-/*
- * Class:     io_pixelsdb_pixels_retina_RGVisibility
  * Method:    exportDeletionBlocks
  * Signature: (J)[J
  */

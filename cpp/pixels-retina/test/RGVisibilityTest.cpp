@@ -80,19 +80,14 @@ TEST_F(RGVisibilityTest, InvalidRatio) {
     // GC(150) -> Should reclaim first block (8 items) but not second
     rgVisibility->collectRGGarbage(150);
     
-    double ratio = rgVisibility->getInvalidRatio();
-    // Total Capacity depends on RETINA_CAPACITY
-    uint64_t tileCount = (ROW_COUNT + RETINA_CAPACITY - 1) / RETINA_CAPACITY;
-    double totalCapacity = (double)tileCount * RETINA_CAPACITY;
-
-    double expected = 8.0 / totalCapacity;
-    EXPECT_DOUBLE_EQ(ratio, expected);
+    // Test getInvalidCount instead of getInvalidRatio
+    uint64_t invalidCount = rgVisibility->getInvalidCount();
+    EXPECT_EQ(invalidCount, 8UL);
 
     // GC(250) -> Should reclaim second block (8 items) -> Total 16
     rgVisibility->collectRGGarbage(250);
-    ratio = rgVisibility->getInvalidRatio();
-    expected = 16.0 / totalCapacity;
-    EXPECT_DOUBLE_EQ(ratio, expected);
+    invalidCount = rgVisibility->getInvalidCount();
+    EXPECT_EQ(invalidCount, 16UL);
 }
 
 TEST_F(RGVisibilityTest, MultiThread) {

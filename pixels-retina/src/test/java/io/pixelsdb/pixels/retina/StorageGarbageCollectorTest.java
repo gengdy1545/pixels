@@ -136,7 +136,6 @@ public class StorageGarbageCollectorTest
         Path path = createMockPath(1L, "/data/test/");
         
         when(rgVisibility.getInvalidCount()).thenReturn(6000L);
-        when(rgVisibility.getTotalRowCount()).thenReturn(10000L);
         when(resourceManager.getRGVisibility(100L, 0)).thenReturn(rgVisibility);
         
         when(storage.getStatus(anyString())).thenReturn(mock(Storage.Status.class));
@@ -162,7 +161,6 @@ public class StorageGarbageCollectorTest
         File file = createMockFile(101L, "boundary_file.pxl", 8000);
         
         when(rgVisibility.getInvalidCount()).thenReturn(4000L);
-        when(rgVisibility.getTotalRowCount()).thenReturn(8000L);
         when(resourceManager.getRGVisibility(101L, 0)).thenReturn(rgVisibility);
         
         // Execute
@@ -184,7 +182,6 @@ public class StorageGarbageCollectorTest
         File file = createMockFile(102L, "low_ratio_file.pxl", 12000);
         
         when(rgVisibility.getInvalidCount()).thenReturn(4800L);
-        when(rgVisibility.getTotalRowCount()).thenReturn(12000L);
         when(resourceManager.getRGVisibility(102L, 0)).thenReturn(rgVisibility);
         
         // Execute
@@ -601,7 +598,7 @@ public class StorageGarbageCollectorTest
                 if (rgVisibility != null)
                 {
                     totalInvalidCount += rgVisibility.getInvalidCount();
-                    totalRowCount += rgVisibility.getTotalRowCount();
+                    totalRowCount += file.getNumRows(); // Use file's actual row count
                 }
             }
 

@@ -107,26 +107,12 @@ uint64_t RGVisibility<CAPACITY>::getBitmapSize() const {
 }
 
 template<size_t CAPACITY>
-double RGVisibility<CAPACITY>::getInvalidRatio() const {
-    uint64_t totalInvalid = 0;
-    for (uint64_t i = 0; i < tileCount; i++) {
-        totalInvalid += tileVisibilities[i].getInvalidCount();
-    }
-    return static_cast<double>(totalInvalid) / rgRecordNum;
-}
-
-template<size_t CAPACITY>
 uint64_t RGVisibility<CAPACITY>::getInvalidCount() const {
     uint64_t totalInvalid = 0;
     for (uint64_t i = 0; i < tileCount; i++) {
         totalInvalid += tileVisibilities[i].getInvalidCount();
     }
     return totalInvalid;
-}
-
-template<size_t CAPACITY>
-uint64_t RGVisibility<CAPACITY>::getTotalRowCount() const {
-    return rgRecordNum;
 }
 
 template<size_t CAPACITY>

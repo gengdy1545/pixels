@@ -82,8 +82,8 @@ public class TestRGVisibility
          rgVisibility.deleteRecord(15, timestamp2);
         rgVisibility.garbageCollect(timestamp1);
         
-        // Expect ratio 0 because rows 5, 10 share the same block with row 15 (ts=200 > 100), preventing GC of the block.
-        assertEquals(0.0, rgVisibility.getInvalidRatio(), 0.0);
+        // Expect 0 invalid count because rows 5, 10 share the same block with row 15 (ts=200 > 100), preventing GC of the block.
+        assertEquals(0L, rgVisibility.getInvalidCount());
 
         long[] bitmap1 = rgVisibility.getVisibilityBitmap(timestamp1);
         assertEquals(0b0000010000100000L, bitmap1[0]);
@@ -108,18 +108,14 @@ public class TestRGVisibility
         // GC(150) -> Block 0 (lastTs=100 <= 150) should be reclaimed. Block 1 (>150) kept.
         rgVisibility.garbageCollect(150);
         
-        long retinaCapacity = 10240;
-        long tileCount = (ROW_COUNT + retinaCapacity - 1) / retinaCapacity;
-        double totalCapacity = tileCount * retinaCapacity;
-
-        // 8 rows reclaimed. Total capacity = ceil(25600/10240)*10240 = 30720.
-        double expected = 8.0 / totalCapacity;
-        assertEquals(expected, rgVisibility.getInvalidRatio(), 0.0000001);
+        // Test getInvalidCount instead of getInvalidRatio
+        // 8 rows reclaimed initially
+        assertEquals(8L, rgVisibility.getInvalidCount());
 
         // GC(250) -> Block 1 (lastTs=200 <= 250) should be reclaimed.
         rgVisibility.garbageCollect(250);
-        expected = 16.0 / totalCapacity;
-        assertEquals(expected, rgVisibility.getInvalidRatio(), 0.0000001);
+        // 16 rows reclaimed after GC
+        assertEquals(16L, rgVisibility.getInvalidCount());
     }
 
     @Test
