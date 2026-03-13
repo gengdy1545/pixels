@@ -44,17 +44,31 @@
  */
 package io.pixelsdb.pixels.retina;
 
+import com.google.protobuf.ByteString;
+import io.pixelsdb.pixels.common.exception.IndexException;
+import io.pixelsdb.pixels.common.exception.MainIndexException;
+import io.pixelsdb.pixels.common.exception.MetadataException;
+import io.pixelsdb.pixels.common.exception.RowIdException;
+import io.pixelsdb.pixels.common.index.IndexOption;
+import io.pixelsdb.pixels.common.index.MainIndex;
+import io.pixelsdb.pixels.common.index.MainIndexFactory;
+import io.pixelsdb.pixels.common.index.service.LocalIndexService;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
+import io.pixelsdb.pixels.common.metadata.domain.Column;
 import io.pixelsdb.pixels.common.metadata.domain.File;
 import io.pixelsdb.pixels.common.metadata.domain.Layout;
 import io.pixelsdb.pixels.common.metadata.domain.Path;
 import io.pixelsdb.pixels.common.metadata.domain.Schema;
+import io.pixelsdb.pixels.common.metadata.domain.SinglePointIndex;
 import io.pixelsdb.pixels.common.metadata.domain.Table;
 import io.pixelsdb.pixels.common.physical.Storage;
 import io.pixelsdb.pixels.common.physical.StorageFactory;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
+import io.pixelsdb.pixels.common.utils.IndexUtils;
 import io.pixelsdb.pixels.common.utils.RetinaUtils;
 import io.pixelsdb.pixels.core.*;
+import io.pixelsdb.pixels.index.IndexProto;
+import io.pixelsdb.pixels.core.TypeDescription;
 import io.pixelsdb.pixels.core.encoding.EncodingLevel;
 import io.pixelsdb.pixels.core.reader.PixelsReaderOption;
 import io.pixelsdb.pixels.core.reader.PixelsRecordReader;
@@ -63,16 +77,22 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.*;
+import java.util.Collections;
 import java.util.stream.Collectors;
 
 public class StorageGarbageCollector
 {
     private static final Logger logger = LogManager.getLogger(StorageGarbageCollector.class);
+    // Number of retry attempts for MainIndex sync before aborting the rewrite.
+    private static final int SYNC_MAX_RETRIES = 3;
 
     private final RetinaResourceManager resourceManager;
     private final MetadataService metadataService;
     private final Storage storage;
+    private final GcWal gcWal;
 
     // Configuration parameters
     private final boolean enabled;
@@ -80,10 +100,13 @@ public class StorageGarbageCollector
     private final long targetFileSize;
     private final int maxFilesPerRun;
 
-    public StorageGarbageCollector(RetinaResourceManager resourceManager, MetadataService metadataService)
+    public StorageGarbageCollector(RetinaResourceManager resourceManager,
+                                   MetadataService metadataService,
+                                   GcWal gcWal)
     {
         this.resourceManager = resourceManager;
         this.metadataService = metadataService;
+        this.gcWal = gcWal;
 
         ConfigFactory config = ConfigFactory.Instance();
         String enabledStr = config.getProperty("storage.gc.enabled");
@@ -305,27 +328,94 @@ public class StorageGarbageCollector
     {
         logger.info("Rewriting file group: {}", group);
 
-        // Step 1: Create new file path
+        // ── Step 1: Generate path; pre-register new file as TEMPORARY ────────────
+        // Pre-registering early gives us a stable, real newFileId for RGVisibility,
+        // redirect maps, and MainIndex — avoiding the post-swap fileId-update dance.
         String newFilePath = generateNewFilePath(group);
         logger.info("Creating new file: {}", newFilePath);
 
-        // Step 2: Read first file to get schema and configuration
-        FileCandidate firstCandidate = group.files.get(0);
-        File firstFile = firstCandidate.file;
-        PixelsReader firstReader = PixelsReaderImpl.newBuilder()
+        File newFileMeta = new File();
+        newFileMeta.setName(newFilePath.substring(newFilePath.lastIndexOf('/') + 1));
+        newFileMeta.setType(File.Type.TEMPORARY);
+        newFileMeta.setNumRowGroup(0);
+        newFileMeta.setPathId(group.files.get(0).path.getId());
+        metadataService.addFiles(Collections.singletonList(newFileMeta));
+        long newFileId = metadataService.getFileId(newFilePath);
+        newFileMeta.setId(newFileId);
+
+        // WAL: persist PENDING entry before any further metadata/physical changes so that
+        // a crash between here and the atomic swap can be detected and cleaned up on restart.
+        try
+        {
+            gcWal.beginEntry(newFileId, newFilePath);
+        }
+        catch (IOException e)
+        {
+            // WAL write failure is fatal for this rewrite: clean up and abort.
+            try { metadataService.deleteFiles(Collections.singletonList(newFileId)); } catch (Exception ignored) { }
+            throw new IOException("GcWal beginEntry failed for newFileId=" + newFileId
+                    + "; aborting rewrite to avoid un-recoverable state", e);
+        }
+
+        // ── Step 2: Read schema from first old file ──────────────────────────────
+        TypeDescription schema;
+        long pixelStride;
+        PixelsProto.CompressionKind compressionKind;
+        int rowGroupSize;
+        EncodingLevel encodingLevel;
+        boolean hasHiddenCol;
+        try (PixelsReader firstReader = PixelsReaderImpl.newBuilder()
                 .setStorage(storage)
-                .setPath(firstCandidate.filePath)
-                .build();
+                .setPath(group.files.get(0).filePath)
+                .build())
+        {
+            schema = firstReader.getFileSchema();
+            pixelStride = firstReader.getPixelStride();
+            compressionKind = firstReader.getCompressionKind();
+            rowGroupSize = getRowGroupSizeFromConfig(firstReader);
+            encodingLevel = getEncodingLevelFromConfig(firstReader);
+            hasHiddenCol = firstReader.getPostScript().getHasHiddenColumn();
+        }
 
-        TypeDescription schema = firstReader.getFileSchema();
-        long pixelStride = firstReader.getPixelStride();
-        PixelsProto.CompressionKind compressionKind = firstReader.getCompressionKind();
+        // Load primary index metadata for SinglePointIndex sync.
+        // If the table has no primary index or the file has no hidden timestamp column,
+        // we cannot reconstruct IndexKey and skip the sync.
+        SinglePointIndex primaryIndexMeta = null;
+        int[] pkColSchemaIndices = null;
+        TypeDescription.Category[] pkColCategories = null;
+        if (hasHiddenCol)
+        {
+            try
+            {
+                primaryIndexMeta = metadataService.getPrimaryIndex(group.tableId);
+                if (primaryIndexMeta != null)
+                {
+                    int[][] pkInfo = resolvePkColumns(primaryIndexMeta, schema);
+                    pkColSchemaIndices = pkInfo[0];
+                    // pkInfo[1] holds Category ordinals - convert back to Category[]
+                    pkColCategories = new TypeDescription.Category[pkInfo[1].length];
+                    List<TypeDescription> schemaFields = schema.getChildren();
+                    for (int pi = 0; pi < pkColSchemaIndices.length; pi++)
+                    {
+                        pkColCategories[pi] = schemaFields.get(pkColSchemaIndices[pi]).getCategory();
+                    }
+                }
+            }
+            catch (MetadataException e)
+            {
+                logger.warn("Failed to load primary index metadata for tableId={}, SinglePointIndex sync will be skipped: {}",
+                        group.tableId, e.getMessage());
+            }
+        }
 
-        // Step 3: Create PixelsWriter for new file
-        // Get row group size and encoding level from old file configuration
-        int rowGroupSize = getRowGroupSizeFromConfig(firstReader);
-        EncodingLevel encodingLevel = getEncodingLevelFromConfig(firstReader);
-        
+        boolean syncSPI = (primaryIndexMeta != null) && hasHiddenCol;
+        // Per-surviving-row data for SinglePointIndex sync, indexed by newGlobalRowId order.
+        List<byte[]> newRowPkBytes = syncSPI ? new ArrayList<>() : null;
+        List<Long>   newRowWriteTs = syncSPI ? new ArrayList<>() : null;
+
+        String[] allColNames = schema.getFieldNames().toArray(new String[0]);
+
+        // ── Step 3: Write surviving rows to the new file ─────────────────────────
         PixelsWriter pixelsWriter = PixelsWriterImpl.newBuilder()
                 .setSchema(schema)
                 .setPixelStride((int) pixelStride)
@@ -334,221 +424,657 @@ public class StorageGarbageCollector
                 .setPath(newFilePath)
                 .setCompressionKind(compressionKind)
                 .setEncodingLevel(encodingLevel)
+                .setHasHiddenColumn(hasHiddenCol)
                 .build();
 
-        // Track mappings for each old file
         Map<Long, int[]> fileMappings = new HashMap<>();
-        long newFileId = System.currentTimeMillis();  // Temporary ID, will be replaced by metadata service
         int globalNewRowId = 0;
-
-        // Step 4: Process each old file
-        for (FileCandidate oldCandidate : group.files)
+        boolean writerClosed = false;
+        try
         {
-            File oldFile = oldCandidate.file;
-            logger.info("Processing file: {}", oldFile.getName());
-
-            PixelsReader reader = PixelsReaderImpl.newBuilder()
-                    .setStorage(storage)
-                    .setPath(oldCandidate.filePath)
-                    .build();
-
-            int numRowGroups = reader.getRowGroupNum();
-            int[] fileMapping = new int[(int) reader.getNumberOfRows()];
-            Arrays.fill(fileMapping, -1);  // Initialize with -1 (deleted)
-
-            // Step 5: Process each row group
-            for (int rgId = 0; rgId < numRowGroups; rgId++)
+            for (FileCandidate oldCandidate : group.files)
             {
-                // Get RGVisibility and Base Bitmap
-                RGVisibility rgVisibility = resourceManager.getRGVisibility(oldFile.getId(), rgId);
-                if (rgVisibility == null)
+                File oldFile = oldCandidate.file;
+                logger.info("Processing file: {}", oldFile.getName());
+
+                try (PixelsReader reader = PixelsReaderImpl.newBuilder()
+                        .setStorage(storage)
+                        .setPath(oldCandidate.filePath)
+                        .build())
                 {
-                    logger.warn("RGVisibility not found for fileId={}, rgId={}, skipping", oldFile.getId(), rgId);
-                    continue;
-                }
+                    int numRowGroups = reader.getRowGroupNum();
+                    int[] fileMapping = new int[(int) reader.getNumberOfRows()];
+                    Arrays.fill(fileMapping, -1);
 
-                long[] baseBitmap = rgVisibility.getBaseBitmap();
-
-                // Read row group data
-                PixelsReaderOption option = new PixelsReaderOption();
-                option.skipCorruptRecords(true);
-                option.tolerantSchemaEvolution(true);
-                option.rgRange(rgId, 1);
-
-                PixelsRecordReader recordReader = reader.read(option);
-                VectorizedRowBatch rowBatch;
-                int rgRowOffset = 0;
-
-                // Step 6: Filter and write data based on Base Bitmap
-                while ((rowBatch = recordReader.readBatch()) != null)
-                {
-                    int batchSize = rowBatch.size;
-                    VectorizedRowBatch filteredBatch = schema.createRowBatch(batchSize);
-                    int filteredCount = 0;
-
-                    for (int i = 0; i < batchSize; i++)
+                    for (int rgId = 0; rgId < numRowGroups; rgId++)
                     {
-                        int globalRowId = rgRowOffset + i;
-
-                        // Check Base Bitmap for deletion status
-                        // Base Bitmap semantics: 1 = deleted/invalid, 0 = valid
-                        // This is consistent with:
-                        // - SET_BITMAP_BIT macro in TileVisibility.h:25
-                        // - getInvalidCount() in TileVisibility.cpp:303
-                        // - collectTileGarbage() in TileVisibility.cpp:260
-                        int bitmapIndex = globalRowId / 64;
-                        int bitOffset = globalRowId % 64;
-                        boolean isDeleted = (baseBitmap[bitmapIndex] & (1L << bitOffset)) != 0;
-
-                        if (!isDeleted)  // Only keep valid rows (bit = 0)
+                        RGVisibility rgVisibility = resourceManager.getRGVisibility(oldFile.getId(), rgId);
+                        if (rgVisibility == null)
                         {
-                            // Copy row to filtered batch
-                            copyRow(rowBatch, i, filteredBatch, filteredCount);
-                            fileMapping[globalRowId] = globalNewRowId++;
-                            filteredCount++;
+                            logger.warn("RGVisibility not found for fileId={}, rgId={}, skipping",
+                                    oldFile.getId(), rgId);
+                            continue;
                         }
-                        else
+
+                        long[] baseBitmap = rgVisibility.getBaseBitmap();
+                        PixelsReaderOption option = new PixelsReaderOption();
+                        option.skipCorruptRecords(true);
+                        option.tolerantSchemaEvolution(true);
+                        option.rgRange(rgId, 1);
+                        option.includeCols(allColNames);
+                        if (hasHiddenCol)
                         {
-                            fileMapping[globalRowId] = -1;  // Physically deleted
+                            option.forceReadHiddenColumn(true);
+                        }
+
+                        int rgRowOffset = 0;
+                        try (PixelsRecordReader recordReader = reader.read(option))
+                        {
+                            VectorizedRowBatch rowBatch;
+                            while ((rowBatch = recordReader.readBatch()) != null)
+                            {
+                                int batchSize = rowBatch.size;
+                                if (batchSize == 0)
+                                {
+                                    break;
+                                }
+
+                                long[] batchTimestamps = hasHiddenCol
+                                        ? recordReader.getLastBatchTimestamps() : null;
+
+                                // Create write batch; when hasHiddenCol the last ColumnVector
+                                // slot is reserved for the hidden timestamp.
+                                VectorizedRowBatch filteredBatch = createWriteBatch(schema, batchSize, hasHiddenCol);
+                                int filteredCount = 0;
+
+                                for (int i = 0; i < batchSize; i++)
+                                {
+                                    // Base Bitmap: 1 = deleted/invalid, 0 = valid
+                                    int globalRowId = rgRowOffset + i;
+                                    int bitmapIndex = globalRowId / 64;
+                                    int bitOffset = globalRowId % 64;
+                                    boolean isDeleted = (baseBitmap[bitmapIndex] & (1L << bitOffset)) != 0;
+
+                                    if (!isDeleted)
+                                    {
+                                        copyRow(rowBatch, i, filteredBatch, filteredCount);
+                                        // Propagate hidden timestamp to new file.
+                                        if (hasHiddenCol && batchTimestamps != null)
+                                        {
+                                            ((LongColumnVector) filteredBatch.cols[filteredBatch.cols.length - 1])
+                                                    .vector[filteredCount] = batchTimestamps[i];
+                                        }
+                                        fileMapping[globalRowId] = globalNewRowId++;
+                                        // Collect pk bytes + write timestamp for SinglePointIndex sync.
+                                        if (syncSPI && batchTimestamps != null)
+                                        {
+                                            newRowWriteTs.add(batchTimestamps[i]);
+                                            newRowPkBytes.add(serializePkBytes(
+                                                    rowBatch, i, pkColSchemaIndices, pkColCategories));
+                                        }
+                                        filteredCount++;
+                                    }
+                                }
+
+                                if (filteredCount > 0)
+                                {
+                                    filteredBatch.size = filteredCount;
+                                    pixelsWriter.addRowBatch(filteredBatch);
+                                }
+                                rgRowOffset += batchSize;
+                            }
                         }
                     }
-
-                    // Write filtered batch
-                    if (filteredCount > 0)
-                    {
-                        filteredBatch.size = filteredCount;
-                        pixelsWriter.addRowBatch(filteredBatch);
-                    }
-
-                    rgRowOffset += batchSize;
+                    fileMappings.put(oldFile.getId(), fileMapping);
                 }
-
-                recordReader.close();
             }
 
-            fileMappings.put(oldFile.getId(), fileMapping);
-            reader.close();
+            pixelsWriter.close();
+            writerClosed = true;
+        }
+        catch (Exception e)
+        {
+            if (!writerClosed)
+            {
+                try { pixelsWriter.close(); } catch (Exception ignored) { }
+            }
+            try { storage.delete(newFilePath, false); } catch (Exception ignored) { }
+            try { metadataService.deleteFiles(Collections.singletonList(newFileId)); } catch (Exception ignored) { }
+            throw e;
         }
 
-        // Step 7: Close writer and get new file metadata
-        pixelsWriter.close();
+        int totalValidRows = globalNewRowId;
+        int numNewRGsWritten = pixelsWriter.getNumRowGroup();
 
-        // Step 8: Migrate Deletion Chain
-        // CRITICAL: This must be done BEFORE registering dual-write mapping
-        // to ensure new file's Visibility is ready before any concurrent deletes
+        // ── Step 4: Migrate deletion chains; create new RGVisibility ─────────────
         Map<Integer, long[]> newRGDeletions = new HashMap<>();
-
         for (FileCandidate oldCandidate : group.files)
         {
             File oldFile = oldCandidate.file;
             int[] mapping = fileMappings.get(oldFile.getId());
-            int numRowGroups = oldFile.getNumRowGroup();
+            if (mapping == null) continue;
 
-            for (int rgId = 0; rgId < numRowGroups; rgId++)
+            for (int rgId = 0; rgId < oldFile.getNumRowGroup(); rgId++)
             {
                 RGVisibility oldRgVisibility = resourceManager.getRGVisibility(oldFile.getId(), rgId);
                 if (oldRgVisibility == null) continue;
 
-                // Export Deletion Chain from old file
-                long[] deletionBlocks = oldRgVisibility.exportDeletionBlocks();
-
-                // Convert RowIds using mapping
-                long[] convertedBlocks = convertDeletionBlocks(deletionBlocks, mapping);
+                long[] convertedBlocks = convertDeletionBlocks(
+                        oldRgVisibility.exportDeletionBlocks(), mapping);
 
                 if (convertedBlocks.length > 0)
                 {
-                    // Accumulate deletions for each new RG
-                    // TODO: Determine correct new RG ID based on row distribution
-                    int newRgId = rgId;  // Simplified: assume same RG structure
+                    int newRgId = rgId;  // simplified: assumes same RG structure
                     long[] existing = newRGDeletions.getOrDefault(newRgId, new long[0]);
                     long[] merged = new long[existing.length + convertedBlocks.length];
                     System.arraycopy(existing, 0, merged, 0, existing.length);
                     System.arraycopy(convertedBlocks, 0, merged, existing.length, convertedBlocks.length);
                     newRGDeletions.put(newRgId, merged);
-
-                    logger.info("Exported {} deletion blocks from oldFile={}, rgId={}",
+                    logger.debug("Migrated {} deletion blocks from oldFile={}, rgId={}",
                             convertedBlocks.length, oldFile.getId(), rgId);
                 }
             }
         }
 
-        // Create RGVisibility for new file and prepend deletion blocks
-        // This must happen BEFORE registering dual-write mapping
+        int approxRecordsPerRG = numNewRGsWritten > 0
+                ? Math.max(1, totalValidRows / numNewRGsWritten)
+                : totalValidRows;
         for (Map.Entry<Integer, long[]> entry : newRGDeletions.entrySet())
         {
-            int newRgId = entry.getKey();
-            long[] deletions = entry.getValue();
-
-            // Create new RGVisibility instance with dynamic recordNum based on actual row count
-            // Calculate actual row count for this RG based on mapping
-            int actualRecordNum = calculateActualRecordNum(mapping, newRgId, numRowGroups);
             RGVisibility newRgVisibility = resourceManager.createRGVisibility(
-                    newFileId, newRgId, actualRecordNum);
-
-            // Prepend deletion blocks to new file
-            newRgVisibility.prependDeletionBlocks(deletions);
-
-            logger.info("Prepended {} deletion blocks to newFile={}, rgId={}",
-                    deletions.length, newFileId, newRgId);
+                    newFileId, entry.getKey(), approxRecordsPerRG);
+            newRgVisibility.prependDeletionBlocks(entry.getValue());
         }
 
-        // Step 9: Register dual-write mapping with multi-file support
-        // For multiple old files merging into one new file, backwardMap needs to support one-to-many mapping
+        // ── Step 5: Register dual-write ──────────────────────────────────────────
+        // registerRedirection sets both forwardMap and backwardMap internally.
         for (Map.Entry<Long, int[]> entry : fileMappings.entrySet())
         {
             resourceManager.registerRedirection(entry.getKey(), newFileId, entry.getValue());
-            
-            // Register backward mapping for each old file
-            // This allows multiple old files to map to the same new file
-            resourceManager.registerBackwardRedirection(newFileId, entry.getKey(), entry.getValue());
         }
+        // Dual-write is now active (t1).
 
-        // Step 10: Atomic swap metadata
-        String newFileName = newFilePath.substring(newFilePath.lastIndexOf('/') + 1);
-        long pathId = group.files.get(0).path.getId();
-        File newMetadataFile = new File();
-        newMetadataFile.setName(newFileName);
-        newMetadataFile.setType(File.Type.REGULAR);
-        newMetadataFile.setNumRowGroup(pixelsWriter.getNumRowGroup());
-        newMetadataFile.setPathId(pathId);
-        List<File> filesToAdd = Arrays.asList(newMetadataFile);
-
+        // ── Step 6: Sync MainIndex (abort before activation if this fails) ────────
         List<Long> filesToDelete = group.files.stream()
                 .map(c -> c.file.getId())
                 .collect(Collectors.toList());
 
-        boolean swapSuccess = metadataService.atomicSwapFiles(filesToAdd, filesToDelete);
-
-        if (swapSuccess)
+        long firstNewRowId = -1;
+        try
         {
-            logger.info("Metadata swap succeeded for file group: {}", group);
-
-            // Step 11: Get real file ID from metadata service
-            long realFileId = getRealFileIdFromMetadata(newFilePath);
-            
-            // Step 12: Update RGVisibility and RedirectInfo with real file ID
-            updateFileIdInRGVisibility(newFileId, realFileId);
-            updateFileIdInRedirectInfo(newFileId, realFileId);
-
-            // Step 13: Unregister mapping
+            firstNewRowId = syncMainIndex(group, fileMappings, newFileId, newFilePath, totalValidRows);
+        }
+        catch (MainIndexException e)
+        {
+            logger.error("MainIndex sync failed for newFileId={}; aborting rewrite of group {}",
+                    newFileId, group, e);
             for (Long oldFileId : filesToDelete)
             {
                 resourceManager.unregisterRedirection(oldFileId, newFileId);
             }
+            resourceManager.removeAllRGVisibilityForFile(newFileId);
+            try { storage.delete(newFilePath, false); } catch (Exception ignored) { }
+            try { metadataService.deleteFiles(Collections.singletonList(newFileId)); } catch (Exception ignored) { }
+            throw e;
         }
-        else
-        {
-            logger.error("Metadata swap failed for file group: {}, rolling back", group);
 
-            // Rollback: Delete new file and unregister mappings
-            storage.delete(newFilePath, false);
+        // ── Step 6b: Sync SinglePointIndex (best-effort; failures are logged, not fatal) ──
+        if (syncSPI && firstNewRowId >= 0 && newRowPkBytes != null && !newRowPkBytes.isEmpty())
+        {
+            try
+            {
+                syncSinglePointIndex(group, primaryIndexMeta, firstNewRowId,
+                        newRowPkBytes, newRowWriteTs, newFileId);
+            }
+            catch (Exception e)
+            {
+                logger.error("SinglePointIndex sync failed for newFileId={}; index may be stale until next purge. group={}",
+                        newFileId, group, e);
+                // Non-fatal: the old entries will eventually be cleaned up by purgeIndexEntries.
+                // The new entries are missing but queries may fall back to slower paths.
+            }
+        }
+
+        // ── Step 7: Atomically activate new file and retire old ones ─────────────
+        // atomicSwapFiles executes DELETE [oldFileIds] + UPDATE [TEMPORARY→REGULAR]
+        // in a single DB transaction, eliminating the crash window that existed
+        // with the previous separate deleteFiles + updateFile calls.
+        newFileMeta.setType(File.Type.REGULAR);
+        newFileMeta.setNumRowGroup(numNewRGsWritten);
+        try
+        {
+            metadataService.atomicSwapFiles(Collections.singletonList(newFileMeta), filesToDelete);
+        }
+        catch (Exception e)
+        {
+            // atomicSwapFiles failed; old metadata is untouched, so we can safely roll back.
+            logger.error("atomicSwapFiles failed for newFileId={}; rolling back rewrite of group {}",
+                    newFileId, group, e);
             for (Long oldFileId : filesToDelete)
             {
                 resourceManager.unregisterRedirection(oldFileId, newFileId);
             }
-
-            throw new Exception("Metadata swap failed");
+            resourceManager.removeAllRGVisibilityForFile(newFileId);
+            try { storage.delete(newFilePath, false); } catch (Exception ignored) { }
+            try { metadataService.deleteFiles(Collections.singletonList(newFileId)); } catch (Exception ignored) { }
+            throw e;
         }
+
+        // WAL: record successful completion so restart recovery skips this entry.
+        try
+        {
+            gcWal.commitEntry(newFileId);
+        }
+        catch (IOException e)
+        {
+            // A missing DONE record only causes a spurious (but safe) cleanup attempt on restart;
+            // the rewrite itself succeeded, so we only warn rather than failing the operation.
+            logger.warn("GcWal commitEntry failed for newFileId={}; recovery may attempt a no-op cleanup on restart",
+                    newFileId, e);
+        }
+        logger.info("Rewrite succeeded for file group: {} old files → {}", group.files.size(), newFilePath);
+
+        // ── Step 8: Unregister dual-write ─────────────────────────────────────────
+        for (Long oldFileId : filesToDelete)
+        {
+            resourceManager.unregisterRedirection(oldFileId, newFileId);
+        }
+    }
+
+    // =========================================================================
+    // MainIndex sync
+    // =========================================================================
+
+    /**
+     * Write fresh {@link MainIndex} entries for every surviving row in the rewritten file.
+     *
+     * <h3>Retry semantics</h3>
+     * <ul>
+     *   <li>Row-ID batch allocation ({@code allocateRowIdBatch}) is done <em>once</em> before
+     *       the retry loop.  If allocation fails the exception is propagated immediately.</li>
+     *   <li>{@code putEntry} + {@code flushCache} may be retried up to
+     *       {@link #SYNC_MAX_RETRIES} times with exponential back-off.  Because
+     *       {@code putEntry} is idempotent (same rowId → same RowLocation on each attempt),
+     *       retrying with the same batch is safe.</li>
+     *   <li>If all retry attempts are exhausted a {@link MainIndexException} is thrown, which
+     *       causes the caller to abort the rewrite <em>before</em> activating the new file,
+     *       leaving old files and their metadata intact.</li>
+     * </ul>
+     *
+     * @param group          the file group being rewritten (provides {@code tableId})
+     * @param fileMappings   per-old-file mapping: {@code mapping[oldRgLocalRowId] = newGlobalRowId}
+     *                       (or {@code -1} for physically deleted rows)
+     * @param newFileId      real metadata file ID of the new file (pre-registered as TEMPORARY)
+     * @param newFilePath    full URI path of the newly written file (used to read its footer)
+     * @param totalValidRows total number of surviving rows (= sum of non-negative mapping values)
+     * @throws MainIndexException if sync cannot be completed after all retry attempts
+     */
+    /**
+     * Returns the first new row ID allocated for the rewritten file,
+     * or -1 when there are no surviving rows.
+     */
+    private long syncMainIndex(FileGroup group,
+                               Map<Long, int[]> fileMappings,
+                               long newFileId,
+                               String newFilePath,
+                               int totalValidRows) throws MainIndexException
+    {
+        if (totalValidRows == 0)
+        {
+            return -1L;
+        }
+
+        // Read the new file's footer to obtain per-RG row counts, needed to convert
+        // a newGlobalRowId into a (newRgId, newRgLocalOffset) RowLocation.
+        int[] newRgCumulativeRows;
+        try (PixelsReader newReader = PixelsReaderImpl.newBuilder()
+                .setStorage(storage).setPath(newFilePath).build())
+        {
+            int numNewRGs = newReader.getRowGroupNum();
+            int[] rowCounts = new int[numNewRGs];
+            for (int i = 0; i < numNewRGs; i++)
+            {
+                rowCounts[i] = newReader.getRowGroupInfo(i).getNumberOfRows();
+            }
+            newRgCumulativeRows = buildCumulativeArray(rowCounts);
+        }
+        catch (Exception e)
+        {
+            throw new MainIndexException("Failed to read new file footer for MainIndex sync", e);
+        }
+
+        // Obtain the MainIndex instance for this table.
+        MainIndex mainIndex;
+        try
+        {
+            mainIndex = MainIndexFactory.Instance().getMainIndex(group.tableId);
+        }
+        catch (Exception e)
+        {
+            throw new MainIndexException("Failed to get MainIndex for tableId=" + group.tableId, e);
+        }
+
+        // Allocate a contiguous row-ID batch (done once; no retry for allocation).
+        IndexProto.RowIdBatch rowIdBatch;
+        try
+        {
+            rowIdBatch = mainIndex.allocateRowIdBatch(group.tableId, totalValidRows);
+        }
+        catch (RowIdException e)
+        {
+            throw new MainIndexException("Failed to allocate row ID batch for tableId=" + group.tableId, e);
+        }
+        long firstNewRowId = rowIdBatch.getRowIdStart();
+
+        // Retry loop: putEntry for every surviving row, then flush.
+        MainIndexException lastException = null;
+        for (int attempt = 1; attempt <= SYNC_MAX_RETRIES; attempt++)
+        {
+            try
+            {
+                for (FileCandidate oldCandidate : group.files)
+                {
+                    int[] mapping = fileMappings.get(oldCandidate.file.getId());
+                    if (mapping == null) continue;
+                    for (int oldRowId = 0; oldRowId < mapping.length; oldRowId++)
+                    {
+                        int newGlobal = mapping[oldRowId];
+                        if (newGlobal < 0) continue;  // row was physically deleted
+
+                        long newRowId = firstNewRowId + newGlobal;
+                        int newRgId = findNewRgId(newGlobal, newRgCumulativeRows);
+                        int newRgLocalOffset = newGlobal - newRgCumulativeRows[newRgId];
+
+                        IndexProto.RowLocation location = IndexProto.RowLocation.newBuilder()
+                                .setFileId(newFileId)
+                                .setRgId(newRgId)
+                                .setRgRowOffset(newRgLocalOffset)
+                                .build();
+
+                        if (!mainIndex.putEntry(newRowId, location))
+                        {
+                            throw new MainIndexException(
+                                    "putEntry returned false for rowId=" + newRowId);
+                        }
+                    }
+                }
+                mainIndex.flushCache(newFileId);
+                logger.info("MainIndex sync complete for newFileId={}: {} entries written",
+                        newFileId, totalValidRows);
+                return firstNewRowId;  // success
+            }
+            catch (MainIndexException e)
+            {
+                lastException = e;
+                if (attempt < SYNC_MAX_RETRIES)
+                {
+                    long delayMs = 1000L * attempt;
+                    logger.warn("MainIndex sync attempt {}/{} failed for newFileId={}; retrying in {}ms",
+                            attempt, SYNC_MAX_RETRIES, newFileId, delayMs, e);
+                    try { Thread.sleep(delayMs); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                }
+            }
+        }
+        throw new MainIndexException(
+                "MainIndex sync failed after " + SYNC_MAX_RETRIES + " attempts for newFileId=" + newFileId,
+                lastException);
+    }
+
+    // =========================================================================
+    // SinglePointIndex sync
+    // =========================================================================
+
+    /**
+     * Update the SinglePointIndex so that surviving rows point to their new rowIds.
+     *
+     * <p>For each surviving row we reconstruct its {@code IndexKey} from:
+     * <ul>
+     *   <li>{@code pkBytes} – the serialised primary-key column values read during the file-copy
+     *       pass (same byte layout used when the row was first inserted).</li>
+     *   <li>{@code writeTs} – the hidden commit timestamp stored in the file's hidden column.</li>
+     * </ul>
+     * The new {@code rowId} is {@code firstNewRowId + newGlobalRowId} (the same contiguous block
+     * that was allocated by {@link #syncMainIndex}).
+     *
+     * @param group             the file group being rewritten (provides {@code tableId})
+     * @param primaryIndexMeta  metadata for the table's primary SinglePointIndex
+     * @param firstNewRowId     first row-ID of the contiguous block allocated for surviving rows
+     * @param newRowPkBytes     per-row serialised PK bytes, in newGlobalRowId order (0-based)
+     * @param newRowWriteTs     per-row write timestamps, in newGlobalRowId order (0-based)
+     * @param newFileId         metadata file ID of the new file
+     * @throws IndexException if the sync cannot be completed
+     */
+    private void syncSinglePointIndex(FileGroup group,
+                                      SinglePointIndex primaryIndexMeta,
+                                      long firstNewRowId,
+                                      List<byte[]> newRowPkBytes,
+                                      List<Long> newRowWriteTs,
+                                      long newFileId) throws IndexException
+    {
+        long tableId = group.tableId;
+        long indexId = primaryIndexMeta.getId();
+        IndexOption indexOption = IndexOption.builder().vNodeId(0).build();
+
+        int totalRows = newRowPkBytes.size();
+        List<IndexProto.PrimaryIndexEntry> entries = new ArrayList<>(totalRows);
+        for (int i = 0; i < totalRows; i++)
+        {
+            long newRowId = firstNewRowId + i;
+            long writeTs  = newRowWriteTs.get(i);
+            byte[] pkBytes = newRowPkBytes.get(i);
+
+            IndexProto.IndexKey key = IndexProto.IndexKey.newBuilder()
+                    .setTableId(tableId)
+                    .setIndexId(indexId)
+                    .setKey(ByteString.copyFrom(pkBytes))
+                    .setTimestamp(writeTs)
+                    .build();
+
+            // Row location is not used by updatePrimaryEntry (it updates SPI value only;
+            // MainIndex location was already set by syncMainIndex), but the proto field
+            // is required so we fill a placeholder.
+            IndexProto.RowLocation loc = IndexProto.RowLocation.newBuilder()
+                    .setFileId(newFileId).setRgId(0).setRgRowOffset(0).build();
+
+            entries.add(IndexProto.PrimaryIndexEntry.newBuilder()
+                    .setIndexKey(key)
+                    .setRowId(newRowId)
+                    .setRowLocation(loc)
+                    .build());
+        }
+
+        LocalIndexService.Instance().updatePrimaryIndexEntries(tableId, indexId, entries, indexOption);
+        logger.info("SinglePointIndex sync complete for newFileId={}: {} entries updated", newFileId, totalRows);
+    }
+
+    // =========================================================================
+    // PK serialisation helpers
+    // =========================================================================
+
+    /**
+     * Resolve which schema column positions correspond to primary-key columns, and
+     * return them as a two-element int[][] where:
+     * <ul>
+     *   <li>[0] = schema-position array (index into {@link TypeDescription#getChildren()})</li>
+     *   <li>[1] = unused placeholder (category ordinals are derived later from the schema)</li>
+     * </ul>
+     */
+    private int[][] resolvePkColumns(SinglePointIndex primaryIndexMeta, TypeDescription schema)
+            throws MetadataException
+    {
+        List<Integer> keyColumnIds = primaryIndexMeta.getKeyColumns().getKeyColumnIds();
+        long tableId = primaryIndexMeta.getTableId();
+        long indexId = primaryIndexMeta.getId();
+        List<Column> pkCols = IndexUtils.extractInfoFromIndex(tableId, indexId);
+        List<String> fieldNames = schema.getFieldNames();
+
+        int[] indices = new int[pkCols.size()];
+        for (int pi = 0; pi < pkCols.size(); pi++)
+        {
+            String colName = pkCols.get(pi).getName();
+            int pos = -1;
+            for (int si = 0; si < fieldNames.size(); si++)
+            {
+                if (fieldNames.get(si).equalsIgnoreCase(colName))
+                {
+                    pos = si;
+                    break;
+                }
+            }
+            if (pos < 0)
+            {
+                throw new MetadataException("PK column '" + colName + "' not found in file schema");
+            }
+            indices[pi] = pos;
+        }
+        return new int[][]{indices, new int[0]};
+    }
+
+    /**
+     * Serialise the primary-key column values for a single row into a byte array.
+     *
+     * <p>The byte layout matches the format used by Retina clients when they construct
+     * {@code IndexKey.key}: each column value is serialised as big-endian fixed-width bytes
+     * for numeric types, or raw bytes for binary/string types; the per-column bytes are
+     * concatenated in the order of the primary key definition.
+     *
+     * @param batch            the row batch containing the row's data
+     * @param rowIdx           the in-batch row index
+     * @param pkColIndices     schema positions of PK columns
+     * @param pkColCategories  type categories of PK columns (aligned with pkColIndices)
+     * @return concatenated PK bytes for the row
+     */
+    private byte[] serializePkBytes(VectorizedRowBatch batch, int rowIdx,
+                                    int[] pkColIndices, TypeDescription.Category[] pkColCategories)
+    {
+        // Fast path for single-column PK (most common case).
+        if (pkColIndices.length == 1)
+        {
+            return serializeSingleColumn(batch.cols[pkColIndices[0]], rowIdx, pkColCategories[0]);
+        }
+
+        // Multi-column PK: accumulate parts then join.
+        int totalLen = 0;
+        byte[][] parts = new byte[pkColIndices.length][];
+        for (int pi = 0; pi < pkColIndices.length; pi++)
+        {
+            parts[pi] = serializeSingleColumn(batch.cols[pkColIndices[pi]], rowIdx, pkColCategories[pi]);
+            totalLen += parts[pi].length;
+        }
+        byte[] result = new byte[totalLen];
+        int offset = 0;
+        for (byte[] part : parts)
+        {
+            System.arraycopy(part, 0, result, offset, part.length);
+            offset += part.length;
+        }
+        return result;
+    }
+
+    private byte[] serializeSingleColumn(ColumnVector col, int rowIdx,
+                                         TypeDescription.Category category)
+    {
+        switch (category)
+        {
+            case LONG:
+                return ByteBuffer.allocate(Long.BYTES).order(ByteOrder.BIG_ENDIAN)
+                        .putLong(((LongColumnVector) col).vector[rowIdx]).array();
+            case INT:
+            case DATE:
+            case TIME:
+                return ByteBuffer.allocate(Integer.BYTES).order(ByteOrder.BIG_ENDIAN)
+                        .putInt((int) ((LongColumnVector) col).vector[rowIdx]).array();
+            case SHORT:
+                return ByteBuffer.allocate(Short.BYTES).order(ByteOrder.BIG_ENDIAN)
+                        .putShort((short) ((LongColumnVector) col).vector[rowIdx]).array();
+            case BYTE:
+            case BOOLEAN:
+                return new byte[]{(byte) ((LongColumnVector) col).vector[rowIdx]};
+            case FLOAT:
+                return ByteBuffer.allocate(Float.BYTES).order(ByteOrder.BIG_ENDIAN)
+                        .putFloat(Float.intBitsToFloat((int) ((LongColumnVector) col).vector[rowIdx])).array();
+            case DOUBLE:
+                return ByteBuffer.allocate(Double.BYTES).order(ByteOrder.BIG_ENDIAN)
+                        .putDouble(Double.longBitsToDouble(((LongColumnVector) col).vector[rowIdx])).array();
+            case DECIMAL:
+                return ByteBuffer.allocate(Long.BYTES).order(ByteOrder.BIG_ENDIAN)
+                        .putLong(((DecimalColumnVector) col).vector[rowIdx]).array();
+            case TIMESTAMP:
+            {
+                TimestampColumnVector tcv = (TimestampColumnVector) col;
+                return ByteBuffer.allocate(Long.BYTES).order(ByteOrder.BIG_ENDIAN)
+                        .putLong(tcv.times[rowIdx]).array();
+            }
+            case STRING:
+            case VARCHAR:
+            case CHAR:
+            case BINARY:
+            case VARBINARY:
+            {
+                BinaryColumnVector bcv = (BinaryColumnVector) col;
+                int start = bcv.start[rowIdx];
+                int len   = bcv.lens[rowIdx];
+                return Arrays.copyOfRange(bcv.vector[rowIdx], start, start + len);
+            }
+            default:
+                // Fallback: return empty bytes (should not happen for valid PK columns).
+                logger.warn("Unsupported PK column category for serialisation: {}", category);
+                return new byte[0];
+        }
+    }
+
+    /**
+     * Create a write-batch for the new file.
+     *
+     * <p>When {@code hasHiddenCol} is {@code true} the batch gets an extra
+     * {@link LongColumnVector} at the end, which {@link PixelsWriterImpl} treats as the
+     * hidden commit-timestamp column.
+     */
+    private VectorizedRowBatch createWriteBatch(TypeDescription schema, int batchSize, boolean hasHiddenCol)
+    {
+        VectorizedRowBatch batch = schema.createRowBatch(batchSize);
+        if (hasHiddenCol)
+        {
+            ColumnVector[] extended = Arrays.copyOf(batch.cols, batch.cols.length + 1);
+            extended[extended.length - 1] = new LongColumnVector(batchSize);
+            batch.cols = extended;
+            batch.numCols = extended.length;
+        }
+        return batch;
+    }
+
+    /**
+     * Binary-search the cumulative array to find which new RG a given global row ID belongs to.
+     *
+     * @param newGlobal          the global row position in the new file (0-based)
+     * @param newRgCumulativeRows cumulative[i] = total rows in RGs 0..(i-1); length = numRGs + 1
+     * @return 0-based index of the new RG
+     */
+    private int findNewRgId(int newGlobal, int[] newRgCumulativeRows)
+    {
+        int lo = 0, hi = newRgCumulativeRows.length - 2;  // last valid RG index
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) >>> 1;
+            if (newRgCumulativeRows[mid] <= newGlobal) lo = mid;
+            else hi = mid - 1;
+        }
+        return lo;
+    }
+
+    /**
+     * Build a cumulative-sum array from per-RG row counts.
+     * {@code result[0] = 0}, {@code result[i+1] = result[i] + rowCounts[i]}.
+     */
+    private int[] buildCumulativeArray(int[] rowCounts)
+    {
+        int[] cumulative = new int[rowCounts.length + 1];
+        for (int i = 0; i < rowCounts.length; i++)
+        {
+            cumulative[i + 1] = cumulative[i] + rowCounts[i];
+        }
+        return cumulative;
     }
 
     /**
@@ -630,7 +1156,7 @@ public class StorageGarbageCollector
         {
             int numRowGroups = file.getNumRowGroup();
             long totalInvalidCount = 0;
-            long totalRowCount = file.getNumRows(); // Use actual file row count instead of RG-level count
+            long totalRowCount = 0;
 
             for (int rgId = 0; rgId < numRowGroups; rgId++)
             {
@@ -638,6 +1164,7 @@ public class StorageGarbageCollector
                 if (rgVisibility != null)
                 {
                     totalInvalidCount += rgVisibility.getInvalidCount();
+                    totalRowCount += rgVisibility.getRecordNum();
                 }
             }
 
@@ -696,70 +1223,6 @@ public class StorageGarbageCollector
         
         // Default encoding level: EL2
         return EncodingLevel.EL2;
-    }
-
-    /**
-     * Calculate actual record number for a row group based on RowId Mapping.
-     * This ensures the recordNum matches the actual number of rows written to the new RG.
-     */
-    private int calculateActualRecordNum(int[] mapping, int rgId, int numRowGroups)
-    {
-        if (mapping == null || mapping.length == 0)
-        {
-            return 65536; // Fallback to default if mapping is not available
-        }
-        
-        // Count valid rows (mapping[i] >= 0) that belong to this RG
-        int rgStart = rgId * (mapping.length / numRowGroups);
-        int rgEnd = (rgId + 1) * (mapping.length / numRowGroups);
-        
-        int validRows = 0;
-        for (int i = rgStart; i < rgEnd && i < mapping.length; i++)
-        {
-            if (mapping[i] >= 0)
-            {
-                validRows++;
-            }
-        }
-        
-        // Return actual row count, with minimum of 1 to avoid zero-sized RG
-        return Math.max(validRows, 1);
-    }
-
-    /**
-     * Get real file ID from metadata service after atomic swap.
-     */
-    private long getRealFileIdFromMetadata(String filePath)
-    {
-        try
-        {
-            return metadataService.getFileId(filePath);
-        }
-        catch (Exception e)
-        {
-            logger.error("Failed to get real file ID from metadata for path: {}", filePath, e);
-            throw new RuntimeException("Failed to get real file ID", e);
-        }
-    }
-
-    /**
-     * Update RGVisibility with real file ID after metadata swap.
-     */
-    private void updateFileIdInRGVisibility(long tempFileId, long realFileId)
-    {
-        // TODO: Implement RGVisibility file ID update logic
-        // This requires access to RGVisibility internal structures
-        logger.info("Updating RGVisibility file ID from {} to {}", tempFileId, realFileId);
-    }
-
-    /**
-     * Update RedirectInfo with real file ID after metadata swap.
-     */
-    private void updateFileIdInRedirectInfo(long tempFileId, long realFileId)
-    {
-        // TODO: Implement RedirectInfo file ID update logic
-        // This requires access to RetinaResourceManager's redirect maps
-        logger.info("Updating RedirectInfo file ID from {} to {}", tempFileId, realFileId);
     }
 
     /**

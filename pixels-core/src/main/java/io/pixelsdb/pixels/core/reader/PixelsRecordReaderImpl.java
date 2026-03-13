@@ -139,6 +139,13 @@ public class PixelsRecordReaderImpl implements PixelsRecordReader
     private long readTimeNanos = 0L;
     private long memoryUsage = 0L;
 
+    /**
+     * The hidden commit timestamps for rows in the last readBatch() call.
+     * Populated only when {@link PixelsReaderOption#isForceReadHiddenColumn()} is true
+     * and the file has a hidden column.
+     */
+    private long[] lastBatchTimestamps = null;
+
     private static boolean checkBit(long[] bitmap, int k)
     {
         return (bitmap[k / 64] & (1L << (k % 64))) != 0;
@@ -161,7 +168,8 @@ public class PixelsRecordReaderImpl implements PixelsRecordReader
         this.option = option;
         this.transId = option.getTransId();
         this.transTimestamp = option.getTransTimestamp();
-        this.shouldReadHiddenColumn = option.hasValidTransTimestamp() && postScript.getHasHiddenColumn();
+        this.shouldReadHiddenColumn = (option.hasValidTransTimestamp() || option.isForceReadHiddenColumn())
+                && postScript.getHasHiddenColumn();
         this.RGStart = option.getRGStart();
         this.RGLen = option.getRGLen();
         this.enableEncodedVector = option.isEnableEncodedColumnVector();
@@ -1237,6 +1245,11 @@ public class PixelsRecordReaderImpl implements PixelsRecordReader
                     curBatchSize = batchSize - resultRowBatch.size;
                 }
 
+                // When shouldReadHiddenColumn is true the chunkBuffers stride is
+                // (includedColumns.length + 1) instead of includedColumns.length.
+                int colStride = shouldReadHiddenColumn
+                        ? includedColumns.length + 1 : includedColumns.length;
+
                 // read vectors
                 for (int i = 0; i < resultColumns.length; i++)
                 {
@@ -1245,12 +1258,34 @@ public class PixelsRecordReaderImpl implements PixelsRecordReader
                         PixelsProto.RowGroupFooter rowGroupFooter = rowGroupFooters[curRGIdx];
                         PixelsProto.ColumnEncoding encoding = rowGroupFooter.getRowGroupEncoding()
                                 .getColumnChunkEncodings(resultColumns[i]);
-                        int index = curRGIdx * includedColumns.length + resultColumns[i];
+                        int index = curRGIdx * colStride + resultColumns[i];
                         PixelsProto.ColumnChunkIndex chunkIndex = rowGroupFooter.getRowGroupIndexEntry()
                                 .getColumnChunkIndexEntries(resultColumns[i]);
                         readers[i].read(chunkBuffers[index], encoding, curRowInRG, curBatchSize,
                                 postScript.getPixelStride(), resultRowBatch.size, columnVectors[i], chunkIndex);
                     }
+                }
+
+                // Decode the hidden timestamp column for forceReadHiddenColumn callers (e.g. Storage GC).
+                if (shouldReadHiddenColumn)
+                {
+                    PixelsProto.RowGroupFooter rowGroupFooter = rowGroupFooters[curRGIdx];
+                    int hiddenColId = includedColumns.length;
+                    int hiddenIndex = curRGIdx * colStride + hiddenColId;
+                    LongColumnVector hiddenVec = new LongColumnVector(curBatchSize);
+                    PixelsProto.ColumnEncoding hiddenEncoding = rowGroupFooter.getRowGroupEncoding()
+                            .getHiddenColumnChunkEncoding();
+                    PixelsProto.ColumnChunkIndex hiddenChunkIndex = rowGroupFooter.getRowGroupIndexEntry()
+                            .getHiddenColumnChunkIndexEntry();
+                    readers[readers.length - 1].read(chunkBuffers[hiddenIndex], hiddenEncoding,
+                            curRowInRG, curBatchSize, postScript.getPixelStride(), 0,
+                            hiddenVec, hiddenChunkIndex);
+                    // Grow / initialise the per-batch timestamp buffer and copy decoded values.
+                    if (lastBatchTimestamps == null || lastBatchTimestamps.length < resultRowBatch.size + curBatchSize)
+                    {
+                        lastBatchTimestamps = new long[batchSize];
+                    }
+                    System.arraycopy(hiddenVec.vector, 0, lastBatchTimestamps, resultRowBatch.size, curBatchSize);
                 }
 
                 // update current row index in the row group
@@ -1329,6 +1364,12 @@ public class PixelsRecordReaderImpl implements PixelsRecordReader
             throws IOException
     {
         return readBatch(VectorizedRowBatch.DEFAULT_SIZE, false);
+    }
+
+    @Override
+    public long[] getLastBatchTimestamps()
+    {
+        return lastBatchTimestamps;
     }
 
     @Override

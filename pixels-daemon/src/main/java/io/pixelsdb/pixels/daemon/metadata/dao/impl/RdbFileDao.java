@@ -302,9 +302,18 @@ public class RdbFileDao extends FileDao
                 }
             }
 
-            // Insert new files
+            // Insert or update files.
+            // If file.getId() != 0, the file was pre-registered (e.g., as TEMPORARY by Storage GC)
+            // and we UPDATE it in-place (promotes TEMPORARY → REGULAR, preserving file ID).
+            // If file.getId() == 0, we INSERT a new row with a DB-assigned ID.
             if (filesToAdd != null && !filesToAdd.isEmpty())
             {
+                String updateSql = "UPDATE FILES SET " +
+                        "`FILE_TYPE`=?," +
+                        "`FILE_NUM_RG`=?," +
+                        "`FILE_MIN_ROW_ID`=?," +
+                        "`FILE_MAX_ROW_ID`=? " +
+                        "WHERE FILE_ID=?";
                 String insertSql = "INSERT INTO FILES(" +
                         "`FILE_NAME`," +
                         "`FILE_TYPE`," +
@@ -312,19 +321,33 @@ public class RdbFileDao extends FileDao
                         "`FILE_MIN_ROW_ID`," +
                         "`FILE_MAX_ROW_ID`," +
                         "`PATHS_PATH_ID`) VALUES (?,?,?,?,?,?)";
-                try (PreparedStatement pst = conn.prepareStatement(insertSql))
+                try (PreparedStatement updatePst = conn.prepareStatement(updateSql);
+                     PreparedStatement insertPst = conn.prepareStatement(insertSql))
                 {
                     for (MetadataProto.File file : filesToAdd)
                     {
-                        pst.setString(1, file.getName());
-                        pst.setInt(2, file.getTypeValue());
-                        pst.setInt(3, file.getNumRowGroup());
-                        pst.setLong(4, file.getMinRowId());
-                        pst.setLong(5, file.getMaxRowId());
-                        pst.setLong(6, file.getPathId());
-                        pst.addBatch();
+                        if (file.getId() != 0)
+                        {
+                            updatePst.setInt(1, file.getTypeValue());
+                            updatePst.setInt(2, file.getNumRowGroup());
+                            updatePst.setLong(3, file.getMinRowId());
+                            updatePst.setLong(4, file.getMaxRowId());
+                            updatePst.setLong(5, file.getId());
+                            updatePst.addBatch();
+                        }
+                        else
+                        {
+                            insertPst.setString(1, file.getName());
+                            insertPst.setInt(2, file.getTypeValue());
+                            insertPst.setInt(3, file.getNumRowGroup());
+                            insertPst.setLong(4, file.getMinRowId());
+                            insertPst.setLong(5, file.getMaxRowId());
+                            insertPst.setLong(6, file.getPathId());
+                            insertPst.addBatch();
+                        }
                     }
-                    pst.executeBatch();
+                    updatePst.executeBatch();
+                    insertPst.executeBatch();
                 }
             }
 

@@ -85,6 +85,12 @@ public class SqliteMainIndex implements MainIndex
      */
     private static final String insertRangeSql = "INSERT INTO row_id_ranges VALUES(?, ?, ?, ?, ?, ?)";
 
+    /**
+     * The SQL statement to query all row id ranges for a given file id.
+     * Used by Storage GC to enumerate rowId ranges belonging to an old file.
+     */
+    private static final String queryRangesByFileIdSql = "SELECT * FROM row_id_ranges WHERE file_id = ?";
+
     private final long tableId;
     private final String sqlitePath;
     private final MainIndexBuffer indexBuffer;
@@ -271,6 +277,39 @@ public class SqliteMainIndex implements MainIndex
             this.dbRwLock.readLock().unlock();
         }
         return location;
+    }
+
+    @Override
+    public List<RowIdRange> getRowIdRangesForFile(long fileId) throws MainIndexException
+    {
+        this.dbRwLock.readLock().lock();
+        try (PreparedStatement pst = connection.prepareStatement(queryRangesByFileIdSql))
+        {
+            pst.setLong(1, fileId);
+            try (ResultSet rs = pst.executeQuery())
+            {
+                ImmutableList.Builder<RowIdRange> builder = ImmutableList.builder();
+                while (rs.next())
+                {
+                    long rowIdStart = rs.getLong("row_id_start");
+                    long rowIdEnd = rs.getLong("row_id_end");
+                    long fid = rs.getLong("file_id");
+                    int rgId = rs.getInt("rg_id");
+                    int rgRowOffsetStart = rs.getInt("rg_row_offset_start");
+                    int rgRowOffsetEnd = rs.getInt("rg_row_offset_end");
+                    builder.add(new RowIdRange(rowIdStart, rowIdEnd, fid, rgId, rgRowOffsetStart, rgRowOffsetEnd));
+                }
+                return builder.build();
+            }
+        }
+        catch (SQLException e)
+        {
+            throw new MainIndexException("Failed to query row id ranges for fileId=" + fileId, e);
+        }
+        finally
+        {
+            this.dbRwLock.readLock().unlock();
+        }
     }
 
     @Override

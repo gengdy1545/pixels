@@ -38,6 +38,7 @@ public class PixelsReaderOption
     private long transTimestamp = -1L; // -1 means no need to consider the timestamp when reading data
     private int rgStart = 0;
     private int rgLen = -1;     // -1 means reading to the end of the file
+    private boolean forceReadHiddenColumn = false; // force reading hidden column even without transTimestamp filter
 
     public PixelsReaderOption() { }
 
@@ -103,6 +104,17 @@ public class PixelsReaderOption
     public boolean hasValidTransTimestamp()
     {
         return this.transTimestamp >= 0L;
+    }
+
+    public PixelsReaderOption forceReadHiddenColumn(boolean forceReadHiddenColumn)
+    {
+        this.forceReadHiddenColumn = forceReadHiddenColumn;
+        return this;
+    }
+
+    public boolean isForceReadHiddenColumn()
+    {
+        return forceReadHiddenColumn;
     }
 
     public PixelsReaderOption rgRange(int rgStart, int rgLen)

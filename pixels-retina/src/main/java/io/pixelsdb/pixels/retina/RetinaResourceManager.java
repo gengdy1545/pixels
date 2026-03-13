@@ -76,6 +76,9 @@ public class RetinaResourceManager
     private long latestGcTimestamp = -1;
     private final int totalVirtualNodeNum;
 
+    // GC WAL for restart recovery of interrupted Storage GC rewrites
+    private final GcWal gcWal;
+
     private final Map<Long, AtomicInteger> checkpointRefCounts;
 
     private enum CheckpointType
@@ -157,6 +160,15 @@ public class RetinaResourceManager
                 logger.error("Failed to get retina hostname", e);
             }
         }
+
+        // GC WAL: default path is <checkpointDir>/gc_wal.log; can be overridden via config.
+        String walPath = config.getProperty("retina.gc.wal.path");
+        if (walPath == null || walPath.isEmpty())
+        {
+            String dir = checkpointDir.endsWith("/") ? checkpointDir : checkpointDir + "/";
+            walPath = dir + "gc_wal.log";
+        }
+        this.gcWal = new GcWal(walPath);
     }
 
     private static final class InstanceHolder
@@ -198,11 +210,7 @@ public class RetinaResourceManager
 
     public void finishRecovery()
     {
-        if (!recoveryCache.isEmpty())
-        {
-            logger.info("Dropping {} orphaned entries from recovery cache.", recoveryCache.size());
-            recoveryCache.clear();
-        }
+        // No-op: recoveryCache was removed as part of cleanup; kept for API compatibility.
     }
 
     public void addVisibility(String filePath) throws RetinaException
@@ -735,7 +743,7 @@ public class RetinaResourceManager
             }
             
             // 3. Run Storage GC after Memory GC
-            StorageGarbageCollector storageGC = new StorageGarbageCollector(this, metadataService);
+            StorageGarbageCollector storageGC = new StorageGarbageCollector(this, metadataService, gcWal);
             storageGC.runStorageGC();
         } catch (Exception e)
         {
@@ -830,6 +838,98 @@ public class RetinaResourceManager
         {
             logger.error("Failed to recover checkpoints", e);
         }
+    }   // end recoverCheckpoints()
+
+    /**
+     * Replay the GC WAL and clean up any Storage GC operations that were interrupted
+     * by a process crash.
+     *
+     * <p>For each entry in the WAL that has a {@code PENDING} record but no matching
+     * {@code DONE} record, this method:
+     * <ol>
+     *   <li>Deletes the TEMPORARY metadata entry (the new file that was being written).</li>
+     *   <li>Deletes the associated physical file from storage.</li>
+     * </ol>
+     * After processing, the WAL is compacted to remove all completed entries.
+     *
+     * <p>Should be called once during startup, after {@link #recoverCheckpoints()}.
+     */
+    public void cleanupTemporaryFiles()
+    {
+        List<GcWal.PendingEntry> pendingEntries;
+        try
+        {
+            pendingEntries = gcWal.recoverPendingEntries();
+        }
+        catch (IOException e)
+        {
+            logger.error("Failed to read GC WAL; skipping temporary file cleanup", e);
+            return;
+        }
+
+        if (pendingEntries.isEmpty())
+        {
+            logger.debug("GC WAL: no pending entries found on startup");
+            return;
+        }
+
+        logger.info("GC WAL: cleaning up {} interrupted Storage GC operation(s)", pendingEntries.size());
+
+        List<GcWal.PendingEntry> uncleanedEntries = new ArrayList<>();
+        for (GcWal.PendingEntry entry : pendingEntries)
+        {
+            boolean cleaned = true;
+
+            // 1. Delete the TEMPORARY metadata entry.
+            try
+            {
+                metadataService.deleteFiles(Collections.singletonList(entry.newFileId));
+                logger.info("GC WAL recovery: deleted TEMPORARY metadata for fileId={}", entry.newFileId);
+            }
+            catch (Exception e)
+            {
+                logger.warn("GC WAL recovery: failed to delete metadata for fileId={}; will retry on next restart",
+                        entry.newFileId, e);
+                cleaned = false;
+            }
+
+            // 2. Delete the physical file.
+            if (cleaned)
+            {
+                try
+                {
+                    Storage s = StorageFactory.Instance().getStorage(entry.newFilePath);
+                    if (s.exists(entry.newFilePath))
+                    {
+                        s.delete(entry.newFilePath, false);
+                        logger.info("GC WAL recovery: deleted orphaned physical file {}", entry.newFilePath);
+                    }
+                }
+                catch (Exception e)
+                {
+                    // Physical file deletion failure is non-fatal: cleanupOrphanPhysicalFiles()
+                    // in StorageGarbageCollector will pick it up on the next GC cycle.
+                    logger.warn("GC WAL recovery: failed to delete physical file {}; "
+                            + "it will be cleaned by orphan-file GC later", entry.newFilePath, e);
+                }
+            }
+            else
+            {
+                uncleanedEntries.add(entry);
+            }
+        }
+
+        // Compact the WAL: retain only entries whose metadata deletion failed.
+        try
+        {
+            gcWal.compact(uncleanedEntries);
+        }
+        catch (IOException e)
+        {
+            logger.warn("GC WAL: compaction failed; stale entries will be re-processed on the next restart", e);
+        }
+    }
+
     /**
      * Register redirection mapping for Storage GC dual-write.
      * This enables dual-write during index update phase.
@@ -880,5 +980,34 @@ public class RetinaResourceManager
         forwardMap.remove(oldFileId);
         backwardMap.remove(newFileId);
         logger.info("Unregistered redirection: oldFileId={}, newFileId={}", oldFileId, newFileId);
+    }
+
+    /**
+     * Remove and close all {@link RGVisibility} instances associated with the given file.
+     * <p>
+     * Called during Storage GC abort cleanup when a rewrite is rolled back before activation,
+     * so that in-memory visibility state for the half-built new file does not leak.
+     *
+     * @param fileId the file ID whose RGVisibility entries should all be removed
+     */
+    public void removeAllRGVisibilityForFile(long fileId)
+    {
+        String prefix = fileId + "_";
+        List<String> toRemove = rgVisibilityMap.keySet().stream()
+                .filter(k -> k.startsWith(prefix))
+                .collect(Collectors.toList());
+        for (String key : toRemove)
+        {
+            RGVisibility rgv = rgVisibilityMap.remove(key);
+            if (rgv != null)
+            {
+                rgv.close();
+            }
+        }
+        if (!toRemove.isEmpty())
+        {
+            logger.debug("Removed {} RGVisibility entries for fileId={} (abort cleanup)",
+                    toRemove.size(), fileId);
+        }
     }
 }

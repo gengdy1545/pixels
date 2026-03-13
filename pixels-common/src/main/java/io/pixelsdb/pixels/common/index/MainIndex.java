@@ -135,6 +135,16 @@ public interface MainIndex extends Closeable
     List<Boolean> putEntries(List<IndexProto.PrimaryIndexEntry> primaryEntries);
 
     /**
+     * Get all row id ranges stored in the main index for the given file.
+     * Used by Storage GC to enumerate all rowIds associated with an old file so their
+     * RowLocation entries can be updated to point to the newly rewritten file.
+     *
+     * @param fileId the file id whose row id ranges are to be retrieved
+     * @return list of RowIdRange for the file, empty if none found
+     */
+    List<RowIdRange> getRowIdRangesForFile(long fileId) throws MainIndexException;
+
+    /**
      * Delete a range of row ids from the main index. This method only has effect on the persistent storage
      * of the main index. {@link #flushCache(long fileId)} should be called before this method
      * delete the row ids from both cache and persistent storage.

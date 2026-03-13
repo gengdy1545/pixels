@@ -150,6 +150,22 @@ public interface PixelsRecordReader extends AutoCloseable
     long getMemoryUsage();
 
     /**
+     * Get the hidden commit timestamps from the last {@link #readBatch} call.
+     * Valid only when {@link PixelsReaderOption#isForceReadHiddenColumn()} is true
+     * and the file contains a hidden column ({@code PostScript.hasHiddenColumn}).
+     * <p>
+     * The returned array has exactly {@code readBatch().size} elements, one per row
+     * in the batch, in the same order. Returns {@code null} when the hidden column
+     * was not read.
+     *
+     * @return per-row write timestamps, or {@code null} if not available
+     */
+    default long[] getLastBatchTimestamps()
+    {
+        return null;
+    }
+
+    /**
      * Cleanup and release resources
      *
      * @throws java.io.IOException

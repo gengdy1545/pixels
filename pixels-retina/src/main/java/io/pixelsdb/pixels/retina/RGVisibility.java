@@ -59,11 +59,7 @@ public class RGVisibility implements AutoCloseable
         System.load(libPath);
     }
 
-    /**
-     * Constructor creates C++ object and returns handle.
-     */
     private final AtomicLong nativeHandle = new AtomicLong();
-    private final long recordNum;
 
     /**
      * The actual number of rows in this row-group, as provided at construction time.
@@ -91,7 +87,7 @@ public class RGVisibility implements AutoCloseable
 
     public long getRecordNum()
     {
-        return recordNum;
+        return rgRecordNum;
     }
 
     @Override
