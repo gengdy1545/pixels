@@ -143,22 +143,6 @@ JNIEXPORT void JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_garbageCollec
 
 /*
  * Class:     io_pixelsdb_pixels_retina_RGVisibility
- * Method:    getInvalidRatio
- * Signature: (J)D
- */
-JNIEXPORT jdouble JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getInvalidRatio
-  (JNIEnv* env, jobject, jlong handle) {
-    try {
-        auto* rgVisibility = reinterpret_cast<RGVisibilityInstance*>(handle);
-        return static_cast<jdouble>(rgVisibility->getInvalidRatio());
-    } catch (const std::exception& e) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
-        return 0.0;
-    }
-}
-
-/*
- * Class:     io_pixelsdb_pixels_retina_RGVisibility
  * Method:    getNativeMemoryUsage
  * Returns the total bytes currently allocated by the process as tracked by jemalloc.
  */
@@ -298,57 +282,4 @@ JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getInvalidCo
         env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
         return 0;
     }
-}
-
-/*
- * Class:     io_pixelsdb_pixels_retina_RGVisibility
- * Method:    getNativeMemoryUsage
- * Returns the total bytes currently allocated by the process as tracked by jemalloc.
- */
-JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getNativeMemoryUsage
-  (JNIEnv* env, jclass) {
-#ifdef ENABLE_JEMALLOC
-    size_t allocated = 0;
-    size_t sz = sizeof(size_t);
-    uint64_t epoch = 1;
-
-    // 1. Try to refresh jemalloc epoch to ensure stats are current.
-    // Return -2 if this fails, as defined in Java's handleMemoryMetric.
-    if (mallctl("epoch", NULL, NULL, &epoch, sizeof(uint64_t)) != 0) {
-        return -2;
-    }
-
-    // 2. Try to read the actual allocated bytes.
-    // Return -3 if this fails, which often implies a config/prefix mismatch.
-    if (mallctl("stats.allocated", &allocated, &sz, NULL, 0) != 0) {
-        return -3;
-    }
-
-    // Success: return the positive value
-    return static_cast<jlong>(allocated);
-#else
-    // -1 triggers the "monitoring is disabled" message in Java
-    return -1;
-#endif
-}
-
-/*
- * Class:     io_pixelsdb_pixels_retina_RGVisibility
- * Method:    getRetinaTrackedMemoryUsage
- * Signature: ()J
- */
-JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getRetinaTrackedMemoryUsage
-  (JNIEnv *env, jclass clazz) {
-    // Read the current value from the atomic counter using relaxed memory order
-    // as this is a simple statistic and doesn't require strict synchronization.
-    return static_cast<jlong>(pixels::g_retina_tracked_memory.load(std::memory_order_relaxed));
-}
-
-/*
- * Implementation for tracking the number of active objects.
- */
-JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getRetinaObjectCount
-  (JNIEnv *env, jclass clazz) {
-    // Read the atomic object counter from RetinaBase namespace
-    return static_cast<jlong>(pixels::g_retina_object_count.load(std::memory_order_relaxed));
 }

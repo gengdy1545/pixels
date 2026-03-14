@@ -120,15 +120,19 @@ std::vector<uint64_t> RGVisibility<CAPACITY>::exportDeletionBlocks() const {
     for (uint64_t tileIndex = 0; tileIndex < tileCount; tileIndex++) {
         std::vector<uint64_t> tileItems = tileVisibilities[tileIndex].exportDeletionBlocks();
         
-        // Convert tile-local rowId to RG-global rowId
+        // Convert tile-local rowId to RG-global rowId.
+        // RG-level encoding uses high 32 bits for globalRowId and low 32 bits for
+        // the lower 32 bits of timestamp.  This differs from the Tile-internal
+        // makeDeleteIndex encoding (high 16 bits / low 48 bits) and supports
+        // RGs with up to 2^32 rows.
         for (uint64_t item : tileItems) {
             uint16_t localRowId = extractRowId(item);
             uint64_t timestamp = extractTimestamp(item);
-            uint32_t globalRowId = tileIndex * CAPACITY + localRowId;
+            uint32_t globalRowId = static_cast<uint32_t>(tileIndex * CAPACITY) + localRowId;
             
-            // Pack global rowId (32-bit) and timestamp (48-bit) into uint64_t
-            // Use high 16 bits for rowId, low 48 bits for timestamp
-            uint64_t globalItem = (static_cast<uint64_t>(globalRowId) << 48) | (timestamp & 0x0000FFFFFFFFFFFFULL);
+            // high 32 bits: globalRowId, low 32 bits: lower 32 bits of timestamp
+            uint64_t globalItem = (static_cast<uint64_t>(globalRowId) << 32)
+                                  | (timestamp & 0x00000000FFFFFFFFULL);
             result.push_back(globalItem);
         }
     }
@@ -138,22 +142,23 @@ std::vector<uint64_t> RGVisibility<CAPACITY>::exportDeletionBlocks() const {
 
 template<size_t CAPACITY>
 void RGVisibility<CAPACITY>::prependDeletionBlocks(const uint64_t* items, size_t count) {
-    // Group items by tile
+    // Group items by tile.
+    // RG-level encoding: high 32 bits = globalRowId, low 32 bits = lower 32 bits of timestamp.
     std::vector<std::vector<uint64_t>> tileItems(tileCount);
     
     for (size_t i = 0; i < count; i++) {
         uint64_t item = items[i];
-        uint32_t globalRowId = static_cast<uint32_t>(item >> 48);
-        uint64_t timestamp = item & 0x0000FFFFFFFFFFFFULL;
+        uint32_t globalRowId = static_cast<uint32_t>(item >> 32);
+        uint64_t timestamp = item & 0x00000000FFFFFFFFULL;
         
         uint32_t tileIndex = globalRowId / CAPACITY;
-        uint16_t localRowId = globalRowId % CAPACITY;
+        uint16_t localRowId = static_cast<uint16_t>(globalRowId % CAPACITY);
         
         if (tileIndex >= tileCount) {
             throw std::runtime_error("Row id is out of range during prepend.");
         }
         
-        // Pack local rowId and timestamp
+        // Pack local rowId and timestamp back into Tile-internal format
         uint64_t localItem = makeDeleteIndex(localRowId, timestamp);
         tileItems[tileIndex].push_back(localItem);
     }

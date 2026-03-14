@@ -80,7 +80,7 @@ TEST_F(RGVisibilityTest, InvalidCount) {
     // GC(150) -> Should reclaim first block (8 items) but not second
     rgVisibility->collectRGGarbage(150);
     
-    // Test getInvalidCount instead of getInvalidCount
+    // getInvalidCount() returns baseBitmap invalid rows only (8 after first GC)
     uint64_t invalidCount = rgVisibility->getInvalidCount();
     EXPECT_EQ(invalidCount, 8UL);
 
@@ -366,4 +366,105 @@ TEST_F(RGVisibilityTest, InvalidCountAfterGC) {
     EXPECT_EQ(snapshot, baseBitmapCount)
         << "snapshot=" << snapshot
         << " baseBitmapCount=" << baseBitmapCount;
+}
+
+// Test: getBaseBitmap() size equals getBitmapSize(), and popcount equals getInvalidCount().
+TEST_F(RGVisibilityTest, GetBaseBitmapConsistency) {
+    for (int i = 0; i < 16; i++) {
+        rgVisibility->deleteRGRecord(i, 100 + i);
+    }
+    rgVisibility->collectRGGarbage(200);
+
+    std::vector<uint64_t> baseBitmap = rgVisibility->getBaseBitmap();
+    EXPECT_EQ(baseBitmap.size(), static_cast<size_t>(rgVisibility->getBitmapSize()));
+
+    uint64_t popcount = 0;
+    for (uint64_t word : baseBitmap) {
+        popcount += static_cast<uint64_t>(__builtin_popcountll(word));
+    }
+    EXPECT_EQ(rgVisibility->getInvalidCount(), popcount);
+    EXPECT_EQ(popcount, 16UL);
+}
+
+// Test: exportDeletionBlocks / prependDeletionBlocks round-trip (Storage GC sync path).
+// Use a small RG so global rowIds fit in 16 bits in the packed format.
+TEST_F(RGVisibilityTest, ExportAndPrependDeletionBlocks) {
+    static constexpr uint64_t SMALL_ROW_COUNT = 512;
+    RGVisibilityInstance* rg1 = new RGVisibilityInstance(SMALL_ROW_COUNT);
+    // Delete a few rows but do not fill a full block so they stay in the deletion chain.
+    rg1->deleteRGRecord(0, 10);
+    rg1->deleteRGRecord(1, 20);
+    rg1->deleteRGRecord(2, 30);
+
+    std::vector<uint64_t> exported = rg1->exportDeletionBlocks();
+    EXPECT_EQ(exported.size(), 3UL);
+
+    // Prepend the same deletion chain into a second RG (same size, empty base).
+    RGVisibilityInstance* rg2 = new RGVisibilityInstance(SMALL_ROW_COUNT);
+    rg2->prependDeletionBlocks(exported.data(), exported.size());
+
+    // Visibility at ts 30 should match: both have rows 0,1,2 invalid.
+    uint64_t* b1 = rg1->getRGVisibilityBitmap(30);
+    uint64_t* b2 = rg2->getRGVisibilityBitmap(30);
+    uint64_t bitmapWords = rg1->getBitmapSize();
+    EXPECT_EQ(bitmapWords, rg2->getBitmapSize());
+    for (uint64_t i = 0; i < bitmapWords; i++) {
+        EXPECT_EQ(b1[i], b2[i]) << "Bitmap word " << i << " differs after prepend";
+    }
+    delete[] b1;
+    delete[] b2;
+    delete rg1;
+    delete rg2;
+}
+
+// Test: exportDeletionBlocks / prependDeletionBlocks with globalRowId > 65535.
+// Verifies that the RG-level encoding (high 32-bit rowId) does not truncate
+// row IDs beyond the 16-bit limit used by the Tile-internal format.
+TEST_F(RGVisibilityTest, ExportAndPrependDeletionBlocksLargeRowId) {
+    // 131072 rows = 512 Tiles of 256.  Rows near the boundary between tile 255
+    // (rows 65280-65535) and tile 256 (rows 65536-65791) have globalRowId that
+    // exceeds 16 bits and would be silently truncated by the old (high-16-bit)
+    // encoding.
+    static constexpr uint64_t LARGE_ROW_COUNT = 131072;
+    RGVisibilityInstance* rg1 = new RGVisibilityInstance(LARGE_ROW_COUNT);
+
+    // Delete rows that straddle the 65536 boundary so they end up in different
+    // Tiles yet their global IDs cover both the <= 65535 and > 65535 ranges.
+    const uint32_t rowsBelowBoundary[] = {65534, 65535};
+    const uint32_t rowsAboveBoundary[] = {65536, 65537, 65538};
+    for (uint32_t r : rowsBelowBoundary) rg1->deleteRGRecord(r, 10 + r);
+    for (uint32_t r : rowsAboveBoundary) rg1->deleteRGRecord(r, 10 + r);
+
+    std::vector<uint64_t> exported = rg1->exportDeletionBlocks();
+    EXPECT_EQ(exported.size(), 5UL);
+
+    RGVisibilityInstance* rg2 = new RGVisibilityInstance(LARGE_ROW_COUNT);
+    rg2->prependDeletionBlocks(exported.data(), exported.size());
+
+    // Both RGs should show identical visibility bitmaps at a timestamp that
+    // covers all deleted rows.
+    const uint64_t queryTs = 10 + rowsAboveBoundary[2] + 1;
+    uint64_t* b1 = rg1->getRGVisibilityBitmap(queryTs);
+    uint64_t* b2 = rg2->getRGVisibilityBitmap(queryTs);
+    uint64_t bitmapWords = rg1->getBitmapSize();
+    EXPECT_EQ(bitmapWords, rg2->getBitmapSize());
+    for (uint64_t i = 0; i < bitmapWords; i++) {
+        EXPECT_EQ(b1[i], b2[i]) << "Bitmap word " << i << " differs after prepend (large rowId)";
+    }
+
+    // Also verify the specific rows are marked deleted in rg2
+    auto checkBit = [&](const uint64_t* bmp, uint32_t rowId) -> bool {
+        return (bmp[rowId / 64] >> (rowId % 64)) & 1ULL;
+    };
+    for (uint32_t r : rowsBelowBoundary) {
+        EXPECT_TRUE(checkBit(b2, r)) << "Row " << r << " should be deleted in rg2";
+    }
+    for (uint32_t r : rowsAboveBoundary) {
+        EXPECT_TRUE(checkBit(b2, r)) << "Row " << r << " should be deleted in rg2";
+    }
+
+    delete[] b1;
+    delete[] b2;
+    delete rg1;
+    delete rg2;
 }
