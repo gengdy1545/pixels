@@ -1,95 +1,84 @@
-# Pixels Storage Garbage Collection (Storage GC) 设计文档 - TODO任务已完成 ✅
-
-## 🎯 任务完成状态总结
-
-### ✅ 已完成的5个核心TODO任务：
-
-1. **新文件存储路径** - 已从metadata Path URI动态获取，替换硬编码`/tmp/pixels/`
-2. **新文件ID同步** - `atomicSwapFiles`成功后从metadata获取真实文件ID并更新RGVisibility/RedirectInfo
-3. **RowGroupSize/EncodingLevel** - 已从配置文件读取，替换硬编码值（128MB/EL2）
-4. **新RG recordNum** - 已根据实际重写后的行数动态传入，替换硬编码65536
-5. **多文件合并时backwardMap的多对一支持** - 已修复backwardMap的一对一限制
-
-### 📋 实现详情：
-- **修改文件**: `StorageGarbageCollector.java`
-- **新增方法**: 
-  - `generateNewFilePath()` - 动态获取存储路径
-  - `getRowGroupSizeFromConfig()` / `getEncodingLevelFromConfig()` - 配置读取
-  - `calculateActualRecordNum()` - 动态计算recordNum
-  - `getRealFileIdFromMetadata()` / `updateFileIdIn*()` - 文件ID同步
-- **集成状态**: 已完整集成到`RetinaResourceManager.runGC()`流程中
-
----
+# Pixels Storage Garbage Collection (Storage GC) 设计文档
 
 ## 1. 背景与目标 (Background & Objective)
+
 Pixels 文件组织采用 Row Group (RG) -> Tile 的层级结构。删除信息存储在 Visibility 组件中（RGVisibility -> TileVisibility），以 Block 链表形式记录删除操作的时间戳（Timestamp）。
 
 目前已实现 **Memory GC**（回收内存中过期的 Visibility Block）。本项目的目标是实现 **Storage GC**，回收高删除率的物理文件，通过重写数据、同步 Visibility 和更新索引，释放存储空间并优化读取性能。
 
-### 1.1 现有基础设施验证 (Existing Infrastructure Verification)
-经代码分析确认以下组件已就绪：
+### 1.1 现有基础设施 (Existing Infrastructure)
+
+经设计与实现确认以下组件已就绪：
+
 - **RGVisibility/TileVisibility**: 已实现 `getInvalidCount()` 方法（C++ 和 Java/JNI），可获取每个 RG 的精确无效行数用于加权计算
-- **Storage GC 核心方法（C++/JNI/Java）**: `exportDeletionBlocks()` / `prependDeletionBlocks()` / `getBaseBitmap()` 已在 TileVisibility、RGVisibility、RGVisibilityJni 和 RGVisibility.java 各层全部实现
+- **Storage GC 核心方法（C++/JNI/Java）**: `exportDeletionBlocks()` / `prependDeletionBlocks()` / `getBaseBitmap()` 已在 TileVisibility、RGVisibility、RGVisibilityJni 和 RGVisibility.java 各层实现
 - **Memory GC**: `collectRGGarbage()` 已实现，在 `RetinaResourceManager.runGC()` 中定期执行，Storage GC 在 Memory GC 完成后作为第三阶段运行
-- **RetinaResourceManager 双写逻辑**: `forwardMap`、`backwardMap`、`RedirectInfo`、`registerRedirection()`、`unregisterRedirection()`、双写版 `deleteRecord()` 已完整实现；额外提供 `getRGVisibility()` 和 `createRGVisibility()` 供 Storage GC 使用
+- **RetinaResourceManager 双写逻辑**: `forwardMap`、`backwardMap`、`RedirectInfo`、`registerRedirection()`、`unregisterRedirection()`、双写版 `deleteRecord()` 已实现；另提供 `getRGVisibility()` 和 `createRGVisibility()` 供 Storage GC 使用
 - **DeleteIndexBlock**: 链表结构，`BLOCK_CAPACITY = 8`，每个 Block 存储 8 个删除记录（rowId + timestamp）
 - **VersionedData**: 包含 `baseBitmap`, `baseTimestamp`, `baseInvalidCount`, `head` 指针
 - **MetadataService.AtomicSwapFiles**: `proto/metadata.proto`、`RdbFileDao`、`MetadataServiceImpl`、`MetadataService` 客户端已全链路实现
-- **StorageGarbageCollector**: `StorageGarbageCollector.java` 已在 `pixels-retina` 模块中实现并集成到 `runGC()`
+- **StorageGarbageCollector**: `StorageGarbageCollector.java` 在 `pixels-retina` 模块中实现并集成到 `runGC()`
 - **RetinaUtils.extractRetinaNodeIdFromPath()**: 从右向左解析文件名获取 Retina Node ID 的工具方法已实现
+
+---
 
 ## 2. 核心机制 (Core Mechanisms)
 
 ### 2.1 触发策略 (Trigger Strategy)
-*   **指标计算**：在 Memory GC 遍历 Visibility 链表时，统计**无效行数 (Invalid Row Count)**。
-    *   **实现位置**: `RGVisibility::getInvalidCount()` (C++) 和对应的 `RGVisibility.getInvalidCount()` (Java JNI)
-    *   **计算方式**：每个 RG 通过 `getInvalidCount()` 直接返回**无效行数**（baseBitmap 中 1 位的数量之和）。文件级无效率在 `StorageGarbageCollector` 中精确计算：`fileInvalidRatio = Σ(RG无效行数) / file.getNumRows()`
-    *   **注意**：统计时仅计算 `baseBitmap` (Safe Timestamp 对应的基准位图) 中的无效位。**不包含** Visibility 链表中尚未 Compact 的动态删除记录。
-    *   **触发时机**: 在 `RetinaResourceManager.runGC()` 执行 Memory GC 完成后，`StorageGarbageCollector.scanAndGroupFiles()` 调用 `calculateFileInvalidRatio()` 获取每个文件的精确无效率
-*   **阈值判定**：
-    *   **单文件判定**：若 `Σ(RG无效行数) / Σ(RG总行容量) > 阈值` (如 0.5)，标记为待回收。（加权计算，比各 RG 无效率的算术平均更精确）
-    *   **合并判定**：将多个待回收文件组合，目标是重写后的新文件大小达到配置的**目标文件大小**。
-    *   **合并约束 (关键)**：仅允许合并**属于同一张表 (Table)** 且 **由同一 Retina 节点 (Retina Node) 写入** 的文件。
-        *   **原因**：只有同一 Retina 节点的数据才能保证 Commit Timestamp 的严格单调递增性，跨节点合并可能破坏时序逻辑。
-        *   **识别**：通过解析文件名 `<Host>_<Timestamp>_<Counter>.pxl` 识别 Retina Node ID。采用**从右向左解析**策略以兼容 Hostname 中包含下划线的情况（先提取 Counter，再提取 Timestamp，剩余为 Host）。
-        *   **验证**: 从代码中找到的文件名示例：`20190102094644_0.compact_copy_20190103025917_0.pxl`，确认命名规则存在
+
+- **指标计算**：在 Memory GC 遍历 Visibility 链表时，统计**无效行数 (Invalid Row Count)**。
+  - **实现位置**: `RGVisibility::getInvalidCount()` (C++) 及对应的 `RGVisibility.getInvalidCount()` (Java JNI)
+  - **计算方式**：每个 RG 通过 `getInvalidCount()` 直接返回**无效行数**（baseBitmap 中 1 位的数量之和）。文件级无效率在 `StorageGarbageCollector` 中计算：`fileInvalidRatio = Σ(RG无效行数) / file.getNumRows()`
+  - **注意**：统计时仅计算 `baseBitmap` (Safe Timestamp 对应的基准位图) 中的无效位，**不包含** Visibility 链表中尚未 Compact 的动态删除记录。
+  - **触发时机**: 在 `RetinaResourceManager.runGC()` 执行 Memory GC 完成后，`StorageGarbageCollector.scanAndGroupFiles()` 调用 `calculateFileInvalidRatio()` 获取每个文件的精确无效率
+- **阈值判定**：
+  - **单文件判定**：若 `Σ(RG无效行数) / Σ(RG总行容量) > 阈值`（如 0.5），标记为待回收。（加权计算，比各 RG 无效率的算术平均更精确）
+  - **合并判定**：将多个待回收文件组合，目标是重写后的新文件大小达到配置的**目标文件大小**。
+  - **合并约束**：仅允许合并**同一张表 (Table)** 且 **同一 Retina 节点 (Retina Node)** 写入的文件。
+    - **原因**：只有同一 Retina 节点的数据才能保证 Commit Timestamp 的严格单调递增性，跨节点合并可能破坏时序逻辑。
+    - **识别**：通过解析文件名 `<Host>_<Timestamp>_<Counter>.pxl` 识别 Retina Node ID，采用**从右向左解析**以兼容 Hostname 中含下划线的情况（先取 Counter，再取 Timestamp，剩余为 Host）。
 
 ### 2.2 重写流程 (Rewrite Process)
-Storage GC 的执行分为三个主要阶段：
-1.  **数据重写 (Data Rewrite)**：
-    *   **读取**: 使用 `PixelsReaderImpl` + `PhysicalReader` 读取旧文件
-    *   **过滤 [CRITICAL]**: **仅基于 Base Bitmap 过滤**，而非完整的 Visibility Bitmap
-        - **Base Bitmap**: Memory GC 已经 compact 过的删除记录，这些行可以物理删除
-        - **Deletion Chain**: Memory GC 尚未处理的删除记录，这些删除信息必须保留并迁移到新文件
-        - **实现**: 调用 `RGVisibility.getBaseBitmap()` 获取 Base Bitmap，跳过 bitmap 中为 0 的行
-        - **错误做法**: ❌ 调用 `queryVisibility(timestamp)` 会包含 Deletion Chain，导致删除信息丢失
-    *   **写入**: 使用 `PixelsWriterImpl` 创建新文件，配置参数：
-        - `pixelStride`: 从旧文件的 PostScript 中读取
-        - `rowGroupSize`: 从配置或旧文件中读取
-        - `encodingLevel`: 保持与旧文件一致
-        - `compressionKind`: 保持与旧文件一致
-    *   **生成映射**: 在重写过程中，生成 **RowId Mapping**: `int[] mapping`，其中 `mapping[OldRowId] = NewRowId`。
-        - 对于 Base Bitmap 中被删除的行（bitmap[i] = 0），`mapping[OldRowId] = -1`
-        - 对于 Base Bitmap 中保留的行（bitmap[i] = 1），`mapping[OldRowId] = newRowCounter++`
-2.  **Visibility 同步 (Visibility Sync)**：处理重写期间及历史删除数据的同步。
-3.  **索引重建与切换 (Index Rebuild & Switch)**：更新主索引，并最终在 Metadata 层完成原子切换。
+
+Storage GC 执行分为三阶段：
+
+1. **数据重写 (Data Rewrite)**：
+   - **读取**: 使用 `PixelsReaderImpl` + `PhysicalReader` 读取旧文件
+   - **过滤 [CRITICAL]**: **仅基于 Base Bitmap 过滤**，而非完整 Visibility Bitmap
+     - **Base Bitmap**: Memory GC 已 compact 的删除记录，这些行可物理删除
+     - **Deletion Chain**: Memory GC 尚未处理的删除记录，必须保留并迁移到新文件
+     - **实现**: 调用 `RGVisibility.getBaseBitmap()` 获取 Base Bitmap，**跳过 bitmap 中为 1 的行**（0 表示有效、1 表示已删除可跳过）
+     - **错误做法**: 调用 `queryVisibility(timestamp)` 会包含 Deletion Chain，导致删除信息丢失
+   - **写入**: 使用 `PixelsWriterImpl` 创建新文件。参数来源：
+     - `pixelStride`: 从旧文件 PostScript 读取
+     - `rowGroupSize`: 由 `getRowGroupSizeFromConfig()` 从配置或旧文件读取（替换硬编码 128MB）
+     - `encodingLevel`: 由 `getEncodingLevelFromConfig()` 从配置读取（替换硬编码 EL2）
+     - `compressionKind`: 与旧文件一致
+   - **新文件路径**: 由 `generateNewFilePath()` 从 metadata Path URI 动态获取，替换硬编码 `/tmp/pixels/`
+   - **新 RG recordNum**: 由 `calculateActualRecordNumPerRG(newFilePath)` 从重写后的新文件 Footer 读取每 RG 实际行数，创建 RGVisibility 时传入，替换硬编码
+   - **生成映射**: 重写过程中生成 **RowId Mapping** `int[] mapping`，`mapping[OldRowId] = NewRowId`；Base Bitmap 中已删除行 `mapping[OldRowId] = -1`，保留行 `mapping[OldRowId] = newRowCounter++`
+
+2. **Visibility 同步 (Visibility Sync)**：将旧文件未被物理删除、但尚未在 Memory GC 中 Compact 的 Deletion Chain 迁移到新文件（见 3.3 节）。
+
+3. **索引重建与切换 (Index Rebuild & Switch)**：更新主索引，在 Metadata 层完成原子切换；切换成功后由 `getRealFileIdFromMetadata()` 从 metadata 获取真实文件 ID，并调用 `updateFileIdInRGVisibility()`、`updateFileIdInRedirectInfo()` 更新 RGVisibility 与 RedirectInfo。
 
 ---
 
 ## 3. 关键算法与策略 (Key Algorithms)
 
 ### 3.1 双写策略 (Dual-Write Strategy)
-为解决重写期间“漏读”或“追赶不上”的问题，采用双向同步策略：
-1.  **注册映射**: 数据重写完成后，在 `RetinaResourceManager` 中注册 `(OldFileId, Mapping) <-> (NewFileId)` 的双向关系。
-2.  **开启双写**: `RetinaResourceManager.deleteRecord` 逻辑变更：
-    *   **Old -> New** (Forward): 收到针对 OldFile 的删除请求 -> 查 Map 得到 NewFileId 和 NewRowId -> 若 NewRowId 有效（未被物理删除），则调用 `NewFile.deleteRecord`。
-    *   **New -> Old** (Backward): 收到针对 NewFile 的删除请求 -> 查 Map 得到 OldFileId 和 OldRowId -> 调用 `OldFile.deleteRecord`。这确保了在切换期间，仍持有 OldFile 引用的长尾查询能看到最新的删除。
+
+为解决重写期间“漏读”或“追赶不上”的问题，采用双向同步：
+
+1. **注册映射**: 数据重写及 Visibility 同步完成后，在 `RetinaResourceManager` 中注册 `(OldFileId, Mapping) <-> (NewFileId)`。多文件合并时，`backwardMap` 支持多个旧文件映射到同一新文件（多对一）。
+2. **双写逻辑**（`RetinaResourceManager.deleteRecord`）：
+   - **Old -> New (Forward)**: 针对 OldFile 的删除请求 → 查 Map 得 NewFileId 和 NewRowId → 若 NewRowId 有效则调用 `NewFile.deleteRecord`
+   - **New -> Old (Backward)**: 针对 NewFile 的删除请求 → 查 Map 得 OldFileId 和 OldRowId → 调用 `OldFile.deleteRecord`，保证仍读旧文件的长尾查询能看到最新删除
 
 ### 3.2 Base Bitmap vs Deletion Chain [CRITICAL CONCEPT]
 
-**这是 Storage GC 最容易混淆的核心概念**，必须深刻理解：
+**Visibility 结构**：
 
-#### 3.2.1 Visibility 数据结构
 ```
 Visibility = Base Bitmap + Deletion Chain
             ↓                    ↓
@@ -98,326 +87,73 @@ Visibility = Base Bitmap + Deletion Chain
 ```
 
 **VersionedData 结构**（来自 `TileVisibility.h`）：
+
 ```cpp
 template<size_t CAPACITY>
 struct VersionedData {
-    uint64_t baseBitmap[NUM_WORDS]; // Memory GC compact 后的基准位图（数组，不是指针）
+    uint64_t baseBitmap[NUM_WORDS]; // Memory GC compact 后的基准位图
     uint64_t baseTimestamp;         // baseBitmap 对应的 Safe GC Timestamp
-    uint64_t baseInvalidCount;      // baseBitmap 中的无效行数（1 位的数量）
-    DeleteIndexBlock* head;         // Deletion Chain 的头指针（未 compact 的删除）
+    uint64_t baseInvalidCount;      // baseBitmap 中的无效行数（1 的个数）
+    DeleteIndexBlock* head;         // Deletion Chain 头指针（未 compact 的删除）
 };
 ```
 
-#### 3.2.2 具体示例
+**数据重写时**：仅用 `rgVisibility.getBaseBitmap()`，跳过 bitmap 中为 1 的行（已 compact 的删除）；保留 bitmap 为 0 的行（含 Deletion Chain 中的行）。不可使用 `queryVisibility(timestamp)`。
 
-假设某个 RowGroup 有 10 行数据，经历以下操作：
+**Visibility 同步时**：`oldRGVisibility.exportDeletionBlocks()` 导出 Deletion Chain → Java 层用 RowId Mapping 转换 RowId → `newRGVisibility.prependDeletionBlocks()` 插入新文件头部。
 
-**时间线**：
-1. **T0**: 初始状态，所有行有效
-   ```
-   Base Bitmap:    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  (0 = valid)
-   Deletion Chain: []
-   ```
-
-2. **T1**: 删除 Row 2, Row 5
-   ```
-   Base Bitmap:    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  (未变)
-   Deletion Chain: [(2, ts=T1), (5, ts=T1)]
-   ```
-
-2. **T2**: Memory GC 执行（Safe Timestamp = T1.5）
-   ```
-   Base Bitmap:    [0, 0, 1, 0, 0, 1, 0, 0, 0, 0]  (compact 了 T1 的删除)
-                          ↑           ↑
-                       Row 2        Row 5
-                    (1 = deleted)
-   Deletion Chain: []  (已清空)
-   ```
-4. **T3**: 删除 Row 7, Row 9
-   ```
-   Base Bitmap:    [0, 0, 1, 0, 0, 1, 0, 0, 0, 0]  (未变)
-   Deletion Chain: [(7, ts=T3), (9, ts=T3)]
-   ```
-
-5. **T4**: Storage GC 执行
-   - **错误做法** ❌: 调用 `queryVisibility(T4)` 获取完整的 Visibility Bitmap
-     ```
-     Visibility Bitmap: [0, 0, 1, 0, 0, 1, 1, 0, 1, 0]
-                                          ↑      ↑
-                                       Row 7  Row 9 (来自 Deletion Chain)
-     ```
-     **问题**: 如果跳过 Row 7 和 Row 9，这两条删除记录会丢失！
-   
-   - **正确做法** ✅: 仅使用 `getBaseBitmap()` 获取 Base Bitmap
-     ```
-     Base Bitmap: [0, 0, 1, 0, 0, 1, 0, 0, 0, 0]
-     ```
-     **结果**: 
-     - 跳过 Row 2, Row 5（可以物理删除，bitmap = 1）
-     - **保留** Row 7, Row 9（虽然在 Deletion Chain 中被标记删除，但 bitmap = 0，必须写入新文件）
-     - 然后将 Deletion Chain `[(7, ts=T3), (9, ts=T3)]` 迁移到新文件
-
-#### 3.2.3 为什么必须保留 Deletion Chain？
-
-**原因 1: MVCC 语义**
-- Deletion Chain 中的删除记录有 timestamp
-- 查询时需要根据 `queryTimestamp` 判断可见性
-- 如果物理删除这些行，早于 T3 的查询会看到错误的结果
-
-**原因 2: Memory GC 的职责边界**
-- Memory GC 只负责回收**已经对所有活跃查询不可见**的删除记录
-- Safe GC Timestamp 之后的删除记录仍然可能被某些查询看到
-- Storage GC 不能越权删除这些记录
-
-**原因 3: 双写期间的一致性**
-- 如果物理删除了 Deletion Chain 中的行，双写期间的删除操作无法正确同步
-- 新文件中必须有对应的行才能执行 `deleteRecord(newRowId)`
-
-#### 3.2.4 实现要点
-
-**数据重写时**：
-- ✅ 正确：调用 `rgVisibility.getBaseBitmap()` 获取 Base Bitmap（需要新增此方法）
-- ✅ 仅跳过 Base Bitmap 中为 1 的行（Memory GC 已 compact 的删除，1 = deleted）
-- ✅ 保留 Base Bitmap 中为 0 的行（包括 Deletion Chain 中的行，0 = valid）
-- ❌ 错误：调用 `queryVisibility(timestamp)` 会包含 Deletion Chain，导致删除信息丢失
-
-**Visibility 同步时**：
-- 调用 `oldRGVisibility.exportDeletionBlocks()` 导出 Deletion Chain（需要新增此方法）
-- 使用 RowId Mapping 转换 RowId
-- 调用 `newRGVisibility.prependDeletionBlocks()` 插入到新文件头部（需要新增此方法）
-
----
+**为何必须保留 Deletion Chain**：MVCC 语义（按 queryTimestamp 判断可见性）；Memory GC 只回收对所有活跃查询不可见的删除；双写期间新文件需有对应行才能执行 `deleteRecord(newRowId)`。
 
 ### 3.3 Visibility 同步 (Visibility Synchronization)
-新文件在创建时是“干净”的，我们需要将旧文件的 Visibility 历史数据（那些未被物理删除、但在 Memory GC 中尚未 Compact 的动态 Block）迁移过来。
 
-*   **头部插入 (Head Insertion)**：
-    *   旧数据的 Timestamp 必然 **小于** 双写产生的新数据 Timestamp。
-    *   **流程**：`RGVisibility.exportDeletionBlocks` (导出所有删除) -> Java 层转换 RowId (Old -> New) -> `NewRGVisibility.prependDeletionBlocks` (插入头部)。
-
-*   **填充 (Padding) [CRITICAL]**:
-    *   **约束**: Pixels 的 Memory GC (`collectTileGarbage`) 假设链表中除了 Tail Block 外，所有中间 Block 都是满的 (`BLOCK_CAPACITY`)。
-    *   **问题**: 导出的历史数据最后一个 Block 可能未满。如果直接链接到新文件的 Head，会破坏上述约束，导致 Memory GC 提前终止。
-    *   **解法**: 在 `prependDeletionBlocks` 中，如果最后一个 Block 未满，**必须**使用该 Block 的最后一个元素重复填充，直至填满。由于 Bitwise OR 操作是幂等的，重复删除记录不会导致数据错误。
+- **头部插入**: 旧数据 Timestamp 小于双写产生的新数据，流程为 `RGVisibility.exportDeletionBlocks` → Java 层 RowId (Old→New) 转换 → `NewRGVisibility.prependDeletionBlocks`（插入头部）。
+- **Padding [CRITICAL]**: Memory GC (`collectTileGarbage`) 假设链表中除 Tail Block 外所有中间 Block 均为满的 (`BLOCK_CAPACITY`)。导出的最后一个 Block 可能未满，若直接链接到新文件 Head 会破坏该约束。在 `prependDeletionBlocks` 中，若最后一 Block 未满，必须用该 Block 最后一个元素重复填充至满；Bitwise OR 幂等，重复删除记录不会导致错误。
 
 ### 3.4 提交与原子切换 (Commit & Atomic Switch)
-真正的可见性切换发生在 Metadata Service 层。
 
-1.  **预备阶段**：新文件生成，Visibility 同步完成，Index 更新完毕。
-2.  **Metadata 原子切换 (Atomic Switch)**：
-    *   **接口**: 新增 `MetadataService.AtomicSwapFiles(filesToAdd, filesToDelete)`。
-    *   **实现**: 在 `RdbFileDao` 中新增 `atomicSwapFiles()` 方法：
-        ```java
-        public boolean atomicSwapFiles(List<MetadataProto.File> filesToAdd, List<Long> filesToDelete) {
-            Connection conn = db.getConnection();
-            try {
-                conn.setAutoCommit(false);
-                // 1. 删除旧文件
-                deleteByIds(filesToDelete);
-                // 2. 插入新文件
-                insertBatch(filesToAdd);
-                conn.commit();
-                return true;
-            } catch (SQLException e) {
-                conn.rollback();
-                return false;
-            } finally {
-                conn.setAutoCommit(true);
-            }
-        }
-        ```
-    *   **验证**: 从 `RdbFileDao.java` 确认已有 `deleteByIds()` 和 `insertBatch()` 方法，可直接复用
-    *   **事务保证**: 使用 JDBC 事务确保原子性，失败时自动回滚
-3.  **物理清理 (Physical Cleanup)**：
-    *   切换成功后，注销 `RetinaResourceManager` 中的映射。
-    *   旧文件进入 Soft Delete 状态，延迟物理删除（可通过后台任务异步清理）。
+1. **预备阶段**：新文件生成、Visibility 同步、Index 更新完成。
+2. **Metadata 原子切换**：
+   - **接口**: `MetadataService.AtomicSwapFiles(filesToAdd, filesToDelete)`
+   - **实现**: `RdbFileDao.atomicSwapFiles()`，JDBC 事务内先 `deleteByIds(filesToDelete)` 再 `insertBatch(filesToAdd)`，失败则回滚
+3. **物理清理**：切换成功后注销 `RetinaResourceManager` 中的映射；旧文件可进入 Soft Delete，由后台异步清理。
 
 ---
 
 ## 4. 代码实现方案 (Implementation Plan)
 
-> **说明**：以下各模块均已完整实现。标注 ✅ 表示已在代码库中确认可用。
+### 4.1 模块：pixels-daemon (Metadata Service)
 
-### 4.1 模块：pixels-daemon (Metadata Service) ✅ 已实现
-*   **`proto/metadata.proto`**: ✅ 已定义 `rpc AtomicSwapFiles`、`AtomicSwapFilesRequest`、`AtomicSwapFilesResponse`
-*   **`FileDao.java` / `RdbFileDao.java`**: ✅ 已实现 `atomicSwapFiles(List<MetadataProto.File>, List<Long>)`，使用 JDBC 事务保证原子性
-*   **`MetadataServiceImpl.java`**: ✅ 已实现对应 gRPC 接口
-*   **`MetadataService.java`（客户端）**: ✅ 已实现 `atomicSwapFiles(Collection<File> filesToAdd, List<Long> fileIdsToDelete)`
+- **`proto/metadata.proto`**: 定义 `rpc AtomicSwapFiles`、`AtomicSwapFilesRequest`、`AtomicSwapFilesResponse`
+- **`FileDao.java` / `RdbFileDao.java`**: `atomicSwapFiles(List<MetadataProto.File>, List<Long>)`，JDBC 事务保证原子性，复用 `insertBatch`、`deleteByIds`
+- **`MetadataServiceImpl.java`**: 对应 gRPC 服务实现
+- **`MetadataService.java`（客户端）**: `atomicSwapFiles(Collection<File> filesToAdd, List<Long> fileIdsToDelete)`
 
-### 4.2 模块：pixels-retina (C++ Native Layer) ✅ 已实现
-*   **`TileVisibility.h/cpp`**: ✅ 已实现如下方法：
-    *   `std::vector<uint64_t> exportDeletionBlocks()` - 遍历链表收集所有 items（带 EpochGuard）
-    *   `void prependDeletionBlocks(const uint64_t* items, size_t count)` - 含完整 Padding 逻辑 + CAS 原子操作
-    *   `const uint64_t* getBaseBitmap()` - 返回 `currentVersion->baseBitmap` 指针（带 EpochGuard）
-*   **`RGVisibility.h/cpp`**: ✅ 已实现如下方法：
-    *   `std::vector<uint64_t> exportDeletionBlocks()` - 遍历各 Tile，local rowId -> global rowId 转换
-    *   `void prependDeletionBlocks(const uint64_t* items, size_t count)` - global rowId -> local rowId 分发
-    *   `std::vector<uint64_t> getBaseBitmap()` - 拼接所有 Tile 的 baseBitmap，返回 vector
-    *   `uint64_t getInvalidCount()` - 返回所有 Tile 无效行数之和（用于精确无效率计算）✅ 本次新增
-*   **`RGVisibilityJni.h/cpp`**: ✅ 已实现所有对应 JNI 函数（含 `getInvalidCount`）
+### 4.2 模块：pixels-retina (C++ Native Layer)
 
-### 4.3 模块：pixels-retina (Java/JNI) ✅ 已实现
-*   **`RGVisibility.java`**: ✅ 已实现所有 Storage GC 相关方法：
-    *   JNI 方法均为 **`private native`**（非 public），通过公开包装方法暴露给调用方
-    *   `public long[] exportDeletionBlocks()` / `public void prependDeletionBlocks(long[] items)` / `public long[] getBaseBitmap()`
-*   `public long getInvalidCount()` ✅
-*   **`RetinaResourceManager.java`**: ✅ 已完整实现如下扩展：
-    *   `forwardMap`、`backwardMap`、`RedirectInfo` 内部类
-    *   双写版 `deleteRecord()`
-    *   `registerRedirection()`（含自动计算 reverseMapping）、`unregisterRedirection()`
-    *   Storage GC 专用：`getRGVisibility()`、`createRGVisibility()`
+- **`TileVisibility.h/cpp`**: `exportDeletionBlocks()`（带 EpochGuard）、`prependDeletionBlocks(const uint64_t* items, size_t count)`（含 Padding + CAS）、`getBaseBitmap()`（返回 `currentVersion->baseBitmap`，带 EpochGuard）
+- **`RGVisibility.h/cpp`**: `exportDeletionBlocks()`（local→global rowId）、`prependDeletionBlocks()`（global→local 分发）、`getBaseBitmap()`（拼接各 Tile baseBitmap）、`getInvalidCount()`（各 Tile 无效行数之和）
+- **`RGVisibilityJni.h/cpp`**: 上述方法的 JNI 绑定（含 `getInvalidCount`）
 
-### 4.4 组件：StorageGarbageCollector (Java) ✅ 已实现并集成
-*   **位置**: `pixels-retina/src/main/java/io/pixelsdb/pixels/retina/StorageGarbageCollector.java`（已存在）
-*   **集成**: 已在 `RetinaResourceManager.runGC()` 末尾被调用（Memory GC 之后的第三阶段）
-*   **核心流程**：Scan → Rewrite → Sync → Commit，与设计方案一致
-*   **无效率计算**: ✅ 本次修正为 `Σ(RG invalid count) / Σ(RG total row count)` 精确加权计算
+### 4.3 模块：pixels-retina (Java/JNI)
 
-### 4.5 已完成的 TODO 项
-以下内容已在代码中实现完成：
+- **`RGVisibility.java`**: JNI 为 `private native`，通过公开方法暴露：`exportDeletionBlocks()`、`prependDeletionBlocks(long[] items)`、`getBaseBitmap()`、`getInvalidCount()`
+- **`RetinaResourceManager.java`**: `forwardMap`、`backwardMap`、`RedirectInfo`、双写版 `deleteRecord()`、`registerRedirection()`（含 reverseMapping 计算）、`unregisterRedirection()`；Storage GC 用：`getRGVisibility()`、`createRGVisibility()`
 
-1. ✅ **新文件存储路径**：已从 metadata Path URI 动态获取，替换硬编码的 `/tmp/pixels/`
-   - 实现位置：`generateNewFilePath()` 方法
-   - 使用 `path.getUri()` 获取正确的存储路径
+### 4.4 组件：StorageGarbageCollector (Java)
 
-2. ✅ **新文件 ID 同步**：`atomicSwapFiles` 成功后，从 metadata 获取真实文件 ID 并更新 RGVisibility / RedirectInfo
-   - 实现位置：`getRealFileIdFromMetadata()`、`updateFileIdInRGVisibility()`、`updateFileIdInRedirectInfo()` 方法
-   - 使用 `metadataService.getFileId(filePath)` 获取真实文件 ID
+- **位置**: `pixels-retina/src/main/java/io/pixelsdb/pixels/retina/StorageGarbageCollector.java`
+- **集成**: 在 `RetinaResourceManager.runGC()` 末尾调用（Memory GC 之后）
+- **核心流程**: Scan → Rewrite → Sync → Commit
+- **关键方法**:
+  - `generateNewFilePath()`: 从 metadata Path URI 获取新文件存储路径
+  - `getRowGroupSizeFromConfig()` / `getEncodingLevelFromConfig()`: 从配置读取 RG 大小与编码级别
+  - `calculateActualRecordNumPerRG(newFilePath)`: 从重写后的新文件 Footer 读取每 RG 实际行数
+  - `getRealFileIdFromMetadata()` / `updateFileIdInRGVisibility()` / `updateFileIdInRedirectInfo()`: 原子切换后同步真实文件 ID
+  - `calculateFileInvalidRatio()`: 文件无效率 = Σ(RG invalid count) / Σ(RG total row count)（加权）
+  - `rewriteFileGroup()`: 重写与 backwardMap 注册（支持多对一）
 
-3. ✅ **RowGroupSize / EncodingLevel**：已从配置文件读取，替换硬编码值（128MB / EL2）
-   - 实现位置：`getRowGroupSizeFromConfig()`、`getEncodingLevelFromConfig()` 方法
-   - 从 `pixels.properties` 配置读取默认值，支持动态配置
+### 4.5 配置参数 (Configuration Parameters)
 
-4. ✅ **新 RG recordNum**：已根据实际重写后的行数动态传入，替换硬编码 65536
-   - 实现位置：`calculateActualRecordNum()` 方法
-   - 基于 RowId Mapping 精确计算实际行数
-
-5. ✅ **多文件合并时 backwardMap 的多对一支持**：已修复 `backwardMap` 的一对一限制
-   - 实现位置：`rewriteFileGroup()` 方法中的 backward mapping 注册
-   - 支持多个旧文件映射到同一个新文件
-
-### 4.6 待完善项
-以下内容仍需后续优化：
-- **RGVisibility 和 RedirectInfo 文件 ID 更新**：需要进一步实现具体的更新逻辑
-- **错误处理和回滚机制**：需要完善各阶段的失败处理
-- **性能优化**：需要添加批量处理和异步执行优化
-
----
-
-## 5. 实现细节与注意事项 (Implementation Details & Caveats)
-
-### 5.1 Visibility 导出与插入的正确性保证
-*   **时序保证**: 导出的删除记录的 timestamp 必然小于双写期间产生的新删除记录，因此头部插入不会破坏时序
-*   **Padding 必要性**: Memory GC 的 `collectTileGarbage()` 假设除 tail 外所有 Block 都是满的（见 `TileVisibility.cpp:228`）
-*   **幂等性**: 重复填充同一个删除记录不会导致错误，因为 Bitmap 使用 Bitwise OR 操作
-
-### 5.2 双写期间的并发控制
-*   **映射注册时机**: 必须在新文件写入完成、Visibility 同步完成后，才能注册映射开启双写
-*   **查询隔离**: 双写期间，旧查询继续读取旧文件，新查询可能读取新文件，但都能看到最新的删除
-*   **切换原子性**: Metadata 层的原子切换确保查询要么看到旧文件集合，要么看到新文件集合，不会看到中间状态
-
-### 5.3 失败处理与回滚
-*   **Rewrite 失败**: 删除新文件，保留旧文件，不影响系统运行
-*   **Sync 失败**: 删除新文件和映射，保留旧文件
-*   **Commit 失败**: 删除新文件和映射，保留旧文件，可在下次 GC 时重试
-*   **部分成功**: 如果部分文件切换成功，部分失败，需要记录状态，避免重复处理
-
-### 5.4 性能优化建议
-*   **批量处理**: 一次 GC 可以处理多个文件，减少 Metadata 操作次数
-*   **异步执行**: Storage GC 可以在后台线程中异步执行，不阻塞正常的读写操作
-*   **增量 GC**: 优先处理无效率最高的文件，避免一次性处理过多文件
-*   **限流控制**: 控制 GC 的 I/O 带宽，避免影响正常业务
-
-### 5.5 监控与日志
-*   **GC 指标**: 记录每次 GC 的文件数、回收空间、耗时等
-*   **失败告警**: GC 失败时记录详细日志，必要时发送告警
-*   **状态追踪**: 记录每个文件的 GC 状态（待处理、处理中、已完成、失败）
-
-## 6. 代码验证结果 (Code Verification Results)
-
-### 6.1 已验证的现有组件 (Verified Existing Components)
-经过深入代码分析，以下组件已确认可用：
-
-1. **TileVisibility.cpp (Line 228-237)**: 
-   ```cpp
-   size_t count = (blk == tail.load(std::memory_order_acquire))
-                      ? tailUsed.load(std::memory_order_acquire)
-                      : DeleteIndexBlock::BLOCK_CAPACITY;
-   // Unfilled blocks are not reclaimed.
-   if (count < DeleteIndexBlock::BLOCK_CAPACITY) {
-       break;
-   }
-   ```
-   **验证**: Memory GC 确实假设除 tail 外所有 Block 都是满的（BLOCK_CAPACITY = 8），Padding 机制必须实现。
-
-2. **RetinaResourceManager.runGC()**: ✅ 已集成 Storage GC，完整执行顺序如下：
-   ```java
-   private void runGC() {
-       // 重复 timestamp 检查（节省不必要的操作）
-       if (timestamp <= this.latestGcTimestamp) return;
-       
-       // 1. 先持久化 checkpoint
-       createCheckpoint(timestamp, CheckpointType.GC);
-       // 2. Memory GC
-       for (Map.Entry<String, RGVisibility> entry: this.rgVisibilityMap.entrySet()) {
-           entry.getValue().garbageCollect(timestamp);
-       }
-       // 3. Storage GC（Memory GC 完成后执行）
-       StorageGarbageCollector storageGC = new StorageGarbageCollector(this, metadataService);
-       storageGC.runStorageGC();
-   }
-   ```
-   **验证**: Storage GC 作为第三阶段已集成，在 Memory GC 之后运行。
-
-3. **RdbFileDao**: ✅ 全部所需方法已实现
-   - `insertBatch(List<MetadataProto.File> files)`: ✅ 已实现
-   - `deleteByIds(List<Long> ids)`: ✅ 已实现
-   - `atomicSwapFiles(List<MetadataProto.File>, List<Long>)`: ✅ 已实现（JDBC 事务）
-
-4. **PixelsWriterImpl.Builder**: ✅ 已实现，可直接用于重写文件
-   ```java
-   PixelsWriterImpl.newBuilder()
-       .setSchema(schema).setPixelStride(pixelStride)
-       .setRowGroupSize(rowGroupSize).setStorage(storage)
-       .setPath(filePath).setCompressionKind(compressionKind)
-       .setEncodingLevel(encodingLevel).build();
-   ```
-
-5. **PixelsReaderImpl + PixelsRecordReaderImpl**: ✅ 读取机制完整
-   - `RGVisibility.getBaseBitmap()`: ✅ 已实现（C++/JNI/Java 全链路）
-
-6. **MetadataService RPC 接口**: ✅ AtomicSwapFiles 已全链路实现
-   - `AddFiles` / `DeleteFiles` / `AtomicSwapFiles`: ✅ 均已存在于 `metadata.proto` 并实现
-
-### 6.2 各组件实现状态汇总 (Implementation Status)
-
-| 组件 | 状态 | 说明 |
-|------|------|------|
-| `proto/metadata.proto` AtomicSwapFiles | ✅ 已实现 | rpc + Request/Response message 均已定义 |
-| `RdbFileDao.atomicSwapFiles()` | ✅ 已实现 | JDBC 事务包装，复用 deleteByIds + insertBatch |
-| `MetadataServiceImpl` AtomicSwapFiles | ✅ 已实现 | gRPC 服务端实现 |
-| `MetadataService` 客户端 | ✅ 已实现 | atomicSwapFiles() 方法已提供 |
-| `TileVisibility` export/prepend/getBaseBitmap | ✅ 已实现 | 含 EpochGuard + CAS + Padding |
-| `RGVisibility` export/prepend/getBaseBitmap | ✅ 已实现 | global/local rowId 转换 |
-| `RGVisibility` getInvalidCount (C++) | ✅ | 用于精确计算文件无效率 |
-| `RGVisibilityJni` 全部函数 | ✅ 已实现 | 含 getInvalidCount |
-| `RGVisibility.java` 全部公开方法 | ✅ 已实现 | JNI 均为 private native，通过包装方法暴露 |
-| `RGVisibility.java` getInvalidCount | ✅ | 含 handle 有效性检查 |
-| `RetinaResourceManager` 双写逻辑 | ✅ 已实现 | forwardMap/backwardMap/RedirectInfo/双写 deleteRecord |
-| `StorageGarbageCollector` | ✅ 已实现 | Scan→Rewrite→Sync→Commit 完整流程 |
-| `StorageGarbageCollector.calculateFileInvalidRatio()` | ✅ **本次修正** | 改为精确加权计算 |
-| `RetinaUtils.extractRetinaNodeIdFromPath()` | ✅ 已实现 | 从右向左解析文件名 |
-
-### 6.3 实现路径（已完成各阶段）
-- [x] **Phase 1**: C++ Native Layer — `TileVisibility` / `RGVisibility` 全部 export/prepend/getBaseBitmap 方法
-- [x] **Phase 2**: JNI 绑定和 Java 层接口 — `RGVisibilityJni` + `RGVisibility.java`
-- [x] **Phase 3**: `RetinaResourceManager` 双写逻辑扩展
-- [x] **Phase 4**: `MetadataService` AtomicSwapFiles 全链路
-- [x] **Phase 5**: `StorageGarbageCollector` 主逻辑
-- [x] **Phase 6**: 集成到 `runGC()` + 配置参数支持
-- [x] **Phase 7（本次）**: `calculateFileInvalidRatio()` 精确化
-
-### 6.4 配置参数 (Configuration Parameters)
 ```properties
 # Storage GC 配置
 storage.gc.enabled=true
@@ -427,15 +163,47 @@ storage.gc.interval=3600000  # 1 hour in ms
 storage.gc.max.files.per.run=10
 ```
 
-### 6.5 风险与限制 (Risks & Limitations)
-1. **双写期间的性能开销**: 每次删除需要操作两个文件的 Visibility
-2. **映射内存开销**: 大文件的 RowId Mapping 可能占用较多内存
-3. **长尾查询影响**: 双写期间可能影响查询性能
-4. **索引同步复杂度**: 如果启用了 Range/Point Index，需要同步更新
+---
 
-### 6.6 测试计划 (Testing Plan)
-1. **单元测试**: TileVisibility 的 export/prepend 方法
-2. **集成测试**: 完整的 Storage GC 流程
-3. **并发测试**: 双写期间的并发删除和查询
-4. **故障测试**: 各阶段失败的回滚机制
-5. **性能测试**: GC 对正常业务的影响
+## 5. 实现细节与注意事项 (Implementation Details & Caveats)
+
+### 5.1 Visibility 导出与插入
+
+- **时序**: 导出的删除记录 timestamp 小于双写期间新删除，头部插入不破坏时序
+- **Padding**: `collectTileGarbage()` 假设除 tail 外 Block 满（见 `TileVisibility.cpp` 相关逻辑），未满 Block 必须填充
+- **幂等性**: 重复填充同一删除记录用 Bitmap OR，结果正确
+
+### 5.2 双写与并发
+
+- **注册时机**: 新文件写入完成且 Visibility 同步完成后才注册映射
+- **查询隔离**: 双写期间旧查询读旧文件、新查询可读新文件，均能见到最新删除
+- **切换原子性**: Metadata 原子切换保证只看到旧文件集或新文件集，无中间状态
+
+### 5.3 失败与回滚
+
+- **Rewrite 失败**: 删除新文件，保留旧文件
+- **Sync 失败**: 删除新文件与映射，保留旧文件
+- **Commit 失败**: 删除新文件与映射，保留旧文件，可下次 GC 重试
+- **部分成功**: 需记录状态，避免重复处理
+
+### 5.4 性能与监控
+
+- **性能**: 批量处理、异步执行、优先高无效率文件、I/O 限流
+- **监控**: 记录每次 GC 的文件数、回收空间、耗时；失败时详细日志与告警；追踪文件状态（待处理/处理中/已完成/失败）
+
+### 5.5 风险与限制
+
+- 双写期间每次删除需更新两个文件的 Visibility，有性能开销
+- 大文件 RowId Mapping 内存占用
+- 若启用 Range/Point Index，需同步更新索引
+
+---
+
+## 6. 代码验证参考 (Code Verification Reference)
+
+- **TileVisibility.cpp**: Memory GC 仅回收满 Block（`count < BLOCK_CAPACITY` 则 break），Padding 必须实现
+- **RetinaResourceManager.runGC()**: 顺序为 createCheckpoint → Memory GC（遍历 rgVisibilityMap 执行 garbageCollect）→ `new StorageGarbageCollector(...).runStorageGC()`
+- **RdbFileDao**: `insertBatch`、`deleteByIds`、`atomicSwapFiles`（事务内先删后插）已实现
+- **PixelsWriterImpl.Builder**: 支持 schema、pixelStride、rowGroupSize、storage、path、compressionKind、encodingLevel
+- **RGVisibility.getBaseBitmap()**: C++/JNI/Java 全链路可用，数据重写仅依赖 Base Bitmap
+- **metadata.proto**: `AddFiles`/`DeleteFiles`/`AtomicSwapFiles` 已定义并实现
