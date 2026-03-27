@@ -22,10 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download build artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           name: pixels-package
           path: ./downloaded_package
@@ -64,7 +64,14 @@ jobs:
       actions: write
     steps:
       - name: Remove old artifacts
-        uses: c-hive/gha-remove-artifacts@v1
-        with:
-          github_token: ${{ secrets.PIXELS_DEVELOP }}
-          age: '1 day'
+        env:
+          GH_TOKEN: ${{ secrets.PIXELS_DEVELOP }}
+        run: |
+          gh api repos/${{ github.repository }}/actions/artifacts \
+            --paginate --jq '.artifacts[] | select(.expired == false) | "\(.id) \(.created_at)"' | \
+          while read -r id created_at; do
+            age=$(( ($(date -u +%s) - $(date -u -d "$created_at" +%s)) / 86400 ))
+            if [ "$age" -ge 1 ]; then
+              gh api -X DELETE repos/${{ github.repository }}/actions/artifacts/$id
+            fi
+          done

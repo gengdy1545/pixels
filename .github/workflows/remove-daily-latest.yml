@@ -14,7 +14,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Remove old assets from daily-latest
         continue-on-error: true
