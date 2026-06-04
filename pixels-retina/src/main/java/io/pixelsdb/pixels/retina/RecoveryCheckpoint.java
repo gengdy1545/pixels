@@ -124,12 +124,18 @@ public final class RecoveryCheckpoint
     {
         ConfigFactory config = ConfigFactory.Instance();
         String retinaNodeId = NetUtils.getLocalHostName();
-        String dir = config.getProperty("retina.recovery.checkpoint.dir");
-        String checkpointDir = trimTrailingSlash(dir);
+        String checkpointDir = config.getProperty("retina.recovery.checkpoint.dir");
+        if (checkpointDir == null || checkpointDir.trim().isEmpty())
+        {
+            throw new RetinaException("retina.recovery.checkpoint.dir is not configured");
+        }
         Storage storage;
-        try {
+        try
+        {
             storage = StorageFactory.Instance().getStorage(checkpointDir);
-        } catch (IOException e) {
+        }
+        catch (IOException e)
+        {
             throw new RetinaException("Failed to resolve storage for " + checkpointDir, e);
         }
         int virtualNodesPerNode = Integer.parseInt(config.getProperty("node.virtual.num"));
@@ -562,7 +568,7 @@ public final class RecoveryCheckpoint
 
         String bodyObjectName = RetinaUtils.getCheckpointFileName(
                 RetinaUtils.CHECKPOINT_PREFIX_RECOVERY, retinaNodeId, checkpointAppliedTs);
-        String bodyPath = checkpointDir + "/" + bodyObjectName;
+        String bodyPath = checkpointPath(bodyObjectName);
         try
         {
             byte[] serialised = body.serialize();
@@ -582,7 +588,7 @@ public final class RecoveryCheckpoint
         String displacedOld = publishPointer(bodyObjectName);
         if (displacedOld != null && !displacedOld.isEmpty())
         {
-            String displacedPath = checkpointDir + "/" + displacedOld;
+            String displacedPath = checkpointPath(displacedOld);
             try
             {
                 if (storage.exists(displacedPath))
@@ -706,9 +712,14 @@ public final class RecoveryCheckpoint
         return value.isEmpty() ? null : value;
     }
 
+    private String checkpointPath(String objectName)
+    {
+        return (checkpointDir.endsWith("/") ? checkpointDir : checkpointDir + "/") + objectName;
+    }
+
     private byte[] readBody(String objectName) throws IOException
     {
-        String path = checkpointDir + "/" + objectName;
+        String path = checkpointPath(objectName);
         long length = storage.getStatus(path).getLength();
         if (length <= 0)
         {
@@ -775,15 +786,5 @@ public final class RecoveryCheckpoint
     private static <T> List<T> emptyIfNull(List<T> values)
     {
         return values == null ? Collections.emptyList() : values;
-    }
-
-    private static String trimTrailingSlash(String dir)
-    {
-        int len = dir.length();
-        while (len > 0 && dir.charAt(len - 1) == '/')
-        {
-            len--;
-        }
-        return dir.substring(0, len);
     }
 }

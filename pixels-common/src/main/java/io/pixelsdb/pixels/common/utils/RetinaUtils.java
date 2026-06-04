@@ -32,6 +32,7 @@ public class RetinaUtils
     public static final String CHECKPOINT_PREFIX_OFFLOAD = "vis_offload_";
     public static final String CHECKPOINT_PREFIX_RECOVERY = "recovery_";
     public static final String CHECKPOINT_SUFFIX = ".bin";
+    public static final String STORAGE_GC_JOURNAL_SUFFIX = ".sgcj";
 
     private static volatile RetinaUtils instance;
     private final int bucketNum;
@@ -143,6 +144,19 @@ public class RetinaUtils
     {
         String fileName = getCheckpointFileName(prefix, hostname, timestamp);
         return checkpointDir.endsWith("/") ? checkpointDir + fileName : checkpointDir + "/" + fileName;
+    }
+
+    /**
+     * Builds the Storage GC journal task file path under {@code journalDir}.
+     *
+     * @param journalDir directory where journal tasks are persisted (may or may not end with '/')
+     * @param taskId     unique journal task identifier
+     */
+    public static String buildStorageGcJournalPath(String journalDir, String taskId)
+    {
+        return journalDir.endsWith("/")
+                ? journalDir + taskId + STORAGE_GC_JOURNAL_SUFFIX
+                : journalDir + "/" + taskId + STORAGE_GC_JOURNAL_SUFFIX;
     }
 
     // ── writeBufferKey utilities ────────────────────────────────────

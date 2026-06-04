@@ -26,7 +26,11 @@ import io.pixelsdb.pixels.common.index.service.IndexService;
 import io.pixelsdb.pixels.common.index.service.IndexServiceProvider;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.metadata.domain.Column;
+import io.pixelsdb.pixels.common.metadata.domain.File;
 import io.pixelsdb.pixels.common.metadata.domain.Layout;
+import io.pixelsdb.pixels.common.metadata.domain.Path;
+import io.pixelsdb.pixels.common.metadata.domain.Schema;
+import io.pixelsdb.pixels.common.metadata.domain.Table;
 import io.pixelsdb.pixels.common.physical.PhysicalReader;
 import io.pixelsdb.pixels.common.physical.PhysicalReaderUtil;
 import io.pixelsdb.pixels.common.physical.Storage;
@@ -56,6 +60,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 /**
@@ -74,6 +79,7 @@ public class RetinaResourceManager
     // GC related fields
     private final ScheduledExecutorService gcExecutor;
     private final AtomicBoolean gcScheduled;
+    private final StorageGcJournalStore storageGcJournalStore;
     private final StorageGarbageCollector storageGarbageCollector;
     // Initialised by startBackgroundGc(); recovery checkpoint publication
     // is part of every GC cycle once the scheduler is running. Null until
@@ -83,6 +89,10 @@ public class RetinaResourceManager
 
     private volatile long latestGcTimestamp = -1;
     private final int totalVirtualNodeNum;
+    private final Set<Long> baselineVisibleFileIds =
+            Collections.newSetFromMap(new ConcurrentHashMap<Long, Boolean>());
+    private volatile boolean baselineVisibleFilterEnabled = false;
+    private volatile BooleanSupplier backgroundGcAllowed = () -> true;
 
     // Offload checkpoint state (see "Offload Checkpoint Section" at the bottom of this file).
     private final String offloadCheckpointDir;
@@ -134,6 +144,18 @@ public class RetinaResourceManager
         }
     }
 
+    private static final class PathRef
+    {
+        final Path path;
+        final long tableId;
+
+        private PathRef(Path path, long tableId)
+        {
+            this.path = path;
+            this.tableId = tableId;
+        }
+    }
+
     private RetinaResourceManager()
     {
         this.metadataService = MetadataService.Instance();
@@ -161,6 +183,8 @@ public class RetinaResourceManager
                     return t;
                 });
 
+        this.storageGcJournalStore = new StorageGcJournalStore();
+
         StorageGarbageCollector gc = null;
         try
         {
@@ -177,7 +201,7 @@ public class RetinaResourceManager
                 long retireDelayMs = (long) (Double.parseDouble(config.getProperty("retina.storage.gc.file.retire.delay.hours")) * 3_600_000L);
                 gc = new StorageGarbageCollector(this, this.metadataService, this.indexService,
                         threshold, targetFileSize, maxFilesPerGroup, maxGroups,
-                        rowGroupSize, encodingLevel, retireDelayMs);
+                        rowGroupSize, encodingLevel, retireDelayMs, storageGcJournalStore);
                 logger.info("Storage GC enabled (threshold={}, targetFileSize={}, maxFilesPerGroup={}, maxGroups={})",
                         threshold, targetFileSize, maxFilesPerGroup, maxGroups);
             }
@@ -188,6 +212,11 @@ public class RetinaResourceManager
             gc = null;
         }
         this.storageGarbageCollector = gc;
+    }
+
+    public StorageGcJournalStore getStorageGcJournalStore()
+    {
+        return storageGcJournalStore;
     }
 
     private static final class InstanceHolder
@@ -264,9 +293,50 @@ public class RetinaResourceManager
         return this.gcScheduled.get();
     }
 
+    public void setBackgroundGcAllowedSupplier(BooleanSupplier supplier)
+    {
+        this.backgroundGcAllowed = supplier == null ? () -> true : supplier;
+    }
+
+    public void clearRgVisibilityForRecovery()
+    {
+        this.rgVisibilityMap.entrySet().removeIf(entry ->
+        {
+            RGVisibility rgVisibility = entry.getValue();
+            if (rgVisibility != null)
+            {
+                rgVisibility.close();
+            }
+            return true;
+        });
+    }
+
+    public void installBaselineVisibleFiles(Set<Long> fileIds)
+    {
+        this.baselineVisibleFileIds.clear();
+        if (fileIds != null)
+        {
+            this.baselineVisibleFileIds.addAll(fileIds);
+        }
+        this.baselineVisibleFilterEnabled = true;
+    }
+
+    public Set<Long> getBaselineVisibleFileIds()
+    {
+        if (!baselineVisibleFilterEnabled)
+        {
+            return null;
+        }
+        return Collections.unmodifiableSet(new HashSet<>(baselineVisibleFileIds));
+    }
+
     public void addVisibility(long fileId, int rgId, int recordNum, long timestamp,
                               long[] bitmap, boolean overwrite)
     {
+        if (baselineVisibleFilterEnabled)
+        {
+            baselineVisibleFileIds.add(fileId);
+        }
         String rgKey = RetinaUtils.buildRgKey(fileId, rgId);
         if (overwrite)
         {
@@ -309,6 +379,10 @@ public class RetinaResourceManager
 
     public void removeVisibility(long fileId)
     {
+        if (baselineVisibleFilterEnabled)
+        {
+            baselineVisibleFileIds.remove(fileId);
+        }
         String prefix = fileId + "_";
         this.rgVisibilityMap.entrySet().removeIf(entry ->
         {
@@ -363,11 +437,16 @@ public class RetinaResourceManager
     }
 
     /**
-     * Processes the retired files queue: for each file whose wall-clock
-     * {@code retireTimestamp} deadline has passed, removes its Visibility
-     * entries and deletes the physical file.
+     * Processes retired files from both the in-memory queue and durable catalog.
+     * The catalog scan makes delayed cleanup retryable after process restart.
      */
     public void processRetiredFiles()
+    {
+        processQueuedRetiredFiles();
+        processCatalogRetiredFiles();
+    }
+
+    private void processQueuedRetiredFiles()
     {
         long now = System.currentTimeMillis();
         retiredFiles.removeIf(rf ->
@@ -376,37 +455,143 @@ public class RetinaResourceManager
             {
                 return false;
             }
-            for (int rgId = 0; rgId < rf.rgCount; rgId++)
+            boolean success = cleanupRetiredFile(rf.fileId, rf.rgCount, rf.filePath,
+                    -1L, -1L, 0);
+            return success;
+        });
+    }
+
+    private void processCatalogRetiredFiles()
+    {
+        List<File> dueFiles;
+        try
+        {
+            dueFiles = metadataService.listRetiredFilesDue();
+        }
+        catch (Exception e)
+        {
+            logger.warn("processRetiredFiles: failed to list due RETIRED files", e);
+            return;
+        }
+        if (dueFiles.isEmpty())
+        {
+            return;
+        }
+        Map<Long, PathRef> pathsById = loadPathMapForRetiredCleanup();
+        for (File file : dueFiles)
+        {
+            PathRef pathRef = pathsById.get(file.getPathId());
+            if (pathRef == null)
             {
-                try
+                logger.warn("processRetiredFiles: pathId={} for retired fileId={} is not available; will retry later",
+                        file.getPathId(), file.getId());
+                continue;
+            }
+            String filePath = File.getFilePath(pathRef.path, file);
+            long rowCount = file.getMaxRowId() - file.getMinRowId() + 1;
+            if (!cleanupRetiredFile(file.getId(), file.getNumRowGroup(), filePath,
+                    pathRef.tableId, file.getMinRowId(), rowCount))
+            {
+                continue;
+            }
+            try
+            {
+                metadataService.deleteFiles(Collections.singletonList(file.getId()));
+            }
+            catch (Exception e)
+            {
+                logger.warn("processRetiredFiles: failed to delete retired catalog fileId={}", file.getId(), e);
+            }
+        }
+    }
+
+    private boolean cleanupRetiredFile(long fileId, int rgCount, String filePath,
+                                       long tableId, long rowIdStart, long rowCount)
+    {
+        boolean success = true;
+        for (int rgId = 0; rgId < rgCount; rgId++)
+        {
+            try
+            {
+                reclaimVisibility(fileId, rgId, 0);
+            }
+            catch (Exception e)
+            {
+                success = false;
+                logger.warn("processRetiredFiles: failed to reclaim Visibility for fileId={}, rgId={}",
+                        fileId, rgId, e);
+            }
+        }
+        if (tableId > 0 && rowIdStart >= 0 && rowCount > 0 && rowCount <= Integer.MAX_VALUE)
+        {
+            try
+            {
+                indexService.deleteMainIndexRange(tableId, fileId, rowIdStart, (int) rowCount);
+            }
+            catch (Exception e)
+            {
+                success = false;
+                logger.warn("processRetiredFiles: failed to delete MainIndex range for tableId={}, fileId={}",
+                        tableId, fileId, e);
+            }
+        }
+        if (filePath != null)
+        {
+            try
+            {
+                Storage storage = StorageFactory.Instance().getStorage(filePath);
+                if (storage.exists(filePath))
                 {
-                    reclaimVisibility(rf.fileId, rgId, 0);
-                }
-                catch (Exception e)
-                {
-                    logger.warn("processRetiredFiles: failed to reclaim Visibility for fileId={}, rgId={}",
-                            rf.fileId, rgId, e);
+                    storage.delete(filePath, false);
                 }
             }
-            // Old MainIndex entries for retired files are purged lazily by the
-            // MainIndex implementation; no explicit cleanup is needed here.
-            if (rf.filePath != null)
+            catch (IOException e)
             {
-                try
+                success = false;
+                logger.warn("processRetiredFiles: failed to delete physical file {}", filePath, e);
+            }
+        }
+        return success;
+    }
+
+    private Map<Long, PathRef> loadPathMapForRetiredCleanup()
+    {
+        Map<Long, PathRef> paths = new HashMap<>();
+        try
+        {
+            for (Schema schema : metadataService.getSchemas())
+            {
+                for (Table table : metadataService.getTables(schema.getName()))
                 {
-                    Storage storage = StorageFactory.Instance().getStorage(rf.filePath);
-                    if (storage.exists(rf.filePath))
+                    for (Layout layout : metadataService.getLayouts(schema.getName(), table.getName()))
                     {
-                        storage.delete(rf.filePath, false);
+                        addPaths(paths, layout.getOrderedPaths(), layout.getTableId());
+                        addPaths(paths, layout.getCompactPaths(), layout.getTableId());
+                        if (layout.getProjectionPaths() != null)
+                        {
+                            addPaths(paths, new ArrayList<>(layout.getProjectionPaths().values()), layout.getTableId());
+                        }
                     }
                 }
-                catch (IOException e)
-                {
-                    logger.warn("processRetiredFiles: failed to delete physical file {}", rf.filePath, e);
-                }
             }
-            return true;
-        });
+        }
+        catch (Exception e)
+        {
+            logger.warn("processRetiredFiles: failed to load path map for retired cleanup", e);
+        }
+        return paths;
+    }
+
+    private void addPaths(Map<Long, PathRef> paths, List<Path> toAdd, long tableId)
+    {
+        if (toAdd == null)
+        {
+            return;
+        }
+        for (Path path : toAdd)
+        {
+            paths.put(path.getId(), new PathRef(path, tableId));
+        }
     }
 
     public void deleteRecord(long fileId, int rgId, int rgRowOffset, long timestamp) throws RetinaException
@@ -776,6 +961,10 @@ public class RetinaResourceManager
      */
     private void runGC()
     {
+        if (!backgroundGcAllowed.getAsBoolean())
+        {
+            return;
+        }
         processRetiredFiles();
 
         long timestamp = 0;
@@ -877,6 +1066,7 @@ public class RetinaResourceManager
                     }
                 }
                 recoveryCheckpoint.generate(timestamp, rgEntries, segments);
+                reconcilePendingStorageGcJournals(rgEntries);
             }
 
             // Step 4: Advance the timestamp only after the full cycle succeeds.
@@ -884,6 +1074,36 @@ public class RetinaResourceManager
         } catch (Exception e)
         {
             logger.error("Error while running GC", e);
+        }
+    }
+
+    private void reconcilePendingStorageGcJournals(List<VisibilityEntry> rgEntries)
+    {
+        if (rgEntries == null || rgEntries.isEmpty())
+        {
+            return;
+        }
+        Set<Long> checkpointFileIds = rgEntries.stream()
+                .map(VisibilityEntry::getFileId)
+                .collect(Collectors.toSet());
+        for (StorageGcJournalTask task : storageGcJournalStore.listAllTasks())
+        {
+            if (task.getState() != StorageGcJournalTask.State.SWAPPED_NOT_CHECKPOINTED
+                    || !checkpointFileIds.contains(task.getNewFileId()))
+            {
+                continue;
+            }
+            try
+            {
+                storageGcJournalStore.transitionState(task.getTaskId(), StorageGcJournalTask.State.CHECKPOINTED);
+                logger.info("Storage GC journal reconciled: taskId={}, newFileId={} advanced to CHECKPOINTED",
+                        task.getTaskId(), task.getNewFileId());
+            }
+            catch (RuntimeException e)
+            {
+                logger.warn("Storage GC journal reconciler failed for taskId={}, newFileId={}",
+                        task.getTaskId(), task.getNewFileId(), e);
+            }
         }
     }
 
@@ -997,9 +1217,8 @@ public class RetinaResourceManager
      * that owned those checkpoints are no longer active after a restart, so
      * the files are safe to drop.
      *
-     * <p>Cross-restart visibility recovery is the responsibility of the
-     * recovery checkpoint flow (see {@code recovery.md}); this method does
-     * not rebuild {@code rgVisibilityMap}.
+     * <p>Cross-restart RG visibility recovery is handled separately during
+     * startup checkpoint load; this method does not rebuild {@code rgVisibilityMap}.
      */
     public void recoverOffloadCheckpoints()
     {

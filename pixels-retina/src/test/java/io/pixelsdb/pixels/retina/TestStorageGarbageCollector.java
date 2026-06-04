@@ -22,6 +22,7 @@ package io.pixelsdb.pixels.retina;
 import io.pixelsdb.pixels.common.index.service.LocalIndexService;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.utils.CheckpointFileIO;
+import io.pixelsdb.pixels.common.utils.ConfigFactory;
 import io.pixelsdb.pixels.common.utils.MetaDBUtil;
 import io.pixelsdb.pixels.common.utils.PixelsFileNameUtils;
 import io.pixelsdb.pixels.common.utils.RetinaUtils;
@@ -50,6 +51,7 @@ import org.junit.BeforeClass;
 import org.junit.Ignore;
 import org.junit.Test;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -120,6 +122,7 @@ public class TestStorageGarbageCollector
 
     private RetinaResourceManager retinaManager;
     private StorageGarbageCollector gc;
+    private StorageGcJournalStore journalStore;
 
     // -----------------------------------------------------------------------
     // Class-level setup / teardown
@@ -174,13 +177,16 @@ public class TestStorageGarbageCollector
     // -----------------------------------------------------------------------
 
     @Before
-    public void setUp()
+    public void setUp() throws Exception
     {
         retinaManager = RetinaResourceManager.Instance();
         resetManagerState();
         cleanupOrderedDir();
+        cleanupJournalDir();
+        journalStore = new StorageGcJournalStore();
         gc = new StorageGarbageCollector(retinaManager, metadataService, LocalIndexService.Instance(),
-                0.5, 134_217_728L, Integer.MAX_VALUE, 10, 1048576, EncodingLevel.EL2, 86_400_000L);
+                0.5, 134_217_728L, Integer.MAX_VALUE, 10, 1048576, EncodingLevel.EL2, 86_400_000L,
+                journalStore);
     }
 
     @After
@@ -188,6 +194,20 @@ public class TestStorageGarbageCollector
     {
         resetManagerState();
         cleanupOrderedDir();
+    }
+
+    private static void cleanupJournalDir() throws IOException
+    {
+        String journalDir = ConfigFactory.Instance().getProperty("retina.storage.gc.journal.dir");
+        Storage storage = StorageFactory.Instance().getStorage(journalDir);
+        if (!storage.exists(journalDir))
+        {
+            return;
+        }
+        for (String path : storage.listPaths(journalDir))
+        {
+            storage.delete(path, false);
+        }
     }
 
     /**
@@ -1666,7 +1686,7 @@ public class TestStorageGarbageCollector
         // mapping so each thread targets a distinct new RGVisibility object.
         StorageGarbageCollector localGc = new StorageGarbageCollector(
                 retinaManager, metadataService, LocalIndexService.Instance(), 0.5, 134_217_728L,
-                Integer.MAX_VALUE, 10, 1, EncodingLevel.EL2, 86_400_000L);
+                Integer.MAX_VALUE, 10, 1, EncodingLevel.EL2, 86_400_000L, journalStore);
 
         StorageGarbageCollector.RewriteResult result =
                 localGc.rewriteFileGroup(makeGroup(fileId, srcPath, schema), 100L, bitmaps);
@@ -3324,7 +3344,7 @@ public class TestStorageGarbageCollector
     {
         return new StorageGarbageCollector(
                 null, null, null, 0.5, targetFileSize, maxFilesPerGroup, maxGroups,
-                1048576, EncodingLevel.EL2, 86_400_000L);
+                1048576, EncodingLevel.EL2, 86_400_000L, new StorageGcJournalStore());
     }
 
     // =======================================================================
@@ -4095,7 +4115,7 @@ public class TestStorageGarbageCollector
         FailFirstGroupGC()
         {
             super(null, null, null, 0.5, 0L, Integer.MAX_VALUE, 10,
-                    1048576, EncodingLevel.EL2, 86_400_000L);
+                    1048576, EncodingLevel.EL2, 86_400_000L, new StorageGcJournalStore());
         }
 
         @Override
@@ -4133,7 +4153,7 @@ public class TestStorageGarbageCollector
                       long retireDelayMs)
         {
             super(rm, ms, null, threshold, targetFileSize, maxFilesPerGroup, maxGroups,
-                    rowGroupSize, encodingLevel, retireDelayMs);
+                    rowGroupSize, encodingLevel, retireDelayMs, new StorageGcJournalStore());
         }
 
         @Override

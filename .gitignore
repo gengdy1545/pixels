@@ -41,3 +41,11 @@ cpp/pixels-retina/third_party/
 .notes/
 CLAUDE.local.md
 AGENTS.md.local
+
+.codebuddy/
+.codegraph
+pr-description.md
+recovery.md
+.mcp.json
+filters.toml
+CLAUDE.md

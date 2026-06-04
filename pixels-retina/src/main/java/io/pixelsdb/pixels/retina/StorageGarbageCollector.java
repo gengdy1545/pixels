@@ -66,6 +66,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -92,6 +93,7 @@ public class StorageGarbageCollector
     private final int rowGroupSize;
     private final EncodingLevel encodingLevel;
     private final long retireDelayMs;
+    private final StorageGcJournalStore.Writer journalWriter;
 
     // -------------------------------------------------------------------------
     // Value types
@@ -209,6 +211,8 @@ public class StorageGarbageCollector
 
         /** Set by {@link #syncIndex} after allocating new rowIds. */
         long newRowIdStart = -1;
+        /** Set by {@link #syncIndex} after creating the durable Storage GC journal task. */
+        String journalTaskId;
         /**
          * Set by {@link #syncIndex} after updating SinglePointIndex; old rowIds that were replaced.
          * <br/>
@@ -251,11 +255,13 @@ public class StorageGarbageCollector
                             int maxFileGroupsPerRun,
                             int rowGroupSize,
                             EncodingLevel encodingLevel,
-                            long retireDelayMs)
+                            long retireDelayMs,
+                            StorageGcJournalStore journalStore)
     {
         this.resourceManager = resourceManager;
         this.metadataService = metadataService;
         this.indexService = indexService;
+        Objects.requireNonNull(journalStore, "journalStore");
         this.gcThreshold = gcThreshold;
         this.targetFileSize = targetFileSize;
         this.maxFilesPerGroup = maxFilesPerGroup;
@@ -263,6 +269,7 @@ public class StorageGarbageCollector
         this.rowGroupSize = rowGroupSize;
         this.encodingLevel = encodingLevel;
         this.retireDelayMs = retireDelayMs;
+        this.journalWriter = new StorageGcJournalStore.Writer(journalStore);
     }
 
     // -------------------------------------------------------------------------
@@ -1111,10 +1118,18 @@ public class StorageGarbageCollector
 
         insertMainIndexEntries(result, tableId, primaryIndexId, indexOption, newRowIdStart);
 
+        result.journalTaskId = buildJournalTaskId(result, tableId);
+        journalWriter.createTaskForRewrite(result.journalTaskId, result, tableId);
+
         if (!result.pendingIndexEntries.isEmpty())
         {
             result.oldRowIds = updateSinglePointIndex(result, tableId, primaryIndexId, indexOption, newRowIdStart);
         }
+    }
+
+    private String buildJournalTaskId(RewriteResult result, long tableId)
+    {
+        return "storage-gc-" + tableId + "-" + result.group.virtualNodeId + "-" + result.newFileId;
     }
 
     private void insertMainIndexEntries(RewriteResult result, long tableId, long primaryIndexId,
@@ -1189,9 +1204,16 @@ public class StorageGarbageCollector
                         "newGlobalRowOffset={} — index may be inconsistent",
                         tableId, result.pendingIndexEntries.get(i).newGlobalRowOffset);
             }
+            journalWriter.recordBeforePrimarySwitch(
+                    result.journalTaskId, keys.get(i), oldRowId, entries.get(i).getRowId());
         }
 
         indexService.updatePrimaryIndexEntriesOnly(tableId, primaryIndexId, entries, indexOption);
+        for (int i = 0; i < size; i++)
+        {
+            journalWriter.markPrimarySwitchUpdated(
+                    result.journalTaskId, keys.get(i), entries.get(i).getRowId());
+        }
         return oldRowIds;
     }
 
@@ -1224,6 +1246,11 @@ public class StorageGarbageCollector
             {
                 throw e;
             }
+        }
+
+        if (result.journalTaskId != null)
+        {
+            journalWriter.markSwappedNotCheckpointed(result.journalTaskId);
         }
 
         unregisterDualWrite(result);
@@ -1264,9 +1291,17 @@ public class StorageGarbageCollector
                 rollbackSinglePointIndex(result);
             }
 
-            // TODO: MainIndex entries for [newRowIdStart, newRowIdStart + totalRows) on newFileId are not cleaned here.
-            // Safe under current invariants (rowIds are monotonic and never reused; newFileId is deleted from catalog
-            // and not reused; no scanner traverses MainIndex globally). Revisit if any of these invariants change.
+            int totalRows = result.newFileRgRowStart == null ? 0 : result.newFileRgRowStart[result.newFileRgCount];
+            try
+            {
+                indexService.deleteMainIndexRange(result.group.tableId, result.newFileId,
+                        result.newRowIdStart, totalRows);
+            }
+            catch (Exception ex)
+            {
+                logger.warn("Rollback: failed to delete MainIndex range for fileId={}, rowIdStart={}, rowCount={}",
+                        result.newFileId, result.newRowIdStart, totalRows, ex);
+            }
 
             unregisterDualWrite(result);
 
@@ -1306,6 +1341,11 @@ public class StorageGarbageCollector
             catch (IOException ex)
             {
                 logger.warn("Rollback: failed to delete physical file {}", result.newFilePath, ex);
+            }
+
+            if (result.journalTaskId != null)
+            {
+                journalWriter.markAborted(result.journalTaskId);
             }
         }
         catch (Exception e)
