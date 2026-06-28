@@ -127,7 +127,7 @@ set_properties_property() {
   mkdir -p "$(dirname "$file")"
   touch "$file"
   escaped_key="$(printf '%s' "$key" | sed 's/[.[\\*^$()+?{}|]/\\&/g')"
-  escaped_value="$(printf '%s' "$value" | sed 's/[\\&]/\\&/g')"
+  escaped_value="$(printf '%s' "$value" | sed 's/[\\&|]/\\&/g')"
 
   if grep -qE "^[[:space:]]*${escaped_key}=" "$file"; then
     sed -i -E "s|^[[:space:]]*${escaped_key}=.*|${key}=${escaped_value}|" "$file"

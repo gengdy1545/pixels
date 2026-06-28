@@ -81,7 +81,7 @@ set_property() {
   local escaped_value
 
   escaped_key="$(escape_ere "$key")"
-  escaped_value="$(printf '%s' "$value" | sed 's/[\\&]/\\&/g')"
+  escaped_value="$(printf '%s' "$value" | sed 's/[\\&|]/\\&/g')"
 
   if grep -qE "^[[:space:]]*${escaped_key}=" "$CONFIG_FILE"; then
     sed -i -E "s|^[[:space:]]*${escaped_key}=.*|${key}=${escaped_value}|" "$CONFIG_FILE"

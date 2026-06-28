@@ -163,7 +163,7 @@ local_functions_file() {
 
 write_functions_file() {
   local functions_file="$1"
-  local nodes_literal node default_pixels_home default_pixels_config
+  local nodes_literal node default_pixels_home default_pixels_config default_ssh_port
 
   nodes_literal=""
   for node in "${TRINO_NODE_LIST[@]}"; do
@@ -172,6 +172,7 @@ write_functions_file() {
   done
   default_pixels_home="$(shell_quote "$TRINO_PIXELS_HOME")"
   default_pixels_config="$(shell_quote "$TRINO_PIXELS_CONFIG")"
+  default_ssh_port="$(shell_quote "$SSH_PORT")"
 
   log "writing trino cluster shell functions to $functions_file (${#TRINO_NODE_LIST[@]} node(s), coordinator first)"
   mkdir -p "$(dirname "$functions_file")"
@@ -189,6 +190,7 @@ $nodes_literal)
 TRINO_REMOTE_HOME_LINK="\${TRINO_REMOTE_HOME_LINK:-${TRINO_HOME_LINK:-$HOME/opt/trino-server}}"
 TRINO_DEFAULT_PIXELS_HOME=$default_pixels_home
 TRINO_DEFAULT_PIXELS_CONFIG=$default_pixels_config
+TRINO_DEFAULT_SSH_PORT=$default_ssh_port
 
 _trino_home() {
   printf '%s\n' "\${TRINO_HOME_LINK:-\$HOME/opt/trino-server}"
@@ -219,13 +221,23 @@ _trino_remote_launcher() {
   printf '%s/bin/launcher' "\$TRINO_REMOTE_HOME_LINK"
 }
 
+_trino_ssh_port() {
+  printf '%s\n' "\${TRINO_SSH_PORT:-\$TRINO_DEFAULT_SSH_PORT}"
+}
+
 _trino_remote_run() {
   local node="\$1"
   local action="\$2"
-  local pixels_home pixels_config
+  local pixels_home pixels_config ssh_port
+  local -a ssh_args
   pixels_home="\$(_trino_pixels_home)"
   pixels_config="\$(_trino_pixels_config)"
-  ssh -n "\$node" "export PIXELS_HOME='\$pixels_home'; export PIXELS_CONFIG='\$pixels_config'; \\"\$(_trino_remote_launcher)\\" \$action"
+  ssh_args=(-n)
+  ssh_port="\$(_trino_ssh_port)"
+  if [[ -n "\$ssh_port" ]]; then
+    ssh_args+=(-p "\$ssh_port")
+  fi
+  ssh "\${ssh_args[@]}" "\$node" "export PIXELS_HOME='\$pixels_home'; export PIXELS_CONFIG='\$pixels_config'; \\"\$(_trino_remote_launcher)\\" \$action"
 }
 
 start_trino_cluster() {
