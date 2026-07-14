@@ -42,12 +42,6 @@
             <fileMode>0644</fileMode>
         </file>
         <file>
-            <source>${project.basedir}/deploy/docker-compose.yml</source>
-            <outputDirectory>.</outputDirectory>
-            <destName>docker-compose.yml</destName>
-            <fileMode>0644</fileMode>
-        </file>
-        <file>
             <source>${project.basedir}/../scripts/sql/metadata_schema.sql</source>
             <outputDirectory>mysql-init</outputDirectory>
             <destName>metadata_schema.sql</destName>

@@ -6,6 +6,6 @@ export PIXELS_HOME="${PIXELS_HOME:-${ROOT_DIR}}"
 export PIXELS_CONFIG="${PIXELS_CONFIG:-${PIXELS_HOME}/etc/pixels.properties}"
 
 exec java \
-  -Dlog4j.configurationFile="${PIXELS_HOME}/etc/retina-benchmark-log4j2.xml" \
+  -Dlog4j.configurationFile="${ROOT_DIR}/etc/retina-benchmark-log4j2.xml" \
   ${JAVA_OPTS:-} \
-  -jar "${PIXELS_HOME}/pixels-retina-benchmark-full.jar" "$@"
+  -jar "${ROOT_DIR}/pixels-retina-benchmark-full.jar" "$@"

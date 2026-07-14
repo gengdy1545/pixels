@@ -77,8 +77,9 @@ public final class TransactionCommitBenchmark implements BenchmarkScenario
     @Override
     public void setup(BenchmarkConfig config)
     {
-        host = option(config, "trans-host", "127.0.0.1");
-        port = integerOption(config, "trans-port", 18889);
+        TransactionEndpoint endpoint = TransactionEndpoint.from(config);
+        host = endpoint.host();
+        port = endpoint.port();
         clientCount = config.clients();
         rpcDeadlineMs = config.getLong("rpc-deadline-ms", 30_000L);
         if (rpcDeadlineMs <= 0)
@@ -262,12 +263,6 @@ public final class TransactionCommitBenchmark implements BenchmarkScenario
             clients.commitWriteTransactions(clientId, ids);
             return OperationResult.success(logicalOperationCount, 1);
         }
-    }
-
-    private static String option(BenchmarkConfig config, String key, String defaultValue)
-    {
-        String value = config.options().get(key);
-        return value == null || value.isEmpty() ? defaultValue : value;
     }
 
     private static int integerOption(BenchmarkConfig config, String key, int defaultValue)

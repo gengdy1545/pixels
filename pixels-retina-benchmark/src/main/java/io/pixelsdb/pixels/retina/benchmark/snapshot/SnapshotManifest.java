@@ -24,7 +24,7 @@ import java.util.Map;
  */
 public final class SnapshotManifest
 {
-    public static final int FORMAT_VERSION = 1;
+    public static final int FORMAT_VERSION = 2;
     public static final String FILE_NAME = "snapshot.json";
 
     public int formatVersion = FORMAT_VERSION;
@@ -38,16 +38,13 @@ public final class SnapshotManifest
     public String consistencyNote;
     public long snapshotTimestamp;
     public boolean physicalIndexStateIncluded;
-    public boolean visibilityCheckpointIncluded;
-    public String visibilityCheckpointSource;
-    public String visibilityCheckpointType;
-    public String visibilityCheckpointHost;
-    public long visibilityCheckpointTimestamp;
-    public long visibilityCheckpointEntryCount;
-    public long visibilityCheckpointExpectedEntryCount;
-    public long visibilityCheckpointMatchedEntryCount;
-    public long visibilityCheckpointUnmatchedEntryCount;
-    public Map<String, String> effectiveConfig = new LinkedHashMap<>();
+    /**
+     * Configuration values that define persisted data semantics. Runtime
+     * endpoints, credentials and filesystem paths are never applied through
+     * this map. Source URIs elsewhere in the manifest are provenance and
+     * destination-safety metadata only.
+     */
+    public Map<String, String> semanticConfig = new LinkedHashMap<>();
     public Map<String, String> artifactsSha256 = new LinkedHashMap<>();
     public List<TableState> tables = new ArrayList<>();
 
@@ -60,19 +57,11 @@ public final class SnapshotManifest
         public String tableType;
         public String storageScheme;
         public long metadataRowCount;
-        public long footerRowsInSelectedSampleLayout;
-        public long maxObservedCreateTimestamp;
         public List<ColumnState> columns = new ArrayList<>();
         public List<IndexState> indexes = new ArrayList<>();
         public IndexState primaryIndex;
         public List<LayoutState> layouts = new ArrayList<>();
         public List<FileState> files = new ArrayList<>();
-        public String indexSamplesFile;
-        public long indexSampleCount;
-        public String rowSamplesFile;
-        public long rowSampleCount;
-        public String sampleLayout;
-        public long selectedSampleLayoutId;
         /** Source layout/path selected by Retina when constructing a fresh WriteBuffer. */
         public long productionWriteLayoutId;
         public long productionOrderedPathId;

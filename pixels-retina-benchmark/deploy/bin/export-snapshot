@@ -7,21 +7,20 @@ if [[ $# -eq 0 || "${1:-}" == "--help" ]]; then
   cat <<'USAGE'
 Export a Retina benchmark snapshot from an existing Pixels deployment.
 
-Before physical export, pause CDC/load/compaction/Visibility GC, gracefully stop
-the Retina daemon that owns the RocksDB/SQLite directories, and leave Metadata
-Service plus the source Pixels storage readable.
+Before copying Index state, stop CDC/update/load/compaction and both GC paths,
+drain all writes, then wait for the running Transaction Service to complete at
+least one 10-second watermark checkpoint. Gracefully stop the Retina daemon
+that owns RocksDB/SQLite. Source etcd, Metadata Service, and Pixels storage must
+remain reachable by the exporter.
 
 Required options:
   --snapshot-output DIR
   --snapshot-schema SCHEMA
   --snapshot-tables TABLE[,TABLE...]
 
-Workload-state options:
-  --snapshot-timestamp TX_TIMESTAMP       (required for index samples/checkpoint)
-  --snapshot-index-samples N              (default: 0)
-  --snapshot-row-samples N                (default: 0)
-  --snapshot-sample-layout ordered|compact (default: ordered)
-  --snapshot-layout-id ID                 (default: latest readable layout)
+Snapshot v2 contains snapshot.json and, optionally, state/index with complete
+RocksDB and SQLite copies. Visibility always uses a clean baseline built from
+manifest footer recordNum values; no Visibility state is exported.
 
 Node/physical state options:
   --snapshot-source-host HOST          (defaults to exporter hostname)
@@ -31,18 +30,38 @@ Node/physical state options:
   --snapshot-copy-index-state true
   --snapshot-rocksdb-dir DIR       (defaults to pixels.properties)
   --snapshot-sqlite-dir DIR        (defaults to pixels.properties)
-  --snapshot-visibility-checkpoint URI
-      Keep the canonical vis_gc_<host>_<timestamp>.bin or
-      vis_offload_<host>_<timestamp>.bin filename; it must match
-      --snapshot-timestamp.
 
-PIXELS_CONFIG must point at the existing deployment configuration.  The output
-directory must be new. This script cannot drain a live PixelsWriteBuffer; do
-that explicitly before stopping Retina. Run `bin/run-benchmark
-snapshot-validate --snapshot-dir DIR` after copying the result to the benchmark
-machine. See SNAPSHOT.md for the consistency protocol.
+PIXELS_HOME must already point at the source Pixels deployment. Configuration
+follows ConfigFactory priority: PIXELS_CONFIG first, otherwise
+PIXELS_HOME/etc/pixels.properties. The runtime JAR and log configuration always
+come from this script's own ROOT_DIR.
+
+Only --snapshot-copy-index-state true reads source etcd. It derives
+snapshotTimestamp as trans_high_watermark - 1; no timestamp is supplied by the
+operator. The output directory must be new. This script cannot drain a live
+PixelsWriteBuffer; do that explicitly before stopping Retina.
+
+Example from the unpacked benchmark runtime after PIXELS_HOME is set:
+  bin/export-snapshot \
+      --snapshot-output /data/snapshots/node-a \
+      --snapshot-schema tpch \
+      --snapshot-tables customer,lineitem,orders \
+      --snapshot-source-host node-a \
+      --snapshot-retina-vnodes 0,1,2,3 \
+      --snapshot-source-quiesced true \
+      --snapshot-copy-index-state true
+
+After copying the result to the benchmark machine, run:
+  bin/run-benchmark snapshot-validate --snapshot-dir DIR
+
+See SNAPSHOT.md for the full consistency protocol.
 USAGE
   exit 0
+fi
+
+if [[ -z "${PIXELS_HOME:-}" ]]; then
+  echo "error: PIXELS_HOME is not set; point it at the source Pixels deployment before exporting" >&2
+  exit 2
 fi
 
 exec "${ROOT_DIR}/bin/run-benchmark" snapshot-export "$@"

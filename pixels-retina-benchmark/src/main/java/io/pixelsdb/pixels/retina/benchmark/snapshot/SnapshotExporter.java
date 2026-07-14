@@ -11,7 +11,7 @@
 package io.pixelsdb.pixels.retina.benchmark.snapshot;
 
 import com.google.common.collect.ImmutableList;
-import com.google.protobuf.ByteString;
+import io.etcd.jetcd.KeyValue;
 import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.common.metadata.domain.Column;
 import io.pixelsdb.pixels.common.metadata.domain.File;
@@ -22,18 +22,14 @@ import io.pixelsdb.pixels.common.metadata.domain.Table;
 import io.pixelsdb.pixels.common.physical.Storage;
 import io.pixelsdb.pixels.common.physical.StorageFactory;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
+import io.pixelsdb.pixels.common.utils.Constants;
+import io.pixelsdb.pixels.common.utils.EtcdUtil;
 import io.pixelsdb.pixels.common.utils.IndexUtils;
-import io.pixelsdb.pixels.common.utils.RetinaUtils;
 import io.pixelsdb.pixels.core.PixelsFooterCache;
 import io.pixelsdb.pixels.core.PixelsProto;
 import io.pixelsdb.pixels.core.PixelsReader;
 import io.pixelsdb.pixels.core.PixelsReaderImpl;
 import io.pixelsdb.pixels.core.TypeDescription;
-import io.pixelsdb.pixels.core.reader.PixelsReaderOption;
-import io.pixelsdb.pixels.core.reader.PixelsRecordReader;
-import io.pixelsdb.pixels.core.vector.ColumnVector;
-import io.pixelsdb.pixels.core.vector.LongColumnVector;
-import io.pixelsdb.pixels.core.vector.VectorizedRowBatch;
 import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkConfig;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotManifest.ColumnState;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotManifest.FileState;
@@ -42,54 +38,44 @@ import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotManifest.LayoutState
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotManifest.PathState;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotManifest.RowGroupState;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotManifest.TableState;
-import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotSamples.IndexSample;
-import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotSamples.RowSample;
 import org.rocksdb.Options;
 import org.rocksdb.RocksDB;
 
 import java.io.IOException;
-import java.io.DataInputStream;
-import java.io.BufferedInputStream;
-import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.URI;
-import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.DirectoryStream;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 /**
- * Exports source-audited table, Pixels file/RG and representative row/key state.
+ * Exports source-audited table, Pixels file/RG topology and physical index state.
  *
- * <p>Metadata/footer/sample export is read-only. Optional physical RocksDB,
- * SQLite and Visibility checkpoint copying is rejected unless the operator
+ * <p>Metadata/footer export is read-only. Optional physical RocksDB and
+ * SQLite copying is rejected unless the operator
  * explicitly declares that every source writer has been quiesced; an online
  * directory copy would not be a consistent snapshot.</p>
  */
 public final class SnapshotExporter
 {
-    private static final String[] CONFIG_KEYS = {
-            "metadata.server.host", "metadata.server.port", "node.server.host", "node.server.port",
-            "index.server.host", "index.server.port", "etcd.hosts", "etcd.port",
+    private static final String[] SEMANTIC_CONFIG_KEYS = {
             "pixel.stride", "row.group.size", "block.size", "block.replication",
             "compact.factor", "column.chunk.little.endian", "column.chunk.alignment",
             "isnull.bitmap.alignment", "enabled.storage.schemes",
             "node.virtual.num", "index.bucket.num", "enabled.single.point.index.schemes",
             "enabled.main.index.scheme", "index.cache.enabled", "index.cache.capacity",
-            "index.cache.expiration.seconds", "index.main.cache.bucket.num", "index.sqlite.path",
-            "index.rocksdb.data.path", "index.rocksdb.multicf", "index.rocksdb.write.buffer.size",
+            "index.cache.expiration.seconds", "index.main.cache.bucket.num",
+            "index.rocksdb.multicf", "index.rocksdb.write.buffer.size",
             "index.rocksdb.max.write.buffer.number", "index.rocksdb.max.background.flushes",
             "index.rocksdb.max.background.compactions", "index.rocksdb.max.open.files",
             "index.rocksdb.block.cache.capacity", "index.rocksdb.block.cache.shard.bits",
@@ -99,31 +85,14 @@ public final class SnapshotExporter
             "index.rocksdb.target.file.size.multiplier", "index.rocksdb.prefix.length",
             "index.rocksdb.max.subcompactions", "index.rocksdb.compression.type",
             "index.rocksdb.bottommost.compression.type", "index.rocksdb.compaction.style",
-            "index.rocksdb.stats.enabled", "index.rocksdb.stats.interval",
-            "index.rocksdb.stats.path", "index.rocksdb.log.interval",
-            "index.rockset.data.path", "index.rockset.local.data.path",
-            "index.rockset.persistent.cache.path", "index.rockset.persistent.cache.size.gb",
-            "index.rockset.read.only", "index.rockset.prefix.length", "index.rockset.multicf",
+            "index.rocksdb.stats.enabled",
             "retina.upsert-mode.enabled", "retina.tile.visibility.capacity",
             "retina.gc.interval", "retina.storage.gc.enabled", "retina.storage.gc.threshold",
-            "retina.storage.gc.target.file.size", "retina.checkpoint.dir", "retina.checkpoint.threads",
+            "retina.storage.gc.target.file.size",
             "retina.buffer.memTable.size", "retina.buffer.flush.count",
             "retina.buffer.object.flush.threads", "retina.buffer.flush.interval",
             "retina.buffer.flush.encodingLevel", "retina.buffer.flush.nullsPadding",
-            "retina.buffer.object.storage.scheme", "retina.buffer.object.storage.folder",
-            "hdfs.config.dir", "s3.connection.timeout.sec",
-            "s3.connection.acquisition.timeout.sec", "s3.client.service.threads",
-            "s3.max.request.concurrency", "s3.max.pending.requests",
-            "s3.enable.async", "s3.use.async.client", "minio.region", "minio.endpoint"
-    };
-    private static final String[] WRITE_BUFFER_REQUIRED_CONFIG = {
-            "retina.buffer.memTable.size", "retina.buffer.flush.count",
-            "retina.buffer.object.flush.threads", "retina.buffer.flush.interval",
-            "retina.buffer.flush.encodingLevel", "retina.buffer.flush.nullsPadding",
-            "retina.buffer.object.storage.scheme", "retina.buffer.object.storage.folder",
-            "block.size", "block.replication", "node.virtual.num",
-            "index.main.cache.bucket.num", "retina.tile.visibility.capacity",
-            "enabled.storage.schemes"
+            "retina.buffer.object.storage.scheme"
     };
     private static final String[] ROCKSDB_REQUIRED_CONFIG = {
             "index.bucket.num", "index.rocksdb.multicf",
@@ -148,6 +117,12 @@ public final class SnapshotExporter
 
     public static void run(BenchmarkConfig options) throws Exception
     {
+        String pixelsHome = System.getenv("PIXELS_HOME");
+        if (pixelsHome == null || pixelsHome.trim().isEmpty())
+        {
+            throw new IllegalStateException("PIXELS_HOME is not set; point it at the source "
+                    + "Pixels deployment before exporting a snapshot");
+        }
         java.nio.file.Path output = Paths.get(options.require("snapshot-output")).toAbsolutePath();
         String schemaName = options.require("snapshot-schema");
         List<String> tableNames = splitList(options.require("snapshot-tables"));
@@ -155,15 +130,6 @@ public final class SnapshotExporter
         {
             throw new IllegalArgumentException("--snapshot-tables is empty");
         }
-        int indexSampleCount = nonNegativeInt(options, "snapshot-index-samples", 0);
-        int rowSampleCount = nonNegativeInt(options, "snapshot-row-samples", 0);
-        String sampleLayout = options.get("snapshot-sample-layout", "ordered").toLowerCase();
-        if (!"ordered".equals(sampleLayout) && !"compact".equals(sampleLayout))
-        {
-            throw new IllegalArgumentException("--snapshot-sample-layout must be ordered or compact");
-        }
-        long selectedLayoutId = options.getLong("snapshot-layout-id", 0L);
-
         if (Files.exists(output) && !isEmptyDirectory(output))
         {
             throw new IllegalArgumentException("snapshot output must be a new or empty directory: " + output);
@@ -183,39 +149,25 @@ public final class SnapshotExporter
         manifest.consistencyNote = manifest.sourceQuiesced
                 ? "operator declared CDC/load/write-buffer/compaction/GC quiesced"
                 : "logical metadata/footer export only; physical state must not be copied online";
-        manifest.snapshotTimestamp = options.getLong("snapshot-timestamp", 0L);
-        if (indexSampleCount > 0 && manifest.snapshotTimestamp <= 0)
+        if (options.options().containsKey("snapshot-timestamp"))
         {
-            throw new IllegalArgumentException("index samples require an authoritative positive "
-                    + "--snapshot-timestamp (the source transaction high watermark)");
+            throw new IllegalArgumentException("--snapshot-timestamp was removed; physical Index "
+                    + "exports read trans_high_watermark from source etcd");
         }
-        captureEffectiveConfig(manifest.effectiveConfig);
-        if (rowSampleCount > 0)
+        if (options.options().containsKey("snapshot-visibility-checkpoint"))
         {
-            requireEffectiveConfig(manifest, "WriteBuffer snapshot",
-                    WRITE_BUFFER_REQUIRED_CONFIG);
+            throw new IllegalArgumentException("--snapshot-visibility-checkpoint was removed; "
+                    + "Visibility benchmarks always construct a clean baseline from footer topology");
         }
-        if (indexSampleCount > 0)
-        {
-            requireEffectiveConfig(manifest, "Index samples", "index.bucket.num");
-        }
+        manifest.snapshotTimestamp = 0L;
+        captureSemanticConfig(manifest.semanticConfig);
 
         MetadataService metadata = MetadataService.Instance();
         PixelsFooterCache footerCache = new PixelsFooterCache();
         for (String tableName : tableNames)
         {
-            TableState state = exportTable(metadata, footerCache, schemaName, tableName,
-                    sampleLayout, selectedLayoutId, indexSampleCount, rowSampleCount, output);
-            if (state.maxObservedCreateTimestamp > manifest.snapshotTimestamp
-                    && indexSampleCount > 0)
-            {
-                throw new IllegalStateException("sampled create timestamp "
-                        + state.maxObservedCreateTimestamp + " exceeds --snapshot-timestamp "
-                        + manifest.snapshotTimestamp + " for " + schemaName + "." + tableName);
-            }
+            TableState state = exportTable(metadata, footerCache, schemaName, tableName);
             manifest.tables.add(state);
-            addArtifactChecksum(output, manifest, state.indexSamplesFile);
-            addArtifactChecksum(output, manifest, state.rowSamplesFile);
         }
         copyOptionalPhysicalState(options, output, manifest);
         SnapshotIO.writeManifest(output, manifest);
@@ -224,31 +176,17 @@ public final class SnapshotExporter
         System.out.println("snapshot_tables=" + manifest.tables.size());
         System.out.println("source_quiesced=" + manifest.sourceQuiesced);
         System.out.println("physical_index_state=" + manifest.physicalIndexStateIncluded);
-        System.out.println("visibility_checkpoint=" + manifest.visibilityCheckpointIncluded);
-        if (manifest.visibilityCheckpointIncluded)
-        {
-            System.out.println("visibility_checkpoint_type=" + manifest.visibilityCheckpointType);
-            System.out.println("visibility_checkpoint_host=" + manifest.visibilityCheckpointHost);
-            System.out.println("visibility_checkpoint_timestamp="
-                    + manifest.visibilityCheckpointTimestamp);
-            System.out.println("visibility_checkpoint_coverage="
-                    + manifest.visibilityCheckpointMatchedEntryCount + "/"
-                    + manifest.visibilityCheckpointExpectedEntryCount);
-        }
+        System.out.println("snapshot_timestamp=" + manifest.snapshotTimestamp);
         for (TableState table : manifest.tables)
         {
             System.out.println("table." + table.tableName + ".id=" + table.tableId);
             System.out.println("table." + table.tableName + ".files=" + table.files.size());
-            System.out.println("table." + table.tableName + ".index_samples=" + table.indexSampleCount);
-            System.out.println("table." + table.tableName + ".row_samples=" + table.rowSampleCount);
         }
         System.out.println("status=exported");
     }
 
     private static TableState exportTable(MetadataService metadata, PixelsFooterCache footerCache,
-                                           String schemaName, String tableName, String sampleLayout,
-                                           long selectedLayoutId, int requestedIndexSamples,
-                                           int requestedRowSamples, java.nio.file.Path output) throws Exception
+                                          String schemaName, String tableName) throws Exception
     {
         Table table = metadata.getTable(schemaName, tableName);
         if (table == null)
@@ -269,7 +207,6 @@ public final class SnapshotExporter
         state.tableType = table.getType();
         state.storageScheme = table.getStorageScheme().name();
         state.metadataRowCount = table.getRowCount();
-        state.sampleLayout = sampleLayout;
         for (int ordinal = 0; ordinal < columns.size(); ordinal++)
         {
             Column column = columns.get(ordinal);
@@ -337,85 +274,6 @@ public final class SnapshotExporter
         }
         captureProductionWritePaths(state, latestId);
 
-        List<FileState> sampleFiles = new ArrayList<>();
-        long selectedId = selectedLayoutId > 0 ? selectedLayoutId : latestReadableLayoutId(state);
-        state.selectedSampleLayoutId = selectedId;
-        boolean selectedReadable = false;
-        for (LayoutState layout : state.layouts)
-        {
-            if (layout.layoutId == selectedId)
-            {
-                selectedReadable = layout.readable;
-                break;
-            }
-        }
-        if ((requestedIndexSamples > 0 || requestedRowSamples > 0) && !selectedReadable)
-        {
-            throw new IllegalArgumentException("selected sample layout is absent or not readable: "
-                    + selectedId + " for " + schemaName + "." + tableName);
-        }
-        Set<Long> productionSamplePaths = new HashSet<>();
-        for (LayoutState layout : state.layouts)
-        {
-            if (layout.layoutId != selectedId)
-            {
-                continue;
-            }
-            for (PathState path : layout.paths)
-            {
-                if (path.productionSelectedByRetina
-                        && sampleLayout.equalsIgnoreCase(path.role))
-                {
-                    productionSamplePaths.add(path.pathId);
-                }
-            }
-        }
-        for (FileState file : state.files)
-        {
-            if (file.layoutId == selectedId && sampleLayout.equals(file.layoutRole)
-                    && productionSamplePaths.contains(file.pathId))
-            {
-                sampleFiles.add(file);
-                state.footerRowsInSelectedSampleLayout += file.footerRowCount;
-            }
-        }
-        sampleFiles.sort(Comparator.comparingLong(file -> file.fileId));
-        if ((requestedIndexSamples > 0 || requestedRowSamples > 0) && sampleFiles.isEmpty())
-        {
-            throw new IllegalStateException("no " + sampleLayout + " files in selected layout "
-                    + selectedId + " for " + schemaName + "." + tableName);
-        }
-        if (requestedIndexSamples > 0 && state.primaryIndex == null)
-        {
-            throw new IllegalStateException("index samples requested but table has no primary index: "
-                    + schemaName + "." + tableName);
-        }
-
-        int indexSamples = (int) Math.min((long) requestedIndexSamples,
-                state.footerRowsInSelectedSampleLayout);
-        int rowSamples = (int) Math.min((long) requestedRowSamples,
-                state.footerRowsInSelectedSampleLayout);
-        if (indexSamples > 0 || rowSamples > 0)
-        {
-            SampleResult samples = readSamples(state, sampleFiles, indexSamples, rowSamples);
-            java.nio.file.Path tableDir = output.resolve("tables").resolve(
-                    safeName(schemaName + "_" + tableName) + "-t" + state.tableId);
-            if (indexSamples > 0)
-            {
-                java.nio.file.Path path = tableDir.resolve("index-samples.bin");
-                SnapshotIO.writeIndexSamples(path, samples.indexSamples);
-                state.indexSamplesFile = output.relativize(path).toString();
-                state.indexSampleCount = samples.indexSamples.size();
-            }
-            if (rowSamples > 0)
-            {
-                java.nio.file.Path path = tableDir.resolve("row-samples.bin");
-                SnapshotIO.writeRowSamples(path, samples.rowSamples, state.columns.size());
-                state.rowSamplesFile = output.relativize(path).toString();
-                state.rowSampleCount = samples.rowSamples.size();
-            }
-            state.maxObservedCreateTimestamp = samples.maxTimestamp;
-        }
         return state;
     }
 
@@ -511,209 +369,6 @@ public final class SnapshotExporter
         return state;
     }
 
-    private static SampleResult readSamples(TableState table, List<FileState> files,
-                                            int indexCount, int rowCount) throws Exception
-    {
-        Map<Location, Target> targets = new LinkedHashMap<>();
-        addTargets(files, table.footerRowsInSelectedSampleLayout, indexCount, true, targets);
-        addTargets(files, table.footerRowsInSelectedSampleLayout, rowCount, false, targets);
-        Map<Long, Map<Integer, List<Target>>> byFile = new HashMap<>();
-        for (Target target : targets.values())
-        {
-            byFile.computeIfAbsent(target.location.fileId, ignored -> new HashMap<>())
-                    .computeIfAbsent(target.location.rgId, ignored -> new ArrayList<>()).add(target);
-        }
-        Map<Long, FileState> fileById = new HashMap<>();
-        for (FileState file : files)
-        {
-            fileById.put(file.fileId, file);
-        }
-
-        SampleResult result = new SampleResult();
-        String[] names = new String[table.columns.size()];
-        List<String> types = new ArrayList<>(table.columns.size());
-        for (ColumnState column : table.columns)
-        {
-            names[column.ordinal] = column.name;
-            types.add(column.type);
-        }
-        TypeDescription schema = TypeDescription.createSchemaFromStrings(Arrays.asList(names), types);
-        for (Map.Entry<Long, Map<Integer, List<Target>>> fileTargets : byFile.entrySet())
-        {
-            FileState file = fileById.get(fileTargets.getKey());
-            Storage storage = StorageFactory.Instance().getStorage(file.fullUri);
-            try (PixelsReader reader = newReader(storage, file.fullUri, new PixelsFooterCache()))
-            {
-                for (Map.Entry<Integer, List<Target>> rgTargets : fileTargets.getValue().entrySet())
-                {
-                    readRowGroupSamples(table, schema, reader, file, rgTargets.getKey(),
-                            rgTargets.getValue(), result, names);
-                }
-            }
-        }
-        result.indexSamples.sort(Comparator.comparingLong(sample -> sample.fileId * 31L
-                + (long) sample.rgId * 17L + sample.rgRowOffset));
-        return result;
-    }
-
-    private static void readRowGroupSamples(TableState table, TypeDescription schema,
-                                            PixelsReader reader, FileState file, int rgId,
-                                            List<Target> targets, SampleResult result,
-                                            String[] columnNames) throws Exception
-    {
-        targets.sort(Comparator.comparingInt(target -> target.location.offset));
-        Map<Integer, Target> offsets = new HashMap<>();
-        for (Target target : targets)
-        {
-            offsets.put(target.location.offset, target);
-        }
-        boolean needsIndexTimestamp = false;
-        for (Target target : targets)
-        {
-            needsIndexTimestamp |= target.index;
-        }
-        PixelsReaderOption option = new PixelsReaderOption().includeCols(columnNames)
-                .rgRange(rgId, 1).skipCorruptRecords(false)
-                .tolerantSchemaEvolution(false).enableEncodedColumnVector(false)
-                .exposeHiddenColumn(needsIndexTimestamp);
-        int rowOffset = 0;
-        try (PixelsRecordReader recordReader = reader.read(option))
-        {
-            VectorizedRowBatch batch;
-            while ((batch = recordReader.readBatch(true)) != null && batch.size > 0)
-            {
-                LongColumnVector hidden = batch.getHiddenColumnVector();
-                if (needsIndexTimestamp && hidden == null)
-                {
-                    throw new IllegalStateException("indexed snapshot requires the real hidden commit "
-                            + "timestamp column: " + file.fullUri + " RG " + rgId);
-                }
-                for (int logical = 0; logical < batch.size; logical++, rowOffset++)
-                {
-                    Target target = offsets.get(rowOffset);
-                    if (target == null)
-                    {
-                        continue;
-                    }
-                    // PixelsRecordReader returns a dense batch; unlike Hive's
-                    // VectorizedRowBatch this class has no selected[] indirection.
-                    int row = logical;
-                    long timestamp = hidden == null ? 0L
-                            : hidden.vector[hidden.isRepeating() ? 0 : row];
-                    result.maxTimestamp = Math.max(result.maxTimestamp, timestamp);
-                    if (target.index)
-                    {
-                        ByteString key = buildIndexKey(table, schema, batch, row);
-                        int bucket = IndexUtils.getBucketIdFromByteBuffer(key);
-                        result.indexSamples.add(new IndexSample(key.toByteArray(), timestamp,
-                                file.fileId, rgId, rowOffset, bucket));
-                    }
-                    if (target.row)
-                    {
-                        byte[][] values = new byte[table.columns.size()][];
-                        for (int column = 0; column < values.length; column++)
-                        {
-                            ColumnVector vector = batch.cols[column];
-                            int vectorRow = vector.isRepeating() ? 0 : row;
-                            if (!vector.noNulls && vector.isNull[vectorRow])
-                            {
-                                values[column] = null;
-                            }
-                            else
-                            {
-                                values[column] = schema.getChildren().get(column)
-                                        .convertColumnVectorToByte(vector, vectorRow);
-                            }
-                        }
-                        result.rowSamples.add(new RowSample(values));
-                    }
-                }
-                if (batch.endOfFile)
-                {
-                    break;
-                }
-            }
-        }
-        if (rowOffset != file.rowGroups.get(rgId).recordNum)
-        {
-            throw new IllegalStateException("reader returned " + rowOffset + " rows for "
-                    + file.fullUri + " RG " + rgId + ", footer says "
-                    + file.rowGroups.get(rgId).recordNum);
-        }
-    }
-
-    private static ByteString buildIndexKey(TableState table, TypeDescription schema,
-                                            VectorizedRowBatch batch, int row)
-    {
-        int length = 0;
-        List<byte[]> parts = new ArrayList<>(table.primaryIndex.keyColumnOrdinals.size());
-        for (Integer ordinal : table.primaryIndex.keyColumnOrdinals)
-        {
-            ColumnVector vector = batch.cols[ordinal];
-            int vectorRow = vector.isRepeating() ? 0 : row;
-            if (!vector.noNulls && vector.isNull[vectorRow])
-            {
-                throw new IllegalStateException("primary key column is null at ordinal " + ordinal);
-            }
-            byte[] value = schema.getChildren().get(ordinal).convertColumnVectorToByte(vector, vectorRow);
-            parts.add(value);
-            length += value.length;
-        }
-        ByteBuffer buffer = ByteBuffer.allocate(length);
-        for (byte[] part : parts)
-        {
-            buffer.put(part);
-        }
-        return ByteString.copyFrom((ByteBuffer) buffer.flip());
-    }
-
-    private static void addTargets(List<FileState> files, long totalRows, int count,
-                                   boolean index, Map<Location, Target> targets)
-    {
-        if (count <= 0)
-        {
-            return;
-        }
-        long[] ordinals = new long[count];
-        for (int i = 0; i < count; i++)
-        {
-            ordinals[i] = ((2L * i + 1L) * totalRows) / (2L * count);
-            if (ordinals[i] >= totalRows)
-            {
-                ordinals[i] = totalRows - 1L;
-            }
-        }
-        int targetIndex = 0;
-        long base = 0;
-        for (FileState file : files)
-        {
-            for (RowGroupState rg : file.rowGroups)
-            {
-                long end = base + rg.recordNum;
-                while (targetIndex < ordinals.length && ordinals[targetIndex] < end)
-                {
-                    int offset = (int) (ordinals[targetIndex] - base);
-                    Location location = new Location(file.fileId, rg.rgId, offset);
-                    Target target = targets.computeIfAbsent(location, Target::new);
-                    if (index)
-                    {
-                        target.index = true;
-                    }
-                    else
-                    {
-                        target.row = true;
-                    }
-                    targetIndex++;
-                }
-                base = end;
-            }
-        }
-        if (targetIndex != ordinals.length)
-        {
-            throw new IllegalStateException("failed to map all systematic sample ordinals");
-        }
-    }
-
     private static IndexState indexState(SinglePointIndex index, List<Column> columns)
     {
         IndexState state = new IndexState();
@@ -805,22 +460,16 @@ public final class SnapshotExporter
                                                   SnapshotManifest manifest) throws Exception
     {
         boolean copyIndex = options.getBoolean("snapshot-copy-index-state", false);
-        String checkpoint = options.get("snapshot-visibility-checkpoint", null);
-        if ((copyIndex || checkpoint != null) && !manifest.sourceQuiesced)
+        if (copyIndex && !manifest.sourceQuiesced)
         {
             throw new IllegalArgumentException("physical state export requires "
                     + "--snapshot-source-quiesced true after all Retina writers have stopped");
         }
         if (copyIndex)
         {
-            requireEffectiveConfig(manifest, "physical RocksDB snapshot",
+            manifest.snapshotTimestamp = readSnapshotTimestampFromEtcd();
+            requireSemanticConfig(manifest, "physical RocksDB snapshot",
                     ROCKSDB_REQUIRED_CONFIG);
-            if (Boolean.parseBoolean(manifest.effectiveConfig.get("index.rocksdb.stats.enabled")))
-            {
-                requireEffectiveConfig(manifest, "RocksDB statistics",
-                        "index.rocksdb.stats.interval", "index.rocksdb.stats.path",
-                        "index.rocksdb.log.interval");
-            }
             ConfigFactory config = ConfigFactory.Instance();
             String rocksSource = options.get("snapshot-rocksdb-dir",
                     config.getProperty("index.rocksdb.data.path"));
@@ -872,171 +521,39 @@ public final class SnapshotExporter
             SnapshotIO.addDirectoryChecksums(output, sqliteTarget, manifest.artifactsSha256);
             manifest.physicalIndexStateIncluded = true;
         }
-        if (checkpoint != null)
-        {
-            requireEffectiveConfig(manifest, "Visibility checkpoint",
-                    "retina.tile.visibility.capacity");
-            if (manifest.snapshotTimestamp <= 0)
-            {
-                throw new IllegalArgumentException("Visibility checkpoint export requires its positive "
-                        + "--snapshot-timestamp");
-            }
-            CheckpointIdentity identity = parseCheckpointIdentity(checkpoint);
-            if (identity.timestamp != manifest.snapshotTimestamp)
-            {
-                throw new IllegalArgumentException("Visibility checkpoint filename timestamp "
-                        + identity.timestamp + " does not equal --snapshot-timestamp "
-                        + manifest.snapshotTimestamp);
-            }
-            java.nio.file.Path target = output.resolve("state/visibility/gc-checkpoint.bin");
-            Files.createDirectories(target.getParent());
-            Storage storage = StorageFactory.Instance().getStorage(checkpoint);
-            try (DataInputStream input = storage.open(checkpoint);
-                 OutputStream out = Files.newOutputStream(target))
-            {
-                byte[] buffer = new byte[8 * 1024 * 1024];
-                int read;
-                while ((read = input.read(buffer)) >= 0)
-                {
-                    if (read > 0)
-                    {
-                        out.write(buffer, 0, read);
-                    }
-                }
-            }
-            String relative = output.relativize(target).toString();
-            manifest.artifactsSha256.put(relative, SnapshotIO.sha256(target));
-            manifest.visibilityCheckpointIncluded = true;
-            manifest.visibilityCheckpointSource = checkpoint;
-            manifest.visibilityCheckpointType = identity.type;
-            manifest.visibilityCheckpointHost = identity.host;
-            manifest.visibilityCheckpointTimestamp = identity.timestamp;
-            CheckpointStats stats = inspectVisibilityCheckpoint(target, manifest);
-            manifest.visibilityCheckpointEntryCount = stats.total;
-            manifest.visibilityCheckpointExpectedEntryCount = stats.expected;
-            manifest.visibilityCheckpointMatchedEntryCount = stats.matched;
-            manifest.visibilityCheckpointUnmatchedEntryCount = stats.unmatched;
-        }
     }
 
-    private static CheckpointStats inspectVisibilityCheckpoint(java.nio.file.Path checkpoint,
-                                                               SnapshotManifest manifest)
-            throws IOException
+    private static long readSnapshotTimestampFromEtcd()
     {
-        if (Files.size(checkpoint) > Integer.MAX_VALUE)
+        KeyValue keyValue = EtcdUtil.Instance().getKeyValue(Constants.TRANS_HIGH_WATERMARK_KEY);
+        if (keyValue == null)
         {
-            throw new IOException("Visibility checkpoint exceeds the current CheckpointFileIO 2 GiB limit: "
-                    + checkpoint);
+            throw new IllegalStateException("source etcd has no "
+                    + Constants.TRANS_HIGH_WATERMARK_KEY
+                    + "; start Transaction Service and wait for its watermark checkpoint");
         }
-        Map<String, RowGroupState> topology = new HashMap<>();
-        for (TableState table : manifest.tables)
-        {
-            Set<Long> productionVisibilityPaths = new HashSet<>();
-            for (LayoutState layout : table.layouts)
-            {
-                if (!layout.readable)
-                {
-                    continue;
-                }
-                for (PathState path : layout.paths)
-                {
-                    if (path.productionSelectedByRetina
-                            && ("ordered".equalsIgnoreCase(path.role)
-                            || "compact".equalsIgnoreCase(path.role)))
-                    {
-                        productionVisibilityPaths.add(path.pathId);
-                    }
-                }
-            }
-            for (FileState file : table.files)
-            {
-                if (!productionVisibilityPaths.contains(file.pathId))
-                {
-                    continue;
-                }
-                for (RowGroupState rg : file.rowGroups)
-                {
-                    String key = file.fileId + "_" + rg.rgId;
-                    if (topology.put(key, rg) != null)
-                    {
-                        throw new IOException("duplicate production Visibility row group " + key);
-                    }
-                }
-            }
-        }
-        if (topology.isEmpty())
-        {
-            throw new IOException("snapshot tables contain no production Visibility row groups");
-        }
-        int tileCapacity = Integer.parseInt(manifest.effectiveConfig.getOrDefault(
-                "retina.tile.visibility.capacity", "10240"));
-        if (tileCapacity <= 0 || tileCapacity > 65_536
-                || tileCapacity % Long.SIZE != 0)
-        {
-            throw new IOException("invalid source retina.tile.visibility.capacity=" + tileCapacity);
-        }
+        String value = keyValue.getValue().toString(StandardCharsets.UTF_8);
+        return snapshotTimestampFromHighWatermark(value);
+    }
 
-        CheckpointStats stats = new CheckpointStats();
-        Set<String> entries = new HashSet<>();
-        try (DataInputStream input = new DataInputStream(new BufferedInputStream(
-                Files.newInputStream(checkpoint), 8 * 1024 * 1024)))
+    static long snapshotTimestampFromHighWatermark(String value)
+    {
+        final long highWatermark;
+        try
         {
-            int count = input.readInt();
-            if (count < 0)
-            {
-                throw new IOException("negative Visibility checkpoint entry count");
-            }
-            stats.total = count;
-            for (int i = 0; i < count; i++)
-            {
-                long fileId = input.readLong();
-                int rgId = input.readInt();
-                int recordNum = input.readInt();
-                int bitmapLength = input.readInt();
-                if (fileId <= 0 || rgId < 0 || recordNum < 0 || bitmapLength < 0)
-                {
-                    throw new IOException("invalid Visibility checkpoint entry at ordinal " + i);
-                }
-                String key = fileId + "_" + rgId;
-                if (!entries.add(key))
-                {
-                    throw new IOException("duplicate Visibility checkpoint entry: " + key);
-                }
-                RowGroupState expected = topology.get(key);
-                if (expected == null)
-                {
-                    stats.unmatched++;
-                }
-                else
-                {
-                    long expectedBitmapLength = ((recordNum + (long) tileCapacity - 1L) / tileCapacity)
-                            * (tileCapacity / Long.SIZE);
-                    if (recordNum != expected.recordNum || bitmapLength != expectedBitmapLength)
-                    {
-                        throw new IOException("Visibility checkpoint/manifest mismatch for " + key
-                                + ": recordNum=" + recordNum + "/" + expected.recordNum
-                                + ", bitmapWords=" + bitmapLength + "/" + expectedBitmapLength);
-                    }
-                    stats.matched++;
-                }
-                for (int word = 0; word < bitmapLength; word++)
-                {
-                    input.readLong();
-                }
-            }
-            if (input.read() != -1)
-            {
-                throw new IOException("Visibility checkpoint contains trailing bytes: " + checkpoint);
-            }
+            highWatermark = Long.parseLong(value);
         }
-        stats.expected = topology.size();
-        if (stats.matched != stats.expected)
+        catch (NumberFormatException e)
         {
-            throw new IOException("Visibility checkpoint covers " + stats.matched + " of "
-                    + stats.expected + " production row groups from --snapshot-tables; "
-                    + "use the checkpoint from the same quiesced Retina host and T_snap");
+            throw new IllegalStateException("source etcd contains an invalid "
+                    + Constants.TRANS_HIGH_WATERMARK_KEY + ": " + value, e);
         }
-        return stats;
+        if (highWatermark <= 1L)
+        {
+            throw new IllegalStateException("source transaction high watermark must be greater than 1 "
+                    + "for a physical Index snapshot, found " + highWatermark);
+        }
+        return highWatermark - 1L;
     }
 
     private static int fixedCanonicalLength(TypeDescription type)
@@ -1071,23 +588,10 @@ public final class SnapshotExporter
                 .setPixelsFooterCache(footerCache).build();
     }
 
-    private static long latestReadableLayoutId(TableState table)
-    {
-        long id = -1;
-        for (LayoutState layout : table.layouts)
-        {
-            if (layout.readable && layout.layoutId > id)
-            {
-                id = layout.layoutId;
-            }
-        }
-        return id;
-    }
-
-    private static void captureEffectiveConfig(Map<String, String> target)
+    private static void captureSemanticConfig(Map<String, String> target)
     {
         ConfigFactory config = ConfigFactory.Instance();
-        for (String key : CONFIG_KEYS)
+        for (String key : SEMANTIC_CONFIG_KEYS)
         {
             String value = config.getProperty(key);
             if (value != null)
@@ -1097,13 +601,13 @@ public final class SnapshotExporter
         }
     }
 
-    private static void requireEffectiveConfig(SnapshotManifest manifest, String purpose,
+    private static void requireSemanticConfig(SnapshotManifest manifest, String purpose,
                                                String... keys)
     {
         List<String> missing = new ArrayList<>();
         for (String key : keys)
         {
-            String value = manifest.effectiveConfig.get(key);
+            String value = manifest.semanticConfig.get(key);
             if (value == null || value.trim().isEmpty())
             {
                 missing.add(key);
@@ -1113,15 +617,6 @@ public final class SnapshotExporter
         {
             throw new IllegalArgumentException(purpose + " requires source configuration keys "
                     + missing + "; point PIXELS_CONFIG at the real source deployment");
-        }
-    }
-
-    private static void addArtifactChecksum(java.nio.file.Path output, SnapshotManifest manifest,
-                                            String relative) throws IOException
-    {
-        if (relative != null)
-        {
-            manifest.artifactsSha256.put(relative, SnapshotIO.sha256(output.resolve(relative)));
         }
     }
 
@@ -1162,16 +657,6 @@ public final class SnapshotExporter
         return result;
     }
 
-    private static int nonNegativeInt(BenchmarkConfig options, String key, int defaultValue)
-    {
-        int value = options.getInt(key, defaultValue);
-        if (value < 0)
-        {
-            throw new IllegalArgumentException("--" + key + " must not be negative");
-        }
-        return value;
-    }
-
     private static boolean isEmptyDirectory(java.nio.file.Path path) throws IOException
     {
         if (!Files.isDirectory(path))
@@ -1191,71 +676,6 @@ public final class SnapshotExporter
             return Paths.get(URI.create(value));
         }
         return Paths.get(value);
-    }
-
-    private static CheckpointIdentity parseCheckpointIdentity(String checkpoint)
-    {
-        String withoutQuery = checkpoint;
-        int query = withoutQuery.indexOf('?');
-        if (query >= 0)
-        {
-            withoutQuery = withoutQuery.substring(0, query);
-        }
-        int slash = Math.max(withoutQuery.lastIndexOf('/'), withoutQuery.lastIndexOf('\\'));
-        String fileName = slash >= 0 ? withoutQuery.substring(slash + 1) : withoutQuery;
-        String type;
-        String prefix;
-        if (fileName.startsWith(RetinaUtils.CHECKPOINT_PREFIX_GC))
-        {
-            type = "gc";
-            prefix = RetinaUtils.CHECKPOINT_PREFIX_GC;
-        }
-        else if (fileName.startsWith(RetinaUtils.CHECKPOINT_PREFIX_OFFLOAD))
-        {
-            type = "offload";
-            prefix = RetinaUtils.CHECKPOINT_PREFIX_OFFLOAD;
-        }
-        else
-        {
-            throw new IllegalArgumentException("Visibility checkpoint must retain the production "
-                    + "vis_gc_<host>_<timestamp>.bin or vis_offload_<host>_<timestamp>.bin filename: "
-                    + checkpoint);
-        }
-        if (!fileName.endsWith(RetinaUtils.CHECKPOINT_SUFFIX))
-        {
-            throw new IllegalArgumentException("Visibility checkpoint does not end in "
-                    + RetinaUtils.CHECKPOINT_SUFFIX + ": " + checkpoint);
-        }
-        String stem = fileName.substring(0,
-                fileName.length() - RetinaUtils.CHECKPOINT_SUFFIX.length());
-        int timestampSeparator = stem.lastIndexOf('_');
-        if (timestampSeparator < prefix.length()
-                || timestampSeparator == stem.length() - 1)
-        {
-            throw new IllegalArgumentException("invalid Visibility checkpoint filename: " + checkpoint);
-        }
-        long timestamp;
-        try
-        {
-            timestamp = Long.parseLong(stem.substring(timestampSeparator + 1));
-        }
-        catch (NumberFormatException e)
-        {
-            throw new IllegalArgumentException("invalid Visibility checkpoint timestamp in "
-                    + checkpoint, e);
-        }
-        if (timestamp <= 0)
-        {
-            throw new IllegalArgumentException("Visibility checkpoint timestamp must be positive: "
-                    + checkpoint);
-        }
-        String host = stem.substring(prefix.length(), timestampSeparator);
-        if (host.isEmpty())
-        {
-            throw new IllegalArgumentException("Visibility checkpoint hostname is empty: "
-                    + checkpoint);
-        }
-        return new CheckpointIdentity(type, host, timestamp);
     }
 
     private static List<long[]> discoverIndexColumnFamilies(java.nio.file.Path rocksDirectory) throws Exception
@@ -1317,81 +737,4 @@ public final class SnapshotExporter
         }
     }
 
-    private static String safeName(String value)
-    {
-        return value.replaceAll("[^A-Za-z0-9_.-]", "_");
-    }
-
-    private static final class SampleResult
-    {
-        private final List<IndexSample> indexSamples = new ArrayList<>();
-        private final List<RowSample> rowSamples = new ArrayList<>();
-        private long maxTimestamp;
-    }
-
-    private static final class CheckpointStats
-    {
-        private long total;
-        private long expected;
-        private long matched;
-        private long unmatched;
-    }
-
-    private static final class CheckpointIdentity
-    {
-        private final String type;
-        private final String host;
-        private final long timestamp;
-
-        private CheckpointIdentity(String type, String host, long timestamp)
-        {
-            this.type = type;
-            this.host = host;
-            this.timestamp = timestamp;
-        }
-    }
-
-    private static final class Location
-    {
-        private final long fileId;
-        private final int rgId;
-        private final int offset;
-
-        private Location(long fileId, int rgId, int offset)
-        {
-            this.fileId = fileId;
-            this.rgId = rgId;
-            this.offset = offset;
-        }
-
-        @Override
-        public boolean equals(Object other)
-        {
-            if (this == other) return true;
-            if (!(other instanceof Location)) return false;
-            Location that = (Location) other;
-            return fileId == that.fileId && rgId == that.rgId && offset == that.offset;
-        }
-
-        @Override
-        public int hashCode()
-        {
-            int result = Long.valueOf(fileId).hashCode();
-            result = 31 * result + rgId;
-            result = 31 * result + offset;
-            return result;
-        }
-    }
-
-    private static final class Target
-    {
-        private final Location location;
-        private boolean index;
-        private boolean row;
-
-        private Target(Location location)
-        {
-            this.location = location;
-        }
-    }
 }

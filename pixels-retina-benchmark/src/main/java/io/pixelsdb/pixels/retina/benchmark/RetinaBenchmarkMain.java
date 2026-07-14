@@ -15,16 +15,16 @@ import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkResult;
 import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkRunner;
 import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkScenario;
 import io.pixelsdb.pixels.retina.benchmark.common.ResultPrinter;
-import io.pixelsdb.pixels.retina.benchmark.index.IndexBenchmarkScenario;
-import io.pixelsdb.pixels.retina.benchmark.index.SnapshotIndexBenchmarkScenario;
+import io.pixelsdb.pixels.retina.benchmark.index.IndexOperation;
+import io.pixelsdb.pixels.retina.benchmark.index.PhysicalIndexBenchmarkScenario;
 import io.pixelsdb.pixels.retina.benchmark.server.MetadataOnlyMain;
 import io.pixelsdb.pixels.retina.benchmark.server.TransactionOnlyMain;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotExporter;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotValidator;
 import io.pixelsdb.pixels.retina.benchmark.transaction.TransactionBeginBenchmark;
+import io.pixelsdb.pixels.retina.benchmark.transaction.TransactionBeginCommitBenchmark;
 import io.pixelsdb.pixels.retina.benchmark.transaction.TransactionCommitBenchmark;
 import io.pixelsdb.pixels.retina.benchmark.visibility.SnapshotVisibilityBenchmarkScenario;
-import io.pixelsdb.pixels.retina.benchmark.visibility.VisibilityBenchmarkScenario;
 import io.pixelsdb.pixels.retina.benchmark.writebuffer.WriteBufferAddBenchmarkScenario;
 
 import java.util.Arrays;
@@ -78,19 +78,35 @@ public final class RetinaBenchmarkMain
             case "transaction-begin":
                 scenario = new TransactionBeginBenchmark();
                 break;
-            case "index":
-                scenario = config.options().containsKey("snapshot-dir")
-                        ? new SnapshotIndexBenchmarkScenario() : new IndexBenchmarkScenario();
-                break;
-            case "visibility":
-                scenario = config.options().containsKey("snapshot-dir")
-                        ? new SnapshotVisibilityBenchmarkScenario() : new VisibilityBenchmarkScenario();
-                break;
-            case "write-buffer-add":
-                scenario = new WriteBufferAddBenchmarkScenario();
+            case "transaction-begin-commit":
+                scenario = new TransactionBeginCommitBenchmark();
                 break;
             case "transaction-commit":
                 scenario = new TransactionCommitBenchmark();
+                break;
+            case "index-put-primary":
+                scenario = new PhysicalIndexBenchmarkScenario(IndexOperation.PUT_PRIMARY);
+                break;
+            case "index-update-primary":
+                scenario = new PhysicalIndexBenchmarkScenario(IndexOperation.UPDATE_PRIMARY);
+                break;
+            case "index-delete-primary":
+                scenario = new PhysicalIndexBenchmarkScenario(IndexOperation.DELETE_PRIMARY);
+                break;
+            case "index-put-secondary":
+                scenario = new PhysicalIndexBenchmarkScenario(IndexOperation.PUT_SECONDARY);
+                break;
+            case "index-update-secondary":
+                scenario = new PhysicalIndexBenchmarkScenario(IndexOperation.UPDATE_SECONDARY);
+                break;
+            case "index-delete-secondary":
+                scenario = new PhysicalIndexBenchmarkScenario(IndexOperation.DELETE_SECONDARY);
+                break;
+            case "visibility":
+                scenario = new SnapshotVisibilityBenchmarkScenario();
+                break;
+            case "write-buffer-add":
+                scenario = new WriteBufferAddBenchmarkScenario();
                 break;
             default:
                 throw new IllegalArgumentException("unknown command: " + command
@@ -108,15 +124,21 @@ public final class RetinaBenchmarkMain
         System.out.println("Usage: java -jar pixels-retina-benchmark-full.jar <command> [options]");
         System.out.println();
         System.out.println("Benchmark commands:");
-        System.out.println("  transaction-begin   real TransService BeginTrans/BeginTransBatch RPC");
-        System.out.println("  index               local primary update through LocalIndexService");
-        System.out.println("  visibility          local ResourceManager -> JNI visibility deletion");
-        System.out.println("  write-buffer-add    local PixelsWriteBuffer.addRow");
-        System.out.println("  transaction-commit  real TransService CommitTrans/CommitTransBatch RPC");
+        System.out.println("  transaction-begin         real TransService BeginTrans/BeginTransBatch RPC");
+        System.out.println("  transaction-begin-commit  real Begin followed immediately by Commit");
+        System.out.println("  transaction-commit        real TransService CommitTrans/CommitTransBatch RPC");
+        System.out.println("  index-put-primary         LocalIndexService.putPrimaryIndexEntries");
+        System.out.println("  index-update-primary      LocalIndexService.updatePrimaryIndexEntries");
+        System.out.println("  index-delete-primary      LocalIndexService.deletePrimaryIndexEntries");
+        System.out.println("  index-put-secondary       LocalIndexService.putSecondaryIndexEntries");
+        System.out.println("  index-update-secondary    LocalIndexService.updateSecondaryIndexEntries");
+        System.out.println("  index-delete-secondary    LocalIndexService.deleteSecondaryIndexEntries");
+        System.out.println("  visibility                local ResourceManager -> JNI visibility deletion");
+        System.out.println("  write-buffer-add          local PixelsWriteBuffer.addRow");
         System.out.println();
         System.out.println("Snapshot commands:");
-        System.out.println("  snapshot-export     export metadata/file topology, real samples, and optional quiesced state");
-        System.out.println("  snapshot-validate   verify format, sample payloads/counts, and SHA-256 before restore");
+        System.out.println("  snapshot-export     export v2 topology and optional quiesced physical state");
+        System.out.println("  snapshot-validate   verify v2 semantics, profiles, and SHA-256 artifacts");
         System.out.println();
         System.out.println("Minimal real service commands:");
         System.out.println("  transaction-server  production TransServer only (requires etcd)");
@@ -133,8 +155,9 @@ public final class RetinaBenchmarkMain
         System.out.println("  --fail-fast true|false  stop after the first failed group (default: false)");
         System.out.println("  --rpc-deadline-ms N     per-call Begin/Commit gRPC deadline (default: 30000)");
         System.out.println("  --snapshot-dir DIR      restore Index/Visibility/WriteBuffer input from a validated snapshot");
-        System.out.println("  --snapshot-table NAME   target table (required by Index/Visibility and multi-table WriteBuffer snapshots)");
-        System.out.println("  --snapshot-require LIST validation profiles: index, visibility, visibility-clean, write-buffer");
+        System.out.println("  --snapshot-table NAME   target table");
+        System.out.println("  --snapshot-secondary-index ID|NAME  target secondary index for secondary commands");
+        System.out.println("  --snapshot-require LIST validation profiles: index, visibility, write-buffer");
         System.out.println();
         System.out.println("Scenario options are in README.md; snapshot export/restore is in SNAPSHOT.md.");
     }

@@ -30,14 +30,10 @@ import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkWorker;
 import io.pixelsdb.pixels.retina.benchmark.common.OperationRange;
 import io.pixelsdb.pixels.retina.benchmark.common.OperationResult;
 import io.pixelsdb.pixels.retina.benchmark.runtime.NativeRuntime;
-import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotIO;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotManifest;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotRuntime;
-import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotSamples.RowSample;
 
 import java.net.URI;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -80,25 +76,6 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
     /** TileVisibility stores transaction timestamps in 48 bits. */
     private static final long MAX_NATIVE_TIMESTAMP = (1L << 48) - 1L;
     private static final int DEFAULT_ROW_POOL_SIZE = 100_000;
-    private static final List<String> DEFAULT_COLUMN_NAMES;
-    private static final List<String> DEFAULT_COLUMN_TYPES;
-
-    static
-    {
-        List<String> names = new ArrayList<>();
-        names.add("nationkey");
-        names.add("name");
-        names.add("regionkey");
-        names.add("comment");
-        DEFAULT_COLUMN_NAMES = Collections.unmodifiableList(names);
-
-        List<String> types = new ArrayList<>();
-        types.add("bigint");
-        types.add("varchar(25)");
-        types.add("bigint");
-        types.add("varchar(152)");
-        DEFAULT_COLUMN_TYPES = Collections.unmodifiableList(types);
-    }
 
     private final Map<BenchmarkPhase, PhaseState> states = new EnumMap<>(BenchmarkPhase.class);
     private final Map<BenchmarkPhase, Long> closeMillis = new EnumMap<>(BenchmarkPhase.class);
@@ -113,9 +90,9 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
     private String baseUri;
     private String retinaHostName;
     private boolean dropSchema;
-    private List<String> columnNames = DEFAULT_COLUMN_NAMES;
-    private List<String> columnTypes = DEFAULT_COLUMN_TYPES;
-    private Storage.Scheme storageScheme = Storage.Scheme.file;
+    private List<String> columnNames;
+    private List<String> columnTypes;
+    private Storage.Scheme storageScheme;
     private SnapshotRuntime snapshotRuntime;
     private SnapshotManifest.TableState snapshotTable;
     private boolean seedBuffers;
@@ -139,28 +116,29 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         }
 
         ConfigFactory pixelsConfig = ConfigFactory.Instance();
-        if (benchmarkConfig.options().containsKey("snapshot-dir"))
+        this.snapshotRuntime = SnapshotRuntime.open(benchmarkConfig);
+        this.snapshotTable = selectSnapshotTable(snapshotRuntime, benchmarkConfig);
+        this.snapshotRuntime.prepareFreshWriteBufferState();
+        this.snapshotTimestamp = snapshotRuntime.manifest().snapshotTimestamp;
+        if (snapshotTimestamp < 0 || snapshotTimestamp >= MAX_NATIVE_TIMESTAMP)
         {
-            this.snapshotRuntime = SnapshotRuntime.open(benchmarkConfig);
-            this.snapshotRuntime.prepareFreshWriteBufferState();
-            this.snapshotTable = selectSnapshotTable(snapshotRuntime, benchmarkConfig);
-            this.snapshotTimestamp = Math.max(snapshotRuntime.manifest().snapshotTimestamp,
-                    snapshotTable.maxObservedCreateTimestamp);
-            List<String> names = new ArrayList<>(snapshotTable.columns.size());
-            List<String> types = new ArrayList<>(snapshotTable.columns.size());
-            for (SnapshotManifest.ColumnState column : snapshotTable.columns)
-            {
-                names.add(column.name);
-                types.add(column.type);
-            }
-            this.columnNames = Collections.unmodifiableList(names);
-            this.columnTypes = Collections.unmodifiableList(types);
+            throw new IllegalArgumentException("snapshotTimestamp must be in [0,"
+                    + (MAX_NATIVE_TIMESTAMP - 1L) + "] for WriteBuffer benchmarking: "
+                    + snapshotTimestamp);
         }
+        List<String> names = new ArrayList<>(snapshotTable.columns.size());
+        List<String> types = new ArrayList<>(snapshotTable.columns.size());
+        for (SnapshotManifest.ColumnState column : snapshotTable.columns)
+        {
+            names.add(column.name);
+            types.add(column.type);
+        }
+        this.columnNames = Collections.unmodifiableList(names);
+        this.columnTypes = Collections.unmodifiableList(types);
         this.schemaName = option(benchmarkConfig, "writebuffer-schema",
                 "retina_bench_" + UUID.randomUUID().toString().replace("-", ""));
-        String defaultStorageScheme = snapshotTable == null ? "file" : snapshotTable.storageScheme;
         this.storageScheme = Storage.Scheme.from(option(benchmarkConfig,
-                "writebuffer-storage-scheme", defaultStorageScheme));
+                "writebuffer-storage-scheme", snapshotTable.storageScheme));
 
         applyOptionalPositiveInt(pixelsConfig, benchmarkConfig,
                 "writebuffer-memtable-size", "retina.buffer.memTable.size", true);
@@ -187,7 +165,7 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         }
 
         String objectFolder = option(benchmarkConfig, "writebuffer-object-folder", null);
-        if (objectFolder == null && snapshotRuntime != null)
+        if (objectFolder == null)
         {
             if (storageScheme != Storage.Scheme.file)
             {
@@ -210,7 +188,7 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         {
             pixelsConfig.addProperty("retina.buffer.object.storage.scheme", objectScheme);
         }
-        else if (snapshotRuntime == null || storageScheme == Storage.Scheme.file)
+        else if (storageScheme == Storage.Scheme.file)
         {
             pixelsConfig.addProperty("retina.buffer.object.storage.scheme", storageScheme.name());
         }
@@ -242,9 +220,8 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         String defaultBaseUri = null;
         if (storageScheme == Storage.Scheme.file)
         {
-            defaultBaseUri = snapshotRuntime == null
-                    ? "file:///tmp/pixels-retina-benchmark/data/" + schemaName
-                    : snapshotRuntime.workDirectory().resolve("write-buffer/data").toUri().toString();
+            defaultBaseUri = snapshotRuntime.workDirectory()
+                    .resolve("write-buffer/data").toUri().toString();
         }
         this.baseUri = option(benchmarkConfig, "writebuffer-base-uri", defaultBaseUri);
         if (baseUri == null)
@@ -252,15 +229,9 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
             throw new IllegalArgumentException("--writebuffer-base-uri is required for non-file storage; "
                     + "use a dedicated writable benchmark prefix, never a source snapshot path");
         }
-        if (snapshotRuntime != null)
-        {
-            rejectProductionDestination("writebuffer-base-uri", baseUri,
-                    snapshotTable.productionOrderedPathUri,
-                    snapshotTable.productionCompactPathUri);
-            rejectProductionDestination("writebuffer-object-folder", objectFolder,
-                    snapshotRuntime.manifest().effectiveConfig.get(
-                            "retina.buffer.object.storage.folder"));
-        }
+        rejectProductionDestination("writebuffer-base-uri", baseUri,
+                snapshotTable.productionOrderedPathUri,
+                snapshotTable.productionCompactPathUri);
         this.retinaHostName = option(benchmarkConfig, "writebuffer-host-name", "benchmark");
         this.dropSchema = Boolean.parseBoolean(option(benchmarkConfig,
                 "writebuffer-drop-schema", "false"));
@@ -271,8 +242,7 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
                     + storageScheme);
         }
         ensureStorageSchemeEnabled(pixelsConfig, storageScheme);
-        this.seedBuffers = benchmarkConfig.getBoolean("writebuffer-seed-buffers",
-                snapshotRuntime != null);
+        this.seedBuffers = benchmarkConfig.getBoolean("writebuffer-seed-buffers", true);
 
         int requestedPoolSize = positiveIntOption(benchmarkConfig,
                 "writebuffer-row-pool-size", DEFAULT_ROW_POOL_SIZE);
@@ -281,33 +251,7 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         {
             throw new IllegalArgumentException("invalid write-buffer row pool size: " + boundedPoolSize);
         }
-        if (snapshotRuntime == null)
-        {
-            this.rowPool = buildSyntheticRows((int) boundedPoolSize);
-        }
-        else
-        {
-            if (snapshotTable.rowSamplesFile == null || snapshotTable.rowSampleCount <= 0)
-            {
-                throw new IllegalArgumentException("snapshot table has no row samples; export with "
-                        + "--snapshot-row-samples at least " + boundedPoolSize);
-            }
-            if (snapshotTable.rowSampleCount < boundedPoolSize)
-            {
-                throw new IllegalArgumentException("snapshot table contains only "
-                        + snapshotTable.rowSampleCount + " row samples, but the requested "
-                        + "--writebuffer-row-pool-size requires " + boundedPoolSize
-                        + "; export more samples or reduce the pool size");
-            }
-            List<RowSample> samples = SnapshotIO.readRowSamples(
-                    snapshotRuntime.resolveArtifact(snapshotTable.rowSamplesFile),
-                    columnNames.size(), Math.min(boundedPoolSize, snapshotTable.rowSampleCount));
-            this.rowPool = new byte[samples.size()][][];
-            for (int i = 0; i < samples.size(); i++)
-            {
-                this.rowPool[i] = samples.get(i).columns;
-            }
-        }
+        this.rowPool = buildSnapshotRows((int) boundedPoolSize, snapshotTable);
 
         /* Must happen before RetinaResourceManager/RGVisibility initialization. */
         NativeRuntime.prepareRetinaLibrary();
@@ -374,9 +318,8 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
             closePrefix(buffers, created);
             throw e;
         }
-        long timestampFloor = Math.max(1_000_000L,
-                Math.addExact(snapshotTimestamp,
-                        Math.addExact((long) config.clients(), 1L)));
+        long timestampFloor = Math.addExact(snapshotTimestamp,
+                Math.addExact((long) config.clients(), 1L));
         long phaseSpan = Math.max(1L,
                 Math.addExact(config.dataSize(), (long) config.clients()));
         long timestampBase = Math.addExact(timestampFloor,
@@ -534,11 +477,11 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         details.put("node_virtual_num", ConfigFactory.Instance().getProperty("node.virtual.num"));
         details.put("native_compiled_tile_capacity", Integer.toString(nativeTileCapacity));
         details.put("storage", storageScheme == null ? "unknown" : storageScheme.name());
-        details.put("snapshot_mode", Boolean.toString(snapshotRuntime != null));
+        details.put("snapshot_mode", "true");
         details.put("snapshot_table", snapshotTable == null ? "none"
                 : snapshotTable.schemaName + "." + snapshotTable.tableName);
-        details.put("snapshot_initialization", snapshotRuntime == null ? "synthetic TPCH-like rows"
-                : "source schema + canonical row samples + effective WriteBuffer/Pixels config; fresh buffer state");
+        details.put("snapshot_initialization",
+                "source schema + deterministic type-valid rows + semantic WriteBuffer/Pixels config; fresh buffer state");
         details.put("seed_buffers", Boolean.toString(seedBuffers));
         details.put("seed_timing", "one real addRow per buffer outside timed phase when enabled");
         details.put("seed_rows", Long.toString(seededRows.get()));
@@ -718,24 +661,95 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         return columns;
     }
 
-    private static byte[][][] buildSyntheticRows(int count)
+    private static byte[][][] buildSnapshotRows(int count,
+                                                SnapshotManifest.TableState table)
     {
-        byte[][][] rows = new byte[count][][];
-        for (int i = 0; i < count; i++)
+        List<TypeDescription> types = new ArrayList<>(table.columns.size());
+        for (SnapshotManifest.ColumnState column : table.columns)
         {
-            rows[i] = new byte[4][];
-            rows[i][0] = longBytes(i);
-            rows[i][1] = ("NATION_" + i).getBytes(StandardCharsets.UTF_8);
-            rows[i][2] = longBytes(i % 25L);
-            rows[i][3] = ("Retina benchmark update record " + i
-                    + " with a real four-column TPCH-like schema").getBytes(StandardCharsets.UTF_8);
+            TypeDescription type = TypeDescription.fromString(column.type);
+            switch (type.getCategory())
+            {
+                case STRUCT:
+                case VECTOR:
+                    throw new IllegalArgumentException("snapshot WriteBuffer row generation does not "
+                            + "support " + type.getCategory() + " column "
+                            + table.schemaName + "." + table.tableName + "." + column.name);
+                default:
+                    types.add(type);
+            }
+        }
+
+        byte[][][] rows = new byte[count][table.columns.size()][];
+        for (int row = 0; row < count; row++)
+        {
+            for (int column = 0; column < types.size(); column++)
+            {
+                rows[row][column] = deterministicValue(types.get(column), row, column);
+            }
         }
         return rows;
     }
 
-    private static byte[] longBytes(long value)
+    private static byte[] deterministicValue(TypeDescription type, int row, int column)
     {
-        return ByteBuffer.allocate(Long.BYTES).putLong(value).array();
+        long seed = (long) row * 131L + column;
+        String value;
+        switch (type.getCategory())
+        {
+            case BOOLEAN:
+                value = (seed & 1L) == 0L ? "false" : "true";
+                break;
+            case BYTE:
+                return new byte[]{(byte) (seed % Byte.MAX_VALUE)};
+            case SHORT:
+                value = Short.toString((short) (seed % Short.MAX_VALUE));
+                break;
+            case INT:
+                value = Integer.toString((int) (seed % Integer.MAX_VALUE));
+                break;
+            case LONG:
+                value = Long.toString(seed);
+                break;
+            case FLOAT:
+            case DOUBLE:
+                value = Long.toString(seed) + ".25";
+                break;
+            case DECIMAL:
+                value = Long.toString(seed % 9L);
+                break;
+            case DATE:
+                value = String.format("2000-01-%02d", (seed % 28L) + 1L);
+                break;
+            case TIME:
+                value = String.format("00:00:%02d", seed % 60L);
+                break;
+            case TIMESTAMP:
+                value = String.format("2000-01-01 00:00:%02d", seed % 60L);
+                break;
+            case CHAR:
+            case VARCHAR:
+            case BINARY:
+            case VARBINARY:
+                value = boundedText("r" + Long.toString(seed, 36), type.getMaxLength());
+                break;
+            case STRING:
+                value = "r" + Long.toString(seed, 36);
+                break;
+            default:
+                throw new IllegalArgumentException("unsupported deterministic row type: "
+                        + type.getCategory());
+        }
+        return type.convertSqlStringToByte(value);
+    }
+
+    private static String boundedText(String value, int maximumLength)
+    {
+        if (maximumLength <= 0)
+        {
+            throw new IllegalArgumentException("snapshot schema contains a non-positive text/binary length");
+        }
+        return value.length() <= maximumLength ? value : value.substring(0, maximumLength);
     }
 
     private static void createFileDirectory(String uri) throws Exception

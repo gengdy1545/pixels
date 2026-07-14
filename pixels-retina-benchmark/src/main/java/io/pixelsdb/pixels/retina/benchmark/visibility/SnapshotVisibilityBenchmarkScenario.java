@@ -11,7 +11,6 @@
 package io.pixelsdb.pixels.retina.benchmark.visibility;
 
 import io.pixelsdb.pixels.common.exception.RetinaException;
-import io.pixelsdb.pixels.common.utils.CheckpointFileIO;
 import io.pixelsdb.pixels.common.utils.ConfigFactory;
 import io.pixelsdb.pixels.index.IndexProto;
 import io.pixelsdb.pixels.retina.RGVisibility;
@@ -24,14 +23,9 @@ import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkWorker;
 import io.pixelsdb.pixels.retina.benchmark.common.OperationRange;
 import io.pixelsdb.pixels.retina.benchmark.common.OperationResult;
 import io.pixelsdb.pixels.retina.benchmark.runtime.NativeRuntime;
-import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotIO;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotManifest;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotRuntime;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.LinkOption;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collections;
@@ -39,20 +33,14 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Visibility-delete throughput benchmark restored from a Retina snapshot.
+ * Visibility-delete throughput benchmark built from a Retina snapshot manifest.
  *
  * <p>The measured operation begins at the same local module boundary used by
  * Retina after an old primary-index version supplies a physical location:</p>
@@ -70,30 +58,19 @@ import java.util.concurrent.atomic.AtomicReference;
  * so the timed loop invokes this real local call directly.  Transaction,
  * Index and WriteBuffer operations are not executed.</p>
  *
- * <p>When {@code snapshot.json} declares a Visibility checkpoint, every phase
- * restores it through the production checkpoint reader:</p>
- *
- * <pre>
- * CheckpointFileIO.readCheckpointParallel
- *   -&gt; RetinaResourceManager.addVisibility(fileId, rgId, recordNum,
- *                                           snapshotTimestamp, bitmap, true)
- * </pre>
- *
- * <p>Manifest row groups not represented by the checkpoint are initialized
- * through the real clean-state API using the footer's {@code recordNum}.  If
- * the manifest declares no checkpoint, every row group uses that clean path.
- * The row-group topology mirrors {@code RetinaServerImpl} startup: for every
+ * <p>Every phase initializes every selected manifest row group through the real
+ * clean-state API using the footer's {@code recordNum}.  The row-group topology
+ * mirrors {@code RetinaServerImpl} startup: for every
  * readable layout it loads files only from {@code orderedPaths.get(0)} and
  * {@code compactPaths.get(0)}.  The snapshot manifest records precisely those
  * paths with {@code productionSelectedByRetina=true}; secondary and projection
  * paths are excluded.
- * Restore, request construction, verification and native-object cleanup all
+ * Baseline construction, request construction, verification and native-object cleanup all
  * run outside the measured interval.  Warmup and measurement use disjoint
- * physical rows and each phase starts from a fresh restore.</p>
+ * physical rows and each phase starts from a fresh clean baseline.</p>
  */
 public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScenario
 {
-    private static final String VISIBILITY_CHECKPOINT = "state/visibility/gc-checkpoint.bin";
     /** TileVisibility stores transaction timestamps in 48 bits. */
     private static final long MAX_NATIVE_TIMESTAMP = (1L << 48) - 1L;
 
@@ -105,29 +82,15 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
     private SnapshotManifest manifest;
     private SnapshotManifest.TableState table;
     private RetinaResourceManager resourceManager;
-    private ExecutorService checkpointReaderExecutor;
-    private Path checkpointPath;
-    private String checkpointUri;
-    private boolean checkpointIncluded;
-    private int checkpointEntryCount;
-    private int checkpointTableEntryCount;
     private int tileCapacity;
     private int nativeTileCapacity;
     private long deleteTimestamp;
     private long warmupOperationCount;
     private long manifestRowCount;
     private int productionSelectedPathCount;
-    private long invalidTimestampSamples;
-    private long duplicateLocationSamples;
-    private int measurementIndexSamples;
-    private int warmupIndexSamples;
     private long lastValidatedDeletes;
-    private int lastCheckpointRestores;
-    private int lastCleanRestores;
 
     private List<RowGroupSpec> rowGroups;
-    private Map<RowGroupKey, RowGroupSpec> rowGroupsByKey;
-    private Set<RowGroupKey> checkpointRowGroups = Collections.emptySet();
     private PreparedDelete[] warmupDeletes;
     private PreparedDelete[] measurementDeletes;
     private PhaseExecution activePhase;
@@ -153,7 +116,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         validatePlatformAndTimestamp();
         configureRuntime();
 
-        /* The checkpoint's tile layout is a native compile-time contract. */
+        /* Tile layout is a native compile-time contract. */
         NativeRuntime.prepareRetinaLibrary();
         try
         {
@@ -172,17 +135,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         }
 
         buildRowGroupTopology();
-        configureCheckpoint();
-
-        CheckpointScan checkpoint = checkpointIncluded
-                ? scanCheckpoint()
-                : new CheckpointScan(0, Collections.<RowGroupKey, CheckpointState>emptyMap());
-        this.checkpointEntryCount = checkpoint.totalEntries;
-        this.checkpointTableEntryCount = checkpoint.entries.size();
-        this.checkpointRowGroups = Collections.unmodifiableSet(
-                new LinkedHashSet<>(checkpoint.entries.keySet()));
-
-        prepareOperationData(checkpoint.entries);
+        prepareOperationData();
 
         this.resourceManager = RetinaResourceManager.Instance();
     }
@@ -206,12 +159,10 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         Exception failure = null;
         try
         {
-            /* A benchmark JVM owns these restored objects; remove any stale phase first. */
+            /* A benchmark JVM owns these native objects; remove any stale phase first. */
             cleanupAllRowGroups();
-            restoreVisibility(execution);
+            initializeCleanBaseline();
             this.activePhase = execution;
-            this.lastCheckpointRestores = execution.restoredFromCheckpoint.size();
-            this.lastCleanRestores = execution.cleanRestores;
         }
         catch (Exception e)
         {
@@ -316,31 +267,16 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
                 Integer.toString(productionSelectedPathCount));
         details.put("visibilityRGScope", "readable layouts; only orderedPaths[0]/compactPaths[0] "
                 + "marked productionSelectedByRetina; projections and secondary paths excluded");
-        details.put("checkpointDeclared", Boolean.toString(checkpointIncluded));
-        details.put("checkpointPath", checkpointPath == null ? "none" : checkpointPath.toString());
-        details.put("checkpointEntries", Integer.toString(checkpointEntryCount));
-        details.put("checkpointEntriesForTable", Integer.toString(checkpointTableEntryCount));
-        details.put("checkpointType", manifest == null ? "none"
-                : String.valueOf(manifest.visibilityCheckpointType));
-        details.put("checkpointCoverage", manifest == null ? "0/0"
-                : manifest.visibilityCheckpointMatchedEntryCount + "/"
-                + manifest.visibilityCheckpointExpectedEntryCount);
-        details.put("restore", checkpointIncluded
-                ? "CheckpointFileIO.readCheckpointParallel -> addVisibility(snapshotTimestamp,bitmap,true); missing RGs use footer clean baseline"
-                : "footer recordNum -> addVisibility(fileId,rgId,recordNum,0,null,false)");
-        details.put("lastCheckpointRGRestores", Integer.toString(lastCheckpointRestores));
-        details.put("lastCleanRGRestores", Integer.toString(lastCleanRestores));
-        details.put("measurementIndexSampleLocations", Integer.toString(measurementIndexSamples));
-        details.put("warmupIndexSampleLocations", Integer.toString(warmupIndexSamples));
-        details.put("indexSamplesSkippedNewerThanSnapshot", Long.toString(invalidTimestampSamples));
-        details.put("indexSampleDuplicateLocations", Long.toString(duplicateLocationSamples));
-        details.put("warmupMeasurementRows", "disjoint; each phase restores the same base state");
+        details.put("baseline",
+                "manifest file/RG recordNum -> addVisibility(fileId,rgId,recordNum,0,null,false)");
+        details.put("deleteTargets", "distinct rows from manifest file/RG recordNum");
+        details.put("warmupMeasurementRows", "disjoint; each phase rebuilds the same clean baseline");
         details.put("logicalOperation", "one unique physical-row deletion; one local API/JNI call");
-        details.put("transactionTimestamp", "one constant real timestamp per restored phase");
+        details.put("transactionTimestamp", "one constant real timestamp per clean phase");
         details.put("gc", "retina.gc.interval=0, retina.storage.gc.enabled=false");
         details.put("postRunValidation", "queryVisibility checks every successful delete outside timing");
         details.put("lastValidatedDeletes", Long.toString(lastValidatedDeletes));
-        details.put("nativeCleanup", "all restored RGs reclaimed after every phase");
+        details.put("nativeCleanup", "all initialized RGs reclaimed after every phase");
         details.put("excludedModules", "Transaction, Index mutation, WriteBuffer and Visibility RPC");
         String error = firstDeleteError.get();
         if (error != null)
@@ -368,25 +304,6 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
             catch (Exception e)
             {
                 first = e;
-            }
-        }
-        if (checkpointReaderExecutor != null)
-        {
-            checkpointReaderExecutor.shutdownNow();
-            try
-            {
-                if (!checkpointReaderExecutor.awaitTermination(5, TimeUnit.SECONDS))
-                {
-                    IOException timeout = new IOException("checkpoint reader executor did not terminate");
-                    if (first == null) first = timeout;
-                    else first.addSuppressed(timeout);
-                }
-            }
-            catch (InterruptedException e)
-            {
-                Thread.currentThread().interrupt();
-                if (first == null) first = e;
-                else first.addSuppressed(e);
             }
         }
         if (snapshotRuntime != null)
@@ -417,23 +334,18 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
             throw new IllegalStateException("the real Retina visibility JNI library is Linux-only; found "
                     + System.getProperty("os.name"));
         }
-        if (manifest.snapshotTimestamp < 0 || manifest.snapshotTimestamp > MAX_NATIVE_TIMESTAMP)
+        long baselineTimestamp = manifest.physicalIndexStateIncluded
+                ? manifest.snapshotTimestamp : 0L;
+        if (baselineTimestamp < 0 || baselineTimestamp > MAX_NATIVE_TIMESTAMP)
         {
             throw new IllegalArgumentException("snapshotTimestamp is outside Retina's 48-bit range: "
-                    + manifest.snapshotTimestamp);
+                    + baselineTimestamp);
         }
-        if (table.maxObservedCreateTimestamp < 0
-                || table.maxObservedCreateTimestamp > MAX_NATIVE_TIMESTAMP)
-        {
-            throw new IllegalArgumentException("sampled create timestamp is outside Retina's 48-bit range: "
-                    + table.maxObservedCreateTimestamp);
-        }
-        long base = Math.max(manifest.snapshotTimestamp, table.maxObservedCreateTimestamp);
-        if (base >= MAX_NATIVE_TIMESTAMP)
+        if (baselineTimestamp >= MAX_NATIVE_TIMESTAMP)
         {
             throw new IllegalArgumentException("snapshot leaves no 48-bit transaction timestamp for deletes");
         }
-        this.deleteTimestamp = base + 1L;
+        this.deleteTimestamp = baselineTimestamp + 1L;
 
         this.warmupOperationCount = config.warmupSeconds() > 0 && config.warmupOperations() > 0
                 ? config.warmupOperations() : 0L;
@@ -445,44 +357,37 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         }
     }
 
-    private void configureRuntime() throws IOException
+    private void configureRuntime()
     {
-        snapshotRuntime.applyAllConfig();
         ConfigFactory pixels = ConfigFactory.Instance();
-
-        /* The copied checkpoint is always a local file, independent of source storage. */
-        pixels.addProperty("enabled.storage.schemes",
-                includeScheme(pixels.getProperty("enabled.storage.schemes"), "file"));
-        pixels.addProperty("localfs.enable.direct.io", "false");
-        pixels.addProperty("localfs.enable.mmap", "false");
-        pixels.addProperty("localfs.enable.async.io", "false");
-        if (pixels.getProperty("localfs.block.size") == null)
+        String enabledStorageSchemes = manifest.semanticConfig.get("enabled.storage.schemes");
+        if (enabledStorageSchemes != null)
         {
-            pixels.addProperty("localfs.block.size", "4096");
+            pixels.addProperty("enabled.storage.schemes", enabledStorageSchemes);
         }
-        if (pixels.getProperty("localfs.reader.threads") == null)
+        String virtualNodes = manifest.semanticConfig.get("node.virtual.num");
+        if (virtualNodes != null)
         {
-            pixels.addProperty("localfs.reader.threads", Integer.toString(Math.max(1, config.threads())));
+            pixels.addProperty("node.virtual.num", virtualNodes);
+        }
+        String visibilityCapacity =
+                manifest.semanticConfig.get("retina.tile.visibility.capacity");
+        if (visibilityCapacity != null)
+        {
+            pixels.addProperty("retina.tile.visibility.capacity", visibilityCapacity);
         }
 
         /* Background mutation would change the target while it is measured. */
         pixels.addProperty("retina.gc.interval", "0");
         pixels.addProperty("retina.storage.gc.enabled", "false");
-        int checkpointThreads = positiveOrDefault(
-                pixels.getProperty("retina.checkpoint.threads"), Math.max(1, config.clients()));
-        pixels.addProperty("retina.checkpoint.threads", Integer.toString(checkpointThreads));
         if (pixels.getProperty("node.virtual.num") == null)
         {
             pixels.addProperty("node.virtual.num", "1");
         }
-        Path scratchCheckpoint = snapshotRuntime.workDirectory().resolve("visibility-checkpoints");
-        Files.createDirectories(scratchCheckpoint);
-        pixels.addProperty("retina.checkpoint.dir", scratchCheckpoint.toUri().toString());
-
-        String manifestCapacity = manifest.effectiveConfig.get("retina.tile.visibility.capacity");
+        String manifestCapacity = manifest.semanticConfig.get("retina.tile.visibility.capacity");
         if (manifestCapacity == null || manifestCapacity.trim().isEmpty())
         {
-            throw new IllegalArgumentException("snapshot effectiveConfig lacks "
+            throw new IllegalArgumentException("snapshot semanticConfig lacks "
                     + "retina.tile.visibility.capacity");
         }
         this.tileCapacity = Integer.parseInt(manifestCapacity);
@@ -496,15 +401,6 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         {
             throw new IllegalStateException("snapshot visibility benchmark requires both GC mechanisms disabled");
         }
-
-        AtomicInteger threadIds = new AtomicInteger();
-        this.checkpointReaderExecutor = Executors.newFixedThreadPool(checkpointThreads, runnable ->
-        {
-            Thread thread = new Thread(runnable,
-                    "snapshot-visibility-checkpoint-reader-" + threadIds.getAndIncrement());
-            thread.setDaemon(true);
-            return thread;
-        });
     }
 
     private void buildRowGroupTopology()
@@ -609,106 +505,10 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         selected.sort(Comparator.comparingLong((RowGroupSpec value) -> value.key.fileId)
                 .thenComparingInt(value -> value.key.rgId));
         this.rowGroups = Collections.unmodifiableList(selected);
-        this.rowGroupsByKey = Collections.unmodifiableMap(byKey);
         this.manifestRowCount = rows;
     }
 
-    private void configureCheckpoint() throws IOException
-    {
-        this.checkpointIncluded = manifest.visibilityCheckpointIncluded;
-        if (checkpointIncluded)
-        {
-            /* resolveArtifact also requires the exporter checksum declaration. */
-            this.checkpointPath = snapshotRuntime.resolveArtifact(VISIBILITY_CHECKPOINT);
-        }
-        else
-        {
-            Path undeclared = snapshotRuntime.snapshotDirectory()
-                    .resolve(VISIBILITY_CHECKPOINT).normalize();
-            if (Files.exists(undeclared, LinkOption.NOFOLLOW_LINKS))
-            {
-                throw new IOException("snapshot contains an undeclared Visibility checkpoint: "
-                        + undeclared + "; regenerate snapshot.json");
-            }
-        }
-        if (checkpointIncluded)
-        {
-            if (!manifest.sourceQuiesced)
-            {
-                throw new IllegalArgumentException("Visibility checkpoint restore requires sourceQuiesced=true");
-            }
-            if (manifest.snapshotTimestamp <= 0)
-            {
-                throw new IllegalArgumentException("Visibility checkpoint restore requires a positive snapshotTimestamp");
-            }
-            this.checkpointUri = checkpointPath.toUri().toString();
-        }
-        else
-        {
-            this.checkpointPath = null;
-            this.checkpointUri = null;
-        }
-    }
-
-    private CheckpointScan scanCheckpoint() throws IOException
-    {
-        ConcurrentHashMap<RowGroupKey, CheckpointState> entries = new ConcurrentHashMap<>();
-        AtomicReference<RuntimeException> failure = new AtomicReference<>();
-        int count = CheckpointFileIO.readCheckpointParallel(checkpointUri, entry ->
-        {
-            RowGroupKey key = new RowGroupKey(entry.fileId, entry.rgId);
-            RowGroupSpec spec = rowGroupsByKey.get(key);
-            if (spec == null || failure.get() != null)
-            {
-                return;
-            }
-            try
-            {
-                validateCheckpointEntry(spec, entry);
-                CheckpointState previous = entries.putIfAbsent(key,
-                        new CheckpointState(entry.recordNum, entry.bitmap));
-                if (previous != null)
-                {
-                    throw new IllegalArgumentException("duplicate checkpoint row group: " + key);
-                }
-            }
-            catch (RuntimeException e)
-            {
-                failure.compareAndSet(null, e);
-            }
-        }, checkpointReaderExecutor);
-        if (count < 0)
-        {
-            throw new IOException("invalid negative checkpoint entry count: " + count);
-        }
-        if (failure.get() != null)
-        {
-            throw new IOException("invalid Visibility checkpoint", failure.get());
-        }
-        return new CheckpointScan(count, entries);
-    }
-
-    private void validateCheckpointEntry(RowGroupSpec spec, CheckpointFileIO.CheckpointEntry entry)
-    {
-        if (entry.fileId != spec.key.fileId || entry.rgId != spec.key.rgId)
-        {
-            throw new IllegalArgumentException("checkpoint callback location mismatch");
-        }
-        if (entry.recordNum < spec.recordNum)
-        {
-            throw new IllegalArgumentException("checkpoint recordNum is smaller than footer for "
-                    + spec.key + ": " + entry.recordNum + " < " + spec.recordNum);
-        }
-        long tileCount = (entry.recordNum + (long) tileCapacity - 1L) / tileCapacity;
-        long requiredWords = tileCount * (tileCapacity / 64L);
-        if (entry.bitmap.length < requiredWords)
-        {
-            throw new IllegalArgumentException("checkpoint bitmap is too short for " + spec.key
-                    + ": " + entry.bitmap.length + " < " + requiredWords);
-        }
-    }
-
-    private void prepareOperationData(Map<RowGroupKey, CheckpointState> checkpoint) throws Exception
+    private void prepareOperationData() throws Exception
     {
         int measurementRequired = Math.toIntExact(config.dataSize());
         int warmupRequired = Math.toIntExact(warmupOperationCount);
@@ -717,75 +517,8 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         Set<LocationKey> reserved = new HashSet<>(initialHashCapacity(
                 Math.addExact(measurementRequired, warmupRequired)));
 
-        if (table.indexSamplesFile != null && table.indexSampleCount > 0)
-        {
-            Path samplesPath = snapshotRuntime.resolveArtifact(table.indexSamplesFile);
-            long sampleCount = SnapshotIO.validateIndexSamples(samplesPath);
-            if (sampleCount != table.indexSampleCount)
-            {
-                throw new IOException("index sample count does not match snapshot manifest: "
-                        + sampleCount + " != " + table.indexSampleCount);
-            }
-            SnapshotIO.scanIndexSamples(samplesPath, sample ->
-            {
-                RowGroupKey rgKey = new RowGroupKey(sample.fileId, sample.rgId);
-                RowGroupSpec spec = rowGroupsByKey.get(rgKey);
-                if (spec == null)
-                {
-                    throw new IllegalArgumentException("index sample points outside the Visibility topology: "
-                            + rgKey);
-                }
-                if (sample.key == null || sample.key.length == 0
-                        || sample.rgRowOffset < 0 || sample.rgRowOffset >= spec.recordNum)
-                {
-                    throw new IllegalArgumentException("index sample has an invalid real RowLocation: "
-                            + rgKey + ", offset=" + sample.rgRowOffset);
-                }
-                if (sample.createTimestamp < 0)
-                {
-                    throw new IllegalArgumentException("index sample has a negative create timestamp at "
-                            + rgKey + ", offset=" + sample.rgRowOffset);
-                }
-                LocationKey location = new LocationKey(sample.fileId, sample.rgId,
-                        sample.rgRowOffset);
-                if (sample.createTimestamp > manifest.snapshotTimestamp)
-                {
-                    /* Do not let deterministic fallback reuse this known future row. */
-                    reserved.add(location);
-                    invalidTimestampSamples++;
-                    return true;
-                }
-                if (isInitiallyDeleted(checkpoint.get(rgKey), sample.rgRowOffset))
-                {
-                    return true;
-                }
-                if (!reserved.add(location))
-                {
-                    duplicateLocationSamples++;
-                    return true;
-                }
-                PreparedDelete delete = preparedDelete(spec, sample.rgRowOffset);
-                if (measurement.size() < measurementRequired)
-                {
-                    measurement.add(delete);
-                    measurementIndexSamples++;
-                }
-                else if (warmup.size() < warmupRequired)
-                {
-                    warmup.add(delete);
-                    warmupIndexSamples++;
-                }
-                else
-                {
-                    return false;
-                }
-                return measurement.size() < measurementRequired
-                        || warmup.size() < warmupRequired;
-            });
-        }
-
-        fillFromManifest(measurement, measurementRequired, reserved, checkpoint);
-        fillFromManifest(warmup, warmupRequired, reserved, checkpoint);
+        fillFromManifest(measurement, measurementRequired, reserved);
+        fillFromManifest(warmup, warmupRequired, reserved);
         if (measurement.size() != measurementRequired || warmup.size() != warmupRequired)
         {
             throw new IllegalArgumentException("snapshot has only "
@@ -800,8 +533,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
 
     /** Round-robin RG traversal avoids creating an artificial single-RG hot spot. */
     private void fillFromManifest(List<PreparedDelete> target, int required,
-                                  Set<LocationKey> reserved,
-                                  Map<RowGroupKey, CheckpointState> checkpoint)
+                                  Set<LocationKey> reserved)
     {
         if (target.size() >= required)
         {
@@ -816,8 +548,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         {
             for (RowGroupSpec spec : rowGroups)
             {
-                if (offset >= spec.recordNum
-                        || isInitiallyDeleted(checkpoint.get(spec.key), offset))
+                if (offset >= spec.recordNum)
                 {
                     continue;
                 }
@@ -835,63 +566,13 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         }
     }
 
-    private void restoreVisibility(PhaseExecution execution) throws Exception
+    private void initializeCleanBaseline()
     {
-        if (checkpointIncluded)
-        {
-            AtomicReference<RuntimeException> failure = new AtomicReference<>();
-            int count = CheckpointFileIO.readCheckpointParallel(checkpointUri, entry ->
-            {
-                RowGroupKey key = new RowGroupKey(entry.fileId, entry.rgId);
-                RowGroupSpec spec = rowGroupsByKey.get(key);
-                if (spec == null || failure.get() != null)
-                {
-                    return;
-                }
-                try
-                {
-                    validateCheckpointEntry(spec, entry);
-                    if (!execution.restoredFromCheckpoint.add(key))
-                    {
-                        throw new IllegalArgumentException("duplicate checkpoint row group: " + key);
-                    }
-                    /* Exact production recovery shape from recoverCheckpoints(). */
-                    resourceManager.addVisibility(entry.fileId, entry.rgId, entry.recordNum,
-                            manifest.snapshotTimestamp, entry.bitmap, true);
-                }
-                catch (RuntimeException e)
-                {
-                    failure.compareAndSet(null, e);
-                }
-            }, checkpointReaderExecutor);
-            if (failure.get() != null)
-            {
-                throw failure.get();
-            }
-            if (count < 0)
-            {
-                throw new IOException("invalid negative checkpoint entry count: " + count);
-            }
-            if (count != checkpointEntryCount)
-            {
-                throw new IOException("Visibility checkpoint changed after setup: entries="
-                        + count + ", expected=" + checkpointEntryCount);
-            }
-            if (!execution.restoredFromCheckpoint.equals(checkpointRowGroups))
-            {
-                throw new IOException("Visibility checkpoint table RG set changed after setup");
-            }
-        }
-
         for (RowGroupSpec spec : rowGroups)
         {
-            if (!execution.restoredFromCheckpoint.contains(spec.key))
-            {
-                /* Exact clean initialization shape used by addVisibility(filePath). */
-                resourceManager.addVisibility(spec.key.fileId, spec.key.rgId,
-                        spec.recordNum, 0L, null, false);
-                execution.cleanRestores++;
-            }
+            /* Exact clean initialization shape used by addVisibility(filePath). */
+            resourceManager.addVisibility(spec.key.fileId, spec.key.rgId,
+                    spec.recordNum, 0L, null, false);
         }
     }
 
@@ -1022,43 +703,6 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         return new PreparedDelete(spec.key, offset, location);
     }
 
-    private static boolean isInitiallyDeleted(CheckpointState checkpoint, int offset)
-    {
-        if (checkpoint == null)
-        {
-            return false;
-        }
-        int word = offset >>> 6;
-        return word < checkpoint.bitmap.length
-                && (checkpoint.bitmap[word] & (1L << (offset & 63))) != 0L;
-    }
-
-    private static String includeScheme(String configured, String required)
-    {
-        if (configured == null || configured.trim().isEmpty())
-        {
-            return required;
-        }
-        for (String scheme : configured.split(","))
-        {
-            if (required.equalsIgnoreCase(scheme.trim()))
-            {
-                return configured;
-            }
-        }
-        return configured + "," + required;
-    }
-
-    private static int positiveOrDefault(String configured, int defaultValue)
-    {
-        if (configured == null || configured.trim().isEmpty())
-        {
-            return defaultValue;
-        }
-        int parsed = Integer.parseInt(configured);
-        return parsed > 0 ? parsed : defaultValue;
-    }
-
     private static int initialHashCapacity(int elements)
     {
         if (elements < 3)
@@ -1164,8 +808,6 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         private final BenchmarkPhase phase;
         private final PreparedDelete[] operations;
         private final List<SnapshotVisibilityWorker> workers = new ArrayList<>();
-        private final Set<RowGroupKey> restoredFromCheckpoint = ConcurrentHashMap.newKeySet();
-        private int cleanRestores;
 
         private PhaseExecution(BenchmarkPhase phase, PreparedDelete[] operations)
         {
@@ -1298,27 +940,4 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         }
     }
 
-    private static final class CheckpointState
-    {
-        private final int recordNum;
-        private final long[] bitmap;
-
-        private CheckpointState(int recordNum, long[] bitmap)
-        {
-            this.recordNum = recordNum;
-            this.bitmap = bitmap;
-        }
-    }
-
-    private static final class CheckpointScan
-    {
-        private final int totalEntries;
-        private final Map<RowGroupKey, CheckpointState> entries;
-
-        private CheckpointScan(int totalEntries, Map<RowGroupKey, CheckpointState> entries)
-        {
-            this.totalEntries = totalEntries;
-            this.entries = entries;
-        }
-    }
 }

@@ -12,14 +12,7 @@ package io.pixelsdb.pixels.retina.benchmark.snapshot;
 
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.serializer.SerializerFeature;
-import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotSamples.IndexSample;
-import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotSamples.RowSample;
-
 import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.EOFException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
@@ -32,7 +25,6 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Formatter;
 import java.util.List;
@@ -43,20 +35,10 @@ import java.util.UUID;
 /** Reads, writes and validates the versioned Retina benchmark snapshot. */
 public final class SnapshotIO
 {
-    private static final int INDEX_MAGIC = 0x50495849; // PIXI
-    private static final int ROW_MAGIC = 0x50495852;   // PIXR
-    private static final int BINARY_VERSION = 1;
     private static final long MAX_MANIFEST_BYTES = 64L * 1024L * 1024L;
 
     private SnapshotIO()
     {
-    }
-
-    @FunctionalInterface
-    public interface IndexSampleVisitor
-    {
-        /** Return false to stop after this sample. */
-        boolean visit(IndexSample sample) throws Exception;
     }
 
     public static void writeManifest(Path snapshotDirectory, SnapshotManifest manifest) throws IOException
@@ -117,309 +99,6 @@ public final class SnapshotIO
             throw new IllegalArgumentException("table is not present in snapshot: " + tableName);
         }
         return found;
-    }
-
-    public static void writeIndexSamples(Path path, List<IndexSample> samples) throws IOException
-    {
-        Files.createDirectories(path.toAbsolutePath().getParent());
-        Path staging = stagingPath(path);
-        try
-        {
-            try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(staging))))
-            {
-                out.writeInt(INDEX_MAGIC);
-                out.writeInt(BINARY_VERSION);
-                out.writeLong(samples.size());
-                for (IndexSample sample : samples)
-                {
-                    if (sample.key == null || sample.key.length == 0)
-                    {
-                        throw new IOException("index sample contains an empty key");
-                    }
-                    out.writeInt(sample.key.length);
-                    out.write(sample.key);
-                    out.writeLong(sample.createTimestamp);
-                    out.writeLong(sample.fileId);
-                    out.writeInt(sample.rgId);
-                    out.writeInt(sample.rgRowOffset);
-                    out.writeInt(sample.bucketId);
-                }
-            }
-            commitStaged(staging, path);
-        }
-        finally
-        {
-            Files.deleteIfExists(staging);
-        }
-    }
-
-    public static List<IndexSample> readIndexSamples(Path path, long limit) throws IOException
-    {
-        if (limit < 0 || limit > Integer.MAX_VALUE)
-        {
-            throw new IllegalArgumentException("invalid index sample read limit: " + limit);
-        }
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path))))
-        {
-            requireHeader(in, INDEX_MAGIC, path);
-            long count = in.readLong();
-            if (count < 0 || count > Integer.MAX_VALUE)
-            {
-                throw new IOException("invalid index sample count " + count + " in " + path);
-            }
-            int toRead = (int) Math.min(count, limit == 0 ? count : limit);
-            List<IndexSample> samples = new ArrayList<>(toRead);
-            for (int i = 0; i < count; i++)
-            {
-                int keyLength = in.readInt();
-                if (keyLength <= 0 || keyLength > 1024 * 1024)
-                {
-                    throw new IOException("invalid index key length " + keyLength + " in " + path);
-                }
-                byte[] key = null;
-                if (i < toRead)
-                {
-                    key = new byte[keyLength];
-                    in.readFully(key);
-                }
-                else
-                {
-                    skipFully(in, keyLength);
-                }
-                long timestamp = in.readLong();
-                long fileId = in.readLong();
-                int rgId = in.readInt();
-                int offset = in.readInt();
-                int bucket = in.readInt();
-                if (key != null)
-                {
-                    samples.add(new IndexSample(key, timestamp, fileId, rgId, offset, bucket));
-                }
-            }
-            rejectTrailingBytes(in, path);
-            return samples;
-        }
-        catch (EOFException e)
-        {
-            throw new IOException("truncated index sample file: " + path, e);
-        }
-    }
-
-    /** Fully scans an index sample artifact without retaining its payload. */
-    public static long validateIndexSamples(Path path) throws IOException
-    {
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path))))
-        {
-            requireHeader(in, INDEX_MAGIC, path);
-            long count = in.readLong();
-            if (count < 0 || count > Integer.MAX_VALUE)
-            {
-                throw new IOException("invalid index sample count " + count + " in " + path);
-            }
-            for (long i = 0; i < count; i++)
-            {
-                int keyLength = in.readInt();
-                if (keyLength <= 0 || keyLength > 1024 * 1024)
-                {
-                    throw new IOException("invalid index key length " + keyLength + " in " + path);
-                }
-                skipFully(in, keyLength);
-                long timestamp = in.readLong();
-                long fileId = in.readLong();
-                int rgId = in.readInt();
-                int offset = in.readInt();
-                int bucket = in.readInt();
-                if (timestamp < 0 || fileId <= 0 || rgId < 0 || offset < 0 || bucket < 0)
-                {
-                    throw new IOException("invalid index sample at ordinal " + i + " in " + path);
-                }
-            }
-            rejectTrailingBytes(in, path);
-            return count;
-        }
-        catch (EOFException e)
-        {
-            throw new IOException("truncated index sample file: " + path, e);
-        }
-    }
-
-    /** Streams index samples in file order and retains no sample collection. */
-    public static long scanIndexSamples(Path path, IndexSampleVisitor visitor) throws Exception
-    {
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path))))
-        {
-            requireHeader(in, INDEX_MAGIC, path);
-            long count = in.readLong();
-            if (count < 0 || count > Integer.MAX_VALUE)
-            {
-                throw new IOException("invalid index sample count " + count + " in " + path);
-            }
-            long visited = 0L;
-            for (long i = 0; i < count; i++)
-            {
-                int keyLength = in.readInt();
-                if (keyLength <= 0 || keyLength > 1024 * 1024)
-                {
-                    throw new IOException("invalid index key length " + keyLength + " in " + path);
-                }
-                byte[] key = new byte[keyLength];
-                in.readFully(key);
-                IndexSample sample = new IndexSample(key, in.readLong(), in.readLong(),
-                        in.readInt(), in.readInt(), in.readInt());
-                visited++;
-                if (!visitor.visit(sample))
-                {
-                    return visited;
-                }
-            }
-            rejectTrailingBytes(in, path);
-            return visited;
-        }
-        catch (EOFException e)
-        {
-            throw new IOException("truncated index sample file: " + path, e);
-        }
-    }
-
-    public static void writeRowSamples(Path path, List<RowSample> samples, int columnCount) throws IOException
-    {
-        Files.createDirectories(path.toAbsolutePath().getParent());
-        Path staging = stagingPath(path);
-        try
-        {
-            try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(staging))))
-            {
-                out.writeInt(ROW_MAGIC);
-                out.writeInt(BINARY_VERSION);
-                out.writeInt(columnCount);
-                out.writeLong(samples.size());
-                for (RowSample sample : samples)
-                {
-                    if (sample.columns == null || sample.columns.length != columnCount)
-                    {
-                        throw new IOException("row sample column count mismatch");
-                    }
-                    for (byte[] value : sample.columns)
-                    {
-                        if (value == null)
-                        {
-                            out.writeInt(-1);
-                        }
-                        else
-                        {
-                            out.writeInt(value.length);
-                            out.write(value);
-                        }
-                    }
-                }
-            }
-            commitStaged(staging, path);
-        }
-        finally
-        {
-            Files.deleteIfExists(staging);
-        }
-    }
-
-    public static List<RowSample> readRowSamples(Path path, int expectedColumns, long limit) throws IOException
-    {
-        if (limit < 0 || limit > Integer.MAX_VALUE)
-        {
-            throw new IllegalArgumentException("invalid row sample read limit: " + limit);
-        }
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path))))
-        {
-            requireHeader(in, ROW_MAGIC, path);
-            int columns = in.readInt();
-            if (columns != expectedColumns)
-            {
-                throw new IOException("row sample has " + columns + " columns, expected "
-                        + expectedColumns + ": " + path);
-            }
-            long count = in.readLong();
-            if (count < 0 || count > Integer.MAX_VALUE)
-            {
-                throw new IOException("invalid row sample count " + count + " in " + path);
-            }
-            int toRead = (int) Math.min(count, limit == 0 ? count : limit);
-            List<RowSample> samples = new ArrayList<>(toRead);
-            for (int row = 0; row < count; row++)
-            {
-                byte[][] values = row < toRead ? new byte[columns][] : null;
-                for (int column = 0; column < columns; column++)
-                {
-                    int length = in.readInt();
-                    if (length < -1 || length > 256 * 1024 * 1024)
-                    {
-                        throw new IOException("invalid row value length " + length + " in " + path);
-                    }
-                    if (length >= 0)
-                    {
-                        if (values != null)
-                        {
-                            byte[] value = new byte[length];
-                            in.readFully(value);
-                            values[column] = value;
-                        }
-                        else
-                        {
-                            skipFully(in, length);
-                        }
-                    }
-                }
-                if (values != null)
-                {
-                    samples.add(new RowSample(values));
-                }
-            }
-            rejectTrailingBytes(in, path);
-            return samples;
-        }
-        catch (EOFException e)
-        {
-            throw new IOException("truncated row sample file: " + path, e);
-        }
-    }
-
-    /** Fully scans a row sample artifact without retaining its payload. */
-    public static long validateRowSamples(Path path, int expectedColumns) throws IOException
-    {
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path))))
-        {
-            requireHeader(in, ROW_MAGIC, path);
-            int columns = in.readInt();
-            if (columns != expectedColumns)
-            {
-                throw new IOException("row sample has " + columns + " columns, expected "
-                        + expectedColumns + ": " + path);
-            }
-            long count = in.readLong();
-            if (count < 0 || count > Integer.MAX_VALUE)
-            {
-                throw new IOException("invalid row sample count " + count + " in " + path);
-            }
-            for (long row = 0; row < count; row++)
-            {
-                for (int column = 0; column < columns; column++)
-                {
-                    int length = in.readInt();
-                    if (length < -1 || length > 256 * 1024 * 1024)
-                    {
-                        throw new IOException("invalid row value length " + length + " in " + path);
-                    }
-                    if (length >= 0)
-                    {
-                        skipFully(in, length);
-                    }
-                }
-            }
-            rejectTrailingBytes(in, path);
-            return count;
-        }
-        catch (EOFException e)
-        {
-            throw new IOException("truncated row sample file: " + path, e);
-        }
     }
 
     public static String sha256(Path path) throws IOException
@@ -542,13 +221,16 @@ public final class SnapshotIO
         {
             throw new IllegalArgumentException("snapshot sourceHost is empty");
         }
+        if (manifest.snapshotTimestamp < 0)
+        {
+            throw new IllegalArgumentException("snapshotTimestamp is negative");
+        }
         if (manifest.sourceVnodeIds == null || manifest.sourceIndexBucketIds == null
-                || manifest.effectiveConfig == null || manifest.artifactsSha256 == null)
+                || manifest.semanticConfig == null || manifest.artifactsSha256 == null)
         {
             throw new IllegalArgumentException("snapshot contains a null top-level collection");
         }
-        if ((manifest.physicalIndexStateIncluded || manifest.visibilityCheckpointIncluded)
-                && !manifest.sourceQuiesced)
+        if (manifest.physicalIndexStateIncluded && !manifest.sourceQuiesced)
         {
             throw new IllegalArgumentException("physical snapshot state requires sourceQuiesced=true");
         }
@@ -561,48 +243,14 @@ public final class SnapshotIO
         {
             throw new IllegalArgumentException("physical Index state/artifact descriptor mismatch");
         }
-        if (manifest.visibilityCheckpointIncluded)
+        if (hasArtifactBelow(manifest, "state/visibility/"))
         {
-            if (manifest.snapshotTimestamp <= 0
-                    || manifest.visibilityCheckpointSource == null
-                    || manifest.visibilityCheckpointTimestamp != manifest.snapshotTimestamp
-                    || manifest.visibilityCheckpointHost == null
-                    || manifest.visibilityCheckpointHost.trim().isEmpty()
-                    || !("gc".equals(manifest.visibilityCheckpointType)
-                    || "offload".equals(manifest.visibilityCheckpointType))
-                    || !manifest.artifactsSha256.containsKey(
-                    "state/visibility/gc-checkpoint.bin")
-                    || manifest.visibilityCheckpointEntryCount < 0
-                    || manifest.visibilityCheckpointExpectedEntryCount <= 0
-                    || manifest.visibilityCheckpointMatchedEntryCount < 0
-                    || manifest.visibilityCheckpointUnmatchedEntryCount < 0
-                    || manifest.visibilityCheckpointMatchedEntryCount
-                    + manifest.visibilityCheckpointUnmatchedEntryCount
-                    != manifest.visibilityCheckpointEntryCount
-                    || manifest.visibilityCheckpointMatchedEntryCount
-                    != manifest.visibilityCheckpointExpectedEntryCount)
-            {
-                throw new IllegalArgumentException("invalid Visibility checkpoint descriptor");
-            }
-        }
-        else if (manifest.visibilityCheckpointSource != null
-                || manifest.visibilityCheckpointType != null
-                || manifest.visibilityCheckpointHost != null
-                || manifest.visibilityCheckpointTimestamp != 0
-                || manifest.visibilityCheckpointEntryCount != 0
-                || manifest.visibilityCheckpointExpectedEntryCount != 0
-                || manifest.visibilityCheckpointMatchedEntryCount != 0
-                || manifest.visibilityCheckpointUnmatchedEntryCount != 0)
-        {
-            throw new IllegalArgumentException("snapshot has checkpoint metadata but no checkpoint");
-        }
-        if (manifest.visibilityCheckpointIncluded
-                != manifest.artifactsSha256.containsKey("state/visibility/gc-checkpoint.bin"))
-        {
-            throw new IllegalArgumentException("Visibility checkpoint/artifact descriptor mismatch");
+            throw new IllegalArgumentException("Snapshot v2 clean Visibility baseline does not "
+                    + "support state/visibility artifacts");
         }
         validateNonNegativeUniqueIds(manifest.sourceVnodeIds, "sourceVnodeIds");
         validateNonNegativeUniqueIds(manifest.sourceIndexBucketIds, "sourceIndexBucketIds");
+        validateSemanticConfig(manifest.semanticConfig);
         Set<Long> tableIds = new HashSet<>();
         Set<String> tableNames = new HashSet<>();
         for (SnapshotManifest.TableState table : manifest.tables)
@@ -650,11 +298,6 @@ public final class SnapshotIO
                                 + table.tableName);
                     }
                 }
-            }
-            if (table.selectedSampleLayoutId > 0 && !layoutIds.contains(table.selectedSampleLayoutId))
-            {
-                throw new IllegalArgumentException("sample layout is absent from snapshot table "
-                        + table.tableName);
             }
             Set<Long> fileIds = new HashSet<>();
             for (SnapshotManifest.FileState file : table.files)
@@ -731,47 +374,36 @@ public final class SnapshotIO
             {
                 throw new IllegalArgumentException("primary index reference mismatch in " + table.tableName);
             }
-            validateSampleReference(manifest, table.indexSamplesFile, table.indexSampleCount,
-                    "index", table.tableName);
-            validateSampleReference(manifest, table.rowSamplesFile, table.rowSampleCount,
-                    "row", table.tableName);
-            if (table.indexSampleCount > 0 && (manifest.snapshotTimestamp <= 0
-                    || table.maxObservedCreateTimestamp > manifest.snapshotTimestamp))
-            {
-                throw new IllegalArgumentException("index samples exceed or lack the authoritative "
-                        + "snapshot timestamp for " + table.tableName);
-            }
-        }
-        if (manifest.visibilityCheckpointIncluded
-                && countProductionVisibilityRowGroups(manifest)
-                != manifest.visibilityCheckpointExpectedEntryCount)
-        {
-            throw new IllegalArgumentException("Visibility checkpoint expected-RG count does not "
-                    + "match the manifest production topology");
-        }
-    }
-
-    private static void validateSampleReference(SnapshotManifest manifest, String relative, long count,
-                                                String type, String table)
-    {
-        if (count < 0)
-        {
-            throw new IllegalArgumentException(type + " sample count is negative for " + table);
-        }
-        if ((relative == null) != (count == 0))
-        {
-            throw new IllegalArgumentException(type + " sample reference/count mismatch for " + table);
-        }
-        if (relative != null && (manifest.artifactsSha256 == null
-                || !manifest.artifactsSha256.containsKey(relative)))
-        {
-            throw new IllegalArgumentException(type + " sample is not checksummed for " + table);
         }
     }
 
     private static boolean validIndexLength(int length)
     {
         return length == -1 || length > 0;
+    }
+
+    private static void validateSemanticConfig(Map<String, String> config)
+    {
+        for (Map.Entry<String, String> entry : config.entrySet())
+        {
+            String key = entry.getKey();
+            String value = entry.getValue();
+            if (key == null || key.trim().isEmpty() || value == null)
+            {
+                throw new IllegalArgumentException("invalid null/empty semantic configuration entry");
+            }
+            String normalized = key.toLowerCase();
+            if (normalized.endsWith(".host") || normalized.endsWith(".hosts")
+                    || normalized.endsWith(".port") || normalized.endsWith(".path")
+                    || normalized.endsWith(".dir") || normalized.endsWith(".folder")
+                    || normalized.contains("endpoint") || normalized.contains("credential")
+                    || normalized.contains("password") || normalized.contains("secret")
+                    || normalized.contains("token") || normalized.contains("access.key"))
+            {
+                throw new IllegalArgumentException("runtime endpoint, credential or path is not "
+                        + "allowed in semanticConfig: " + key);
+            }
+        }
     }
 
     private static void validateNonNegativeUniqueIds(List<Integer> values, String name)
@@ -784,39 +416,6 @@ public final class SnapshotIO
                 throw new IllegalArgumentException("invalid/duplicate " + name + " value: " + value);
             }
         }
-    }
-
-    private static long countProductionVisibilityRowGroups(SnapshotManifest manifest)
-    {
-        long count = 0L;
-        for (SnapshotManifest.TableState table : manifest.tables)
-        {
-            Set<Long> selectedPaths = new HashSet<>();
-            for (SnapshotManifest.LayoutState layout : table.layouts)
-            {
-                if (!layout.readable)
-                {
-                    continue;
-                }
-                for (SnapshotManifest.PathState path : layout.paths)
-                {
-                    if (path.productionSelectedByRetina
-                            && ("ordered".equalsIgnoreCase(path.role)
-                            || "compact".equalsIgnoreCase(path.role)))
-                    {
-                        selectedPaths.add(path.pathId);
-                    }
-                }
-            }
-            for (SnapshotManifest.FileState file : table.files)
-            {
-                if (selectedPaths.contains(file.pathId))
-                {
-                    count = Math.addExact(count, file.rowGroups.size());
-                }
-            }
-        }
-        return count;
     }
 
     private static boolean hasArtifactBelow(SnapshotManifest manifest, String prefix)
@@ -845,6 +444,14 @@ public final class SnapshotIO
             {
                 throw new IOException("invalid snapshot artifact entry: " + relative);
             }
+            String normalizedRelative = relative.replace('\\', '/');
+            if (normalizedRelative.endsWith("/index-samples.bin")
+                    || normalizedRelative.endsWith("/row-samples.bin")
+                    || "index-samples.bin".equals(normalizedRelative)
+                    || "row-samples.bin".equals(normalizedRelative))
+            {
+                throw new IOException("Snapshot v2 does not support sample artifacts: " + relative);
+            }
             Path path = snapshotDirectory.resolve(relative).normalize();
             if (!path.startsWith(snapshotDirectory))
             {
@@ -868,43 +475,6 @@ public final class SnapshotIO
             {
                 throw new IOException("snapshot artifact checksum mismatch: " + path);
             }
-        }
-    }
-
-    private static void requireHeader(DataInputStream in, int expectedMagic, Path path) throws IOException
-    {
-        int magic = in.readInt();
-        int version = in.readInt();
-        if (magic != expectedMagic || version != BINARY_VERSION)
-        {
-            throw new IOException("invalid sample header in " + path + ": magic="
-                    + Integer.toHexString(magic) + ", version=" + version);
-        }
-    }
-
-    private static void rejectTrailingBytes(DataInputStream in, Path path) throws IOException
-    {
-        if (in.read() != -1)
-        {
-            throw new IOException("unexpected trailing bytes in sample file: " + path);
-        }
-    }
-
-    private static void skipFully(DataInputStream in, int length) throws IOException
-    {
-        int remaining = length;
-        while (remaining > 0)
-        {
-            int skipped = in.skipBytes(remaining);
-            if (skipped <= 0)
-            {
-                if (in.read() < 0)
-                {
-                    throw new EOFException("truncated while skipping " + length + " bytes");
-                }
-                skipped = 1;
-            }
-            remaining -= skipped;
         }
     }
 

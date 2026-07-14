@@ -23,23 +23,46 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
-/** Prepares disposable physical state and effective configuration before Pixels singletons start. */
+/** Prepares disposable physical state and module-scoped semantic configuration before Pixels singletons start. */
 public final class SnapshotRuntime implements AutoCloseable
 {
+    private static final Set<String> INDEX_CONFIG = new HashSet<>(Arrays.asList(
+            "index.bucket.num", "index.cache.enabled", "index.cache.capacity",
+            "index.cache.expiration.seconds", "index.main.cache.bucket.num",
+            "index.rocksdb.multicf", "index.rocksdb.write.buffer.size",
+            "index.rocksdb.max.write.buffer.number", "index.rocksdb.max.background.flushes",
+            "index.rocksdb.max.background.compactions", "index.rocksdb.max.open.files",
+            "index.rocksdb.block.cache.capacity", "index.rocksdb.block.cache.shard.bits",
+            "index.rocksdb.block.size", "index.rocksdb.min.write.buffer.number.to.merge",
+            "index.rocksdb.level0.file.num.compaction.trigger",
+            "index.rocksdb.max.bytes.for.level.base",
+            "index.rocksdb.max.bytes.for.level.multiplier",
+            "index.rocksdb.target.file.size.base",
+            "index.rocksdb.target.file.size.multiplier", "index.rocksdb.prefix.length",
+            "index.rocksdb.max.subcompactions", "index.rocksdb.compression.type",
+            "index.rocksdb.bottommost.compression.type", "index.rocksdb.compaction.style",
+            "index.rocksdb.stats.enabled"));
+    private static final Set<String> VISIBILITY_CONFIG = new HashSet<>(Arrays.asList(
+            "enabled.storage.schemes", "node.virtual.num",
+            "retina.tile.visibility.capacity", "retina.checkpoint.threads"));
     private static final Set<String> WRITE_BUFFER_CONFIG = new HashSet<>(Arrays.asList(
             "pixel.stride", "row.group.size", "block.size", "block.replication",
             "column.chunk.little.endian", "column.chunk.alignment", "isnull.bitmap.alignment",
-            "enabled.storage.schemes", "hdfs.config.dir",
-            "s3.connection.timeout.sec", "s3.connection.acquisition.timeout.sec",
-            "s3.client.service.threads", "s3.max.request.concurrency",
-            "s3.max.pending.requests", "s3.enable.async", "s3.use.async.client",
-            "minio.region", "minio.endpoint",
+            "enabled.storage.schemes",
             "node.virtual.num", "index.main.cache.bucket.num",
             "retina.buffer.memTable.size", "retina.buffer.flush.count",
             "retina.buffer.object.flush.threads", "retina.buffer.flush.interval",
             "retina.buffer.flush.encodingLevel", "retina.buffer.flush.nullsPadding",
-            "retina.buffer.object.storage.scheme", "retina.buffer.object.storage.folder",
+            "retina.buffer.object.storage.scheme",
             "retina.tile.visibility.capacity"));
+    private static final String[] WRITE_BUFFER_REQUIRED_CONFIG = {
+            "retina.buffer.memTable.size", "retina.buffer.flush.count",
+            "retina.buffer.object.flush.threads", "retina.buffer.flush.interval",
+            "retina.buffer.flush.encodingLevel", "retina.buffer.flush.nullsPadding",
+            "retina.buffer.object.storage.scheme", "block.size", "block.replication",
+            "node.virtual.num", "index.main.cache.bucket.num",
+            "retina.tile.visibility.capacity", "enabled.storage.schemes"
+    };
 
     private final Path snapshotDirectory;
     private final SnapshotManifest manifest;
@@ -137,7 +160,7 @@ public final class SnapshotRuntime implements AutoCloseable
             throw new IOException("snapshot is missing the table MainIndex: " + tableDb);
         }
 
-        applyAllConfig();
+        applyConfig(INDEX_CONFIG);
         ConfigFactory pixels = ConfigFactory.Instance();
         Path stats = workDirectory.resolve("index/rocksdb-stats");
         Files.createDirectories(stats);
@@ -158,31 +181,52 @@ public final class SnapshotRuntime implements AutoCloseable
      */
     public void prepareFreshWriteBufferState() throws IOException
     {
+        requireSemanticConfig("WriteBuffer", WRITE_BUFFER_REQUIRED_CONFIG);
         applyWriteBufferConfig();
         Path sqlite = workDirectory.resolve("write-buffer/sqlite");
+        Path objects = workDirectory.resolve("write-buffer/objects");
         Files.createDirectories(sqlite);
+        Files.createDirectories(objects);
         ConfigFactory pixels = ConfigFactory.Instance();
         pixels.addProperty("enabled.main.index.scheme", "sqlite");
         pixels.addProperty("index.sqlite.path", sqlite.toString());
+        pixels.addProperty("retina.buffer.object.storage.folder", objects.toString());
     }
 
-    public void applyAllConfig()
+    public void applyVisibilityConfig() throws IOException
     {
-        ConfigFactory pixels = ConfigFactory.Instance();
-        for (Map.Entry<String, String> entry : manifest.effectiveConfig.entrySet())
-        {
-            pixels.addProperty(entry.getKey(), entry.getValue());
-        }
+        applyConfig(VISIBILITY_CONFIG);
+        Path checkpoints = workDirectory.resolve("visibility/checkpoints");
+        Files.createDirectories(checkpoints);
+        ConfigFactory.Instance().addProperty("retina.checkpoint.dir",
+                checkpoints.toUri().toString());
     }
 
     public void applyWriteBufferConfig()
     {
+        applyConfig(WRITE_BUFFER_CONFIG);
+    }
+
+    private void applyConfig(Set<String> allowed)
+    {
         ConfigFactory pixels = ConfigFactory.Instance();
-        for (Map.Entry<String, String> entry : manifest.effectiveConfig.entrySet())
+        for (Map.Entry<String, String> entry : manifest.semanticConfig.entrySet())
         {
-            if (WRITE_BUFFER_CONFIG.contains(entry.getKey()))
+            if (allowed.contains(entry.getKey()))
             {
                 pixels.addProperty(entry.getKey(), entry.getValue());
+            }
+        }
+    }
+
+    private void requireSemanticConfig(String module, String... keys) throws IOException
+    {
+        for (String key : keys)
+        {
+            String value = manifest.semanticConfig.get(key);
+            if (value == null || value.trim().isEmpty())
+            {
+                throw new IOException(module + " snapshot is missing semanticConfig." + key);
             }
         }
     }
