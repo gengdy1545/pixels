@@ -1,0 +1,34 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.15
+    command:
+      - /usr/local/bin/etcd
+      - --name=retina-benchmark
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:2379
+    ports:
+      - "2379:2379"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  mysql:
+    image: mysql:8.0.36
+    environment:
+      MYSQL_ROOT_PASSWORD: root-password
+      MYSQL_DATABASE: pixels_metadata
+      MYSQL_USER: pixels
+      MYSQL_PASSWORD: password
+    ports:
+      - "3306:3306"
+    volumes:
+      # In the runtime tarball this file is copied from scripts/sql unchanged.
+      - ./mysql-init/metadata_schema.sql:/docker-entrypoint-initdb.d/00-metadata-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot-password"]
+      interval: 2s
+      timeout: 3s
+      retries: 60

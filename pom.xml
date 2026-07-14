@@ -68,6 +68,7 @@
         <module>pixels-index/pixels-index-memory</module>
         <module>pixels-index/pixels-index-mapdb</module>
         <module>pixels-index/pixels-index-main-sqlite</module>
+        <module>pixels-retina-benchmark</module>
     </modules>
 
     <properties>

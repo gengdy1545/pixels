@@ -87,6 +87,14 @@ JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getRetinaTra
 JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getRetinaObjectCount
   (JNIEnv *, jclass);
 
+/*
+ * Class:     io_pixelsdb_pixels_retina_RGVisibility
+ * Method:    getNativeTileCapacity
+ * Signature: ()I
+ */
+JNIEXPORT jint JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getNativeTileCapacity
+  (JNIEnv *, jclass);
+
 #ifdef __cplusplus
 }
 #endif

@@ -104,21 +104,77 @@ public class TransService
         return transService;
     }
 
+    /**
+     * Create a transaction client with a dedicated channel.
+     * <p>
+     * Normal Pixels callers should use {@link #Instance()} or {@link #CreateInstance(String, int)},
+     * both of which intentionally reuse a channel.  A load generator may need more than one
+     * physical client connection to the same server, so it cannot use the address-keyed cache in
+     * {@code CreateInstance}.  This factory keeps the exact same request construction, blocking
+     * stub, and response validation used by production while only changing channel ownership.
+     * The caller must invoke {@link #shutdown()} when the dedicated client is no longer needed.
+     */
+    public static TransService CreateDedicatedInstance(String host, int port)
+    {
+        return new TransService(host, port);
+    }
+
+    /**
+     * Create a dedicated transaction client whose every RPC gets a fresh
+     * relative deadline. This retains the production request/response path and
+     * is intended for bounded load generators; cached production clients keep
+     * their historical no-deadline behavior.
+     *
+     * @param host transaction server host
+     * @param port transaction server port
+     * @param rpcDeadlineMs positive per-RPC deadline in milliseconds
+     */
+    public static TransService CreateDedicatedInstance(String host, int port, long rpcDeadlineMs)
+    {
+        if (rpcDeadlineMs <= 0)
+        {
+            throw new IllegalArgumentException("rpcDeadlineMs must be positive");
+        }
+        return new TransService(host, port, rpcDeadlineMs);
+    }
+
     private final ManagedChannel channel;
     private final TransServiceGrpc.TransServiceBlockingStub stub;
+    private final long rpcDeadlineMs;
     private boolean isShutDown;
 
     private TransService(String host, int port)
+    {
+        this(host, port, 0L);
+    }
+
+    private TransService(String host, int port, long rpcDeadlineMs)
     {
         assert (host != null);
         assert (port > 0 && port <= 65535);
         this.channel = ManagedChannelBuilder.forAddress(host, port)
                 .usePlaintext().build();
         this.stub = TransServiceGrpc.newBlockingStub(channel);
+        this.rpcDeadlineMs = rpcDeadlineMs;
         this.isShutDown = false;
     }
 
-    private synchronized void shutdown() throws InterruptedException
+    private TransServiceGrpc.TransServiceBlockingStub rpcStub()
+    {
+        /* withDeadlineAfter must be called for every invocation: a stub stores
+           an absolute Deadline, so reusing a decorated stub would expire it. */
+        return this.rpcDeadlineMs > 0
+                ? this.stub.withDeadlineAfter(this.rpcDeadlineMs, TimeUnit.MILLISECONDS)
+                : this.stub;
+    }
+
+    /**
+     * Close this client's owned channel. Cached production instances are
+     * normally closed by {@link ShutdownHookManager}; callers of
+     * {@link #CreateDedicatedInstance(String, int)} close their instances
+     * explicitly through this method.
+     */
+    public synchronized void shutdown() throws InterruptedException
     {
         if (!this.isShutDown)
         {
@@ -137,7 +193,7 @@ public class TransService
     {
         TransProto.BeginTransRequest request = TransProto.BeginTransRequest.newBuilder()
                 .setReadOnly(readOnly).build();
-        TransProto.BeginTransResponse response = this.stub.beginTrans(request);
+        TransProto.BeginTransResponse response = this.rpcStub().beginTrans(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to begin transaction, error code=" + response.getErrorCode());
@@ -164,7 +220,7 @@ public class TransService
     {
         TransProto.BeginTransBatchRequest request = TransProto.BeginTransBatchRequest.newBuilder()
                 .setReadOnly(readOnly).setExpectNumTrans(numTrans).build();
-        TransProto.BeginTransBatchResponse response = this.stub.beginTransBatch(request);
+        TransProto.BeginTransBatchResponse response = this.rpcStub().beginTransBatch(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to begin the batch of transactions, error code=" + response.getErrorCode());
@@ -199,7 +255,7 @@ public class TransService
     {
         TransProto.CommitTransRequest request = TransProto.CommitTransRequest.newBuilder()
                 .setTransId(transId).build();
-        TransProto.CommitTransResponse response = this.stub.commitTrans(request);
+        TransProto.CommitTransResponse response = this.rpcStub().commitTrans(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to commit transaction, error code=" + response.getErrorCode());
@@ -230,7 +286,7 @@ public class TransService
         }
         TransProto.CommitTransBatchRequest request = TransProto.CommitTransBatchRequest.newBuilder()
                 .setReadOnly(readOnly).addAllTransIds(transIds).build();
-        TransProto.CommitTransBatchResponse response = this.stub.commitTransBatch(request);
+        TransProto.CommitTransBatchResponse response = this.rpcStub().commitTransBatch(request);
         if (response.getErrorCode() == ErrorCode.TRANS_INVALID_ARGUMENT) // other error codes are not thrown as exceptions
         {
             throw new TransException("transaction ids and timestamps size mismatch");
@@ -258,7 +314,7 @@ public class TransService
     {
         TransProto.RollbackTransRequest request = TransProto.RollbackTransRequest.newBuilder()
                 .setTransId(transId).build();
-        TransProto.RollbackTransResponse response = this.stub.rollbackTrans(request);
+        TransProto.RollbackTransResponse response = this.rpcStub().rollbackTrans(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to rollback transaction, error code=" + response.getErrorCode());
@@ -296,7 +352,7 @@ public class TransService
         }
         TransProto.ExtendTransLeaseRequest request = TransProto.ExtendTransLeaseRequest.newBuilder()
                 .setTransId(transContext.getTransId()).build();
-        TransProto.ExtendTransLeaseResponse response = this.stub.extendTransLease(request);
+        TransProto.ExtendTransLeaseResponse response = this.rpcStub().extendTransLease(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("transaction " + transContext.getTransId() +
@@ -323,7 +379,7 @@ public class TransService
         {
             requestBuilder.addTransIds(transContext.getTransId());
         }
-        TransProto.ExtendTransLeaseBatchResponse response = this.stub.extendTransLeaseBatch(requestBuilder.build());
+        TransProto.ExtendTransLeaseBatchResponse response = this.rpcStub().extendTransLeaseBatch(requestBuilder.build());
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to extend lease of transactions, error code=" + response.getErrorCode());
@@ -349,7 +405,7 @@ public class TransService
     {
         TransProto.GetTransContextRequest request = TransProto.GetTransContextRequest.newBuilder()
                 .setTransId(transId).build();
-        TransProto.GetTransContextResponse response = this.stub.getTransContext(request);
+        TransProto.GetTransContextResponse response = this.rpcStub().getTransContext(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to get transaction context, error code=" + response.getErrorCode());
@@ -361,7 +417,7 @@ public class TransService
     {
         TransProto.GetTransContextRequest request = TransProto.GetTransContextRequest.newBuilder()
                 .setExternalTraceId(externalTraceId).build();
-        TransProto.GetTransContextResponse response = this.stub.getTransContext(request);
+        TransProto.GetTransContextResponse response = this.rpcStub().getTransContext(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to get transaction context, error code=" + response.getErrorCode());
@@ -401,7 +457,7 @@ public class TransService
 
     private String setTransProperty(TransProto.SetTransPropertyRequest request) throws TransException
     {
-        TransProto.SetTransPropertyResponse response = this.stub.setTransProperty(request);
+        TransProto.SetTransPropertyResponse response = this.rpcStub().setTransProperty(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to set transaction property, error code=" + response.getErrorCode());
@@ -465,7 +521,7 @@ public class TransService
 
     private boolean updateQueryCosts(TransProto.UpdateQueryCostsRequest request) throws TransException
     {
-        TransProto.UpdateQueryCostsResponse response = this.stub.updateQueryCosts(request);
+        TransProto.UpdateQueryCostsResponse response = this.rpcStub().updateQueryCosts(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to update query costs, error code=" + response.getErrorCode());
@@ -477,7 +533,7 @@ public class TransService
     {
         TransProto.GetTransConcurrencyRequest request = TransProto.GetTransConcurrencyRequest.newBuilder()
                 .setReadOnly(readOnly).build();
-        TransProto.GetTransConcurrencyResponse response = this.stub.getTransConcurrency(request);
+        TransProto.GetTransConcurrencyResponse response = this.rpcStub().getTransConcurrency(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to get transaction concurrency, error code=" + response.getErrorCode());
@@ -489,7 +545,7 @@ public class TransService
     {
         TransProto.BindExternalTraceIdRequest request = TransProto.BindExternalTraceIdRequest.newBuilder()
                 .setTransId(transId).setExternalTraceId(externalTraceId).build();
-        TransProto.BindExternalTraceIdResponse response = this.stub.bindExternalTraceId(request);
+        TransProto.BindExternalTraceIdResponse response = this.rpcStub().bindExternalTraceId(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to bind transaction id and external trace id, error code="
@@ -500,7 +556,7 @@ public class TransService
 
     public long getSafeGcTimestamp() throws TransException
     {
-        TransProto.GetSafeGcTimestampResponse response = this.stub.getSafeGcTimestamp(Empty.getDefaultInstance());
+        TransProto.GetSafeGcTimestampResponse response = this.rpcStub().getSafeGcTimestamp(Empty.getDefaultInstance());
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to get safe garbage collection timestamp"
@@ -521,7 +577,7 @@ public class TransService
     {
         TransProto.MarkTransOffloadedRequest request = TransProto.MarkTransOffloadedRequest.newBuilder()
                 .setTransId(transId).build();
-        TransProto.MarkTransOffloadedResponse response = this.stub.markTransOffloaded(request);
+        TransProto.MarkTransOffloadedResponse response = this.rpcStub().markTransOffloaded(request);
         if (response.getErrorCode() != ErrorCode.SUCCESS)
         {
             throw new TransException("failed to mark transaction as offloaded, error code=" + response.getErrorCode());

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PIXELS_HOME="${PIXELS_HOME:-${ROOT_DIR}}"
+export PIXELS_CONFIG="${PIXELS_CONFIG:-${PIXELS_HOME}/etc/pixels.properties}"
+
+exec java \
+  -Dlog4j.configurationFile="${PIXELS_HOME}/etc/retina-benchmark-log4j2.xml" \
+  ${JAVA_OPTS:-} \
+  -jar "${PIXELS_HOME}/pixels-retina-benchmark-full.jar" "$@"

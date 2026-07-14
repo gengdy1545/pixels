@@ -222,3 +222,13 @@ JNIEXPORT jlong JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getRetinaObj
   (JNIEnv *env, jclass clazz) {
     return static_cast<jlong>(pixels::g_retina_object_count.load(std::memory_order_relaxed));
 }
+
+/*
+ * Returns the tile capacity compiled into this shared library. It cannot be
+ * inferred safely from pixels.properties because RETINA_CAPACITY is a CMake
+ * compile definition.
+ */
+JNIEXPORT jint JNICALL Java_io_pixelsdb_pixels_retina_RGVisibility_getNativeTileCapacity
+  (JNIEnv *, jclass) {
+    return static_cast<jint>(RETINA_CAPACITY);
+}

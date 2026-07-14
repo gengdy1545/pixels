@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<assembly xmlns="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.3"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/plugins/maven-assembly-plugin/assembly/1.1.3 https://maven.apache.org/xsd/assembly-1.1.3.xsd">
+    <id>runtime</id>
+    <formats>
+        <format>tar.gz</format>
+    </formats>
+    <includeBaseDirectory>true</includeBaseDirectory>
+    <baseDirectory>pixels-retina-benchmark</baseDirectory>
+
+    <fileSets>
+        <fileSet>
+            <directory>${project.basedir}/deploy/bin</directory>
+            <outputDirectory>bin</outputDirectory>
+            <fileMode>0755</fileMode>
+        </fileSet>
+        <fileSet>
+            <directory>${project.basedir}/deploy/etc</directory>
+            <outputDirectory>etc</outputDirectory>
+            <fileMode>0644</fileMode>
+        </fileSet>
+    </fileSets>
+
+    <files>
+        <file>
+            <source>${project.basedir}/README.md</source>
+            <outputDirectory>.</outputDirectory>
+            <destName>README.md</destName>
+            <fileMode>0644</fileMode>
+        </file>
+        <file>
+            <source>${project.basedir}/SNAPSHOT.md</source>
+            <outputDirectory>.</outputDirectory>
+            <destName>SNAPSHOT.md</destName>
+            <fileMode>0644</fileMode>
+        </file>
+        <file>
+            <source>${project.build.directory}/${project.build.finalName}-full.jar</source>
+            <outputDirectory>.</outputDirectory>
+            <destName>pixels-retina-benchmark-full.jar</destName>
+            <fileMode>0644</fileMode>
+        </file>
+        <file>
+            <source>${project.basedir}/deploy/docker-compose.yml</source>
+            <outputDirectory>.</outputDirectory>
+            <destName>docker-compose.yml</destName>
+            <fileMode>0644</fileMode>
+        </file>
+        <file>
+            <source>${project.basedir}/../scripts/sql/metadata_schema.sql</source>
+            <outputDirectory>mysql-init</outputDirectory>
+            <destName>metadata_schema.sql</destName>
+            <fileMode>0644</fileMode>
+        </file>
+    </files>
+</assembly>

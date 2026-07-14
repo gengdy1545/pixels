@@ -36,17 +36,26 @@ public class RGVisibility implements AutoCloseable
     private static final Logger logger = LogManager.getLogger(RGVisibility.class);
     static
     {
-        String pixelsHome = System.getenv("PIXELS_HOME");
-        if (pixelsHome == null || pixelsHome.isEmpty())
-        {
-            throw new IllegalStateException("Environment variable PIXELS_HOME is not set");
-        }
-
         if (!Platform.isLinux())
         {
             logger.error("Direct io is not supported on OS other than Linux");
         }
-        String libPath = Paths.get(pixelsHome, "lib/libpixels-retina.so").toString();
+        /*
+         * The system property is used by self-contained tools that extract the native library
+         * from their executable JAR.  Production keeps the existing PIXELS_HOME layout as the
+         * fallback, so normal Retina deployment behavior is unchanged.
+         */
+        String libPath = System.getProperty("pixels.retina.native.library");
+        if (libPath == null || libPath.isEmpty())
+        {
+            String pixelsHome = System.getenv("PIXELS_HOME");
+            if (pixelsHome == null || pixelsHome.isEmpty())
+            {
+                throw new IllegalStateException("Neither system property pixels.retina.native.library " +
+                        "nor environment variable PIXELS_HOME is set");
+            }
+            libPath = Paths.get(pixelsHome, "lib/libpixels-retina.so").toString();
+        }
         File libFile = new File(libPath);
         if (!libFile.exists())
         {
@@ -101,6 +110,17 @@ public class RGVisibility implements AutoCloseable
     private static native long getNativeMemoryUsage();
     private static native long getRetinaTrackedMemoryUsage();
     private static native long getRetinaObjectCount();
+    private static native int getNativeTileCapacity();
+
+    /**
+     * Returns the compile-time {@code RETINA_CAPACITY} embedded in the loaded
+     * native library. Portable snapshot consumers use this to reject a
+     * checkpoint/configuration produced with a different tile layout.
+     */
+    public static int getTileCapacity()
+    {
+        return getNativeTileCapacity();
+    }
 
     public void deleteRecord(int rgRowOffset, long timestamp)
     {

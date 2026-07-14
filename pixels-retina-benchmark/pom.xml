@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.pixelsdb</groupId>
+        <artifactId>pixels</artifactId>
+        <version>0.2.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>pixels-retina-benchmark</artifactId>
+    <name>pixels-retina-benchmark</name>
+    <description>Independent throughput benchmarks for the core Retina update operations.</description>
+
+    <properties>
+        <maven.compiler.source>8</maven.compiler.source>
+        <maven.compiler.target>8</maven.compiler.target>
+        <main.class>io.pixelsdb.pixels.retina.benchmark.RetinaBenchmarkMain</main.class>
+        <dep.hdrhistogram.version>2.1.12</dep.hdrhistogram.version>
+        <dep.mysql.connector.version>8.0.33</dep.mysql.connector.version>
+        <retina.benchmark.native.skip>false</retina.benchmark.native.skip>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-retina</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-daemon</artifactId>
+            <version>${project.version}</version>
+            <!-- The benchmark embeds only the transaction/metadata/node service
+                 implementations.  Keep unrelated storage/index SPI providers out
+                 of the fat JAR so ServiceLoader cannot initialize a backend that
+                 is not configured for this portable runtime. -->
+            <exclusions>
+                <exclusion>
+                    <groupId>io.pixelsdb</groupId>
+                    <artifactId>pixels-storage-hdfs</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>io.pixelsdb</groupId>
+                    <artifactId>pixels-storage-s3</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>io.pixelsdb</groupId>
+                    <artifactId>pixels-index-rocksdb</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>io.pixelsdb</groupId>
+                    <artifactId>pixels-index-rockset</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>io.pixelsdb</groupId>
+                    <artifactId>pixels-index-mapdb</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-index-memory</artifactId>
+        </dependency>
+        <!-- Physical SF100 index snapshots use the production RocksDB
+             SinglePointIndex provider.  The daemon transitive dependency is
+             intentionally excluded above; declare the provider explicitly so
+             snapshot restore remains an opt-in benchmark path. -->
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-index-rocksdb</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-index-main-sqlite</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-storage-localfs</artifactId>
+        </dependency>
+        <!-- Snapshot export must be able to read the same Pixels files as the
+             source SF100 deployment.  These providers are also available to a
+             WriteBuffer benchmark that explicitly selects the matching backend. -->
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-storage-hdfs</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.pixelsdb</groupId>
+            <artifactId>pixels-storage-s3</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.hdrhistogram</groupId>
+            <artifactId>HdrHistogram</artifactId>
+            <version>${dep.hdrhistogram.version}</version>
+        </dependency>
+        <!-- pixels-daemon normally expects this JAR in PIXELS_HOME/lib.  The
+             benchmark fat JAR carries it so metadata-only deployment does not. -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>${dep.mysql.connector.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>pixels-retina-benchmark-${project.version}</finalName>
+        <plugins>
+            <!--
+              pixels-retina builds the real Linux JNI library into PIXELS_HOME/lib.  Copy it
+              into this JAR so the visibility benchmark does not require a Pixels installation.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>${maven.plugin.antrun.version}</version>
+                <executions>
+                    <execution>
+                        <id>bundle-retina-native-library</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <!-- Lets non-Linux CI compile Java without disabling the
+                                 repository's other antrun-based code generators. -->
+                            <skip>${retina.benchmark.native.skip}</skip>
+                            <target>
+                                <mkdir dir="${project.build.outputDirectory}/native/linux"/>
+                                <copy todir="${project.build.outputDirectory}/native/linux"
+                                      failonerror="true" flatten="true">
+                                    <fileset dir="${env.PIXELS_HOME}/lib">
+                                        <include name="libpixels-retina.so"/>
+                                        <include name="libjemalloc.so.2"/>
+                                    </fileset>
+                                </copy>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>${maven.plugin.shade.version}</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>full</shadedClassifierName>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>log4j2.properties</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>${main.class}</mainClass>
+                                    <manifestEntries>
+                                        <Add-Opens>java.base/sun.nio.ch java.base/java.nio</Add-Opens>
+                                        <Multi-Release>true</Multi-Release>
+                                    </manifestEntries>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>${maven.plugin.assembly.version}</version>
+                <executions>
+                    <execution>
+                        <id>runtime-bundle</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                        <configuration>
+                            <descriptors>
+                                <descriptor>src/assembly/runtime.xml</descriptor>
+                            </descriptors>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

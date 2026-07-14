@@ -48,3 +48,7 @@ Source code: [client](../pixels-common/src/main/java/io/pixelsdb/pixels/common/m
 [Source code](https://github.com/pixelsdb/pixels-trino).
 
 ## Usage
+
+For source-audited, independent throughput tests of Transaction Begin, primary
+Index update, Visibility delete, WriteBuffer Add, and Transaction Commit, see
+the [Retina core-operation benchmark](../pixels-retina-benchmark/README.md).

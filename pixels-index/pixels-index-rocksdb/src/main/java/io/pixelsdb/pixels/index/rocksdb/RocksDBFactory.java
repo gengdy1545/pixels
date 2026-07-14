@@ -286,6 +286,45 @@ public class RocksDBFactory
         return dbPath;
     }
 
+    /**
+     * Register the canonical byte length of an index key before the shared
+     * RocksDB instance is opened.
+     *
+     * <p>This is primarily useful when opening a metadata-free physical
+     * snapshot.  Existing column families must be opened with the same fixed
+     * prefix extractor that was used by the source process, but the normal
+     * discovery path obtains that length from Metadata Service.  A snapshot
+     * manifest already contains the ordered key-column types, so a standalone
+     * consumer can register the exact {@link IndexUtils#keyLengthOf(Class)}
+     * prefix length without inventing a different index descriptor or
+     * requiring Metadata Service.</p>
+     *
+     * @param indexId index identifier embedded in the snapshot
+     * @param keyLength fixed logical-key prefix length in bytes, excluding the
+     *                  encoded index id and transaction timestamp
+     */
+    public static synchronized void registerIndexKeyLength(long indexId, int keyLength)
+    {
+        if (indexId <= 0)
+        {
+            throw new IllegalArgumentException("indexId must be positive");
+        }
+        if (keyLength <= 0)
+        {
+            throw new IllegalArgumentException("keyLength must be positive");
+        }
+        if (instance != null && !instance.isClosed())
+        {
+            throw new IllegalStateException("RocksDB is already open; key lengths must be registered first");
+        }
+        Integer previous = indexKeyLenCache.putIfAbsent(indexId, keyLength);
+        if (previous != null && !previous.equals(keyLength))
+        {
+            throw new IllegalArgumentException("conflicting key lengths for index " + indexId
+                    + ": " + previous + " and " + keyLength);
+        }
+    }
+
     private static Integer getIndexKeyLen(long tableId, long indexId) throws MetadataException
     {
         // Try to retrieve from cache using only indexId
