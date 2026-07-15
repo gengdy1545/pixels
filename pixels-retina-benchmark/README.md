@@ -122,7 +122,12 @@ pixels-retina-benchmark/
 tar -xzf pixels-retina-benchmark-0.2.0-SNAPSHOT-runtime.tar.gz
 cd pixels-retina-benchmark
 export PIXELS_CONFIG="$PWD/etc/pixels.properties"
+export JAVA_OPTS='-Xms40g -Xmx40g'
 ```
+
+本实验约定所有压测相关 Java 进程（服务端和 benchmark 客户端）均使用
+`-Xms40g -Xmx40g`。不要同时保留当前场景不需要的 Java 服务，以免多个
+40 GiB heap 加上 native/off-heap 内存超过物理内存。
 
 ## 4. 通用参数与指标
 
@@ -152,38 +157,43 @@ export PIXELS_CONFIG="$PWD/etc/pixels.properties"
 
 ## 5. Transaction 三个命令
 
-先确保外部 etcd 可用并已替换配置，然后在终端 A 启动前台服务：
+推荐用 runtime 自带的编排脚本一次完成三项测试。脚本默认使用 `scenario`
+隔离模式：每个场景创建全新的 etcd data dir 和 Transaction Server，自动等待
+服务就绪、将服务端和客户端 JVM 均设为 `-Xms40g -Xmx40g`、保存日志、
+检查结果，并在失败时停止，不继续运行
+已受污染的下一项。
 
 ```bash
+export PIXELS_HOME="$PWD"
 export PIXELS_CONFIG="$PWD/etc/pixels.properties"
-bin/start-transaction-server
+
+bin/run-transaction-suite \
+  --isolation scenario \
+  --etcd-bin /path/to/etcd \
+  --etcdctl-bin /path/to/etcdctl \
+  --results-dir /data/retina-benchmark-results
 ```
 
-可用 `--trans-port` 或 `--port` 覆盖服务监听端口。一个 benchmark 环境只应运行一个 Transaction Server 实例。
-
-终端 B 运行以下任一命令：
+正式默认参数对齐 16 vCPU：16 threads、4 clients、batch 64、生命周期
+测量 60 秒；Begin/Commit 各以 `2e7` operations 限制 pending 规模。先用
+`--smoke` 做小规模功能验证：
 
 ```bash
-bin/run-benchmark transaction-begin \
-  --trans-host BENCHMARK_HOST --trans-port 18889 \
-  --threads 32 --clients 4 --batch-size 64 \
-  --warmup-seconds 10 --duration-seconds 60 --data-size 5000000
+bin/run-transaction-suite \
+  --isolation scenario \
+  --etcd-bin /path/to/etcd \
+  --etcdctl-bin /path/to/etcdctl \
+  --smoke
 ```
 
-```bash
-bin/run-benchmark transaction-commit \
-  --trans-host BENCHMARK_HOST --trans-port 18889 \
-  --threads 32 --clients 4 --batch-size 64 \
-  --trans-prefill-batch-size 1024 \
-  --warmup-seconds 10 --duration-seconds 60 --data-size 3000000
-```
+`--isolation suite` 则整套测试共用一个全新 etcd，但每项仍重启 Transaction
+Server；适合模拟事务 ID 和 watermark 持续递增的生产语义。脚本不会删除或
+覆盖已有 etcd 数据，也不会杀死未知的端口占用进程。默认端口 `2379/2380/18889`
+必须空闲，可用对应 CLI 参数覆盖。
 
-```bash
-bin/run-benchmark transaction-begin-commit \
-  --trans-host BENCHMARK_HOST --trans-port 18889 \
-  --threads 32 --clients 4 --batch-size 64 \
-  --warmup-seconds 10 --duration-seconds 60 --data-size 3000000
-```
+如只需手动运行单项，仍可用 `bin/start-transaction-server` 和
+`bin/run-benchmark transaction-*`。此时必须自行隔离 etcd、重启服务并处理
+Begin cleanup；不建议用手动方式跑整套正式实验。
 
 真实调用链：
 
@@ -247,6 +257,38 @@ bin/run-benchmark index-update-primary \
 
 将命令替换为 `index-put-primary` 或 `index-delete-primary` 即可测量另外两个主索引入口。
 
+推荐用 runtime 自带的脚本一次验证三个主索引入口。脚本会先执行
+`snapshot-validate --snapshot-require index`，再依次运行
+Put、Update、Delete；每项使用不同且原本不存在的 `--snapshot-work-dir`，
+因此每个 JVM 都从只读 snapshot 重新复制完整 RocksDB 和 SQLite，不继承上一项
+的写入或删除：
+
+```bash
+export PIXELS_HOME="$PWD"
+export PIXELS_CONFIG="$PWD/etc/pixels.properties"
+
+bin/run-index-suite \
+  --snapshot-dir /data/snapshots/node-a \
+  --snapshot-table customer \
+  --work-dir-root /data/retina-benchmark-work/index \
+  --results-dir /data/retina-benchmark-results
+```
+
+正式默认参数为 16 threads、1 client、batch 64、warmup 最多 10 万 entries、
+测量最多 100 万 entries 或 20 秒，JVM 为 `-Xms40g -Xmx40g`。100 万 entries
+对应约 15,625 次完整 batch API，避免在计时前预生成 `1e9` 请求。首次运行先加 `--smoke`
+做小规模功能验证。结果写入 `index-<RUN_ID>`。每项成功并记录结果后，脚本会
+立即删除该项工作副本，再从 snapshot 恢复下一项；失败项则保留现场。调试时可
+加 `--keep-work-dirs` 保留三个副本。每个副本的 RocksDB 和 SQLite 复制完成后
+会立即输出
+`snapshot_index_copy_completed=<path>/index`。Index suite 不需要 etcd、
+MySQL、Metadata Server 或 S3。
+
+正式性能对比无需重复全部 12 个同实现的 unique primary index。推荐测试
+`item`（4B）、`stock`（8B）、`order`（12B）、`orderline`（16B）和
+`history`（28B/default prefix），分别运行三种主索引操作；其余表只做 profile
+与 smoke 验证。
+
 Secondary 命令必须用索引 ID、单列名或逗号分隔的 key-column 名唯一指定目标：
 
 ```bash
@@ -275,17 +317,23 @@ RetinaResourceManager.deleteRecord(RowLocation, timestamp)
   -> C++ TileVisibility::deleteTileRecord
 ```
 
-运行：
+正式测试推荐使用 runtime 自带的脚本，固定测试 ordered-only `orderline`：
 
 ```bash
-bin/run-benchmark visibility \
+bin/run-visibility-suite \
   --snapshot-dir /data/snapshots/node-a \
-  --snapshot-table lineitem \
-  --threads 32 --clients 1 --batch-size 1 \
-  --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
+  --results-dir /data/retina-benchmark-results
 ```
 
-Visibility 只有 clean baseline：每个 phase 都根据 manifest footer 的 `recordNum` 调用 `addVisibility(fileId, rgId, recordNum, 0, null, false)`，不读取或恢复任何 Visibility state。
+脚本默认使用 16 threads、batch 1、10 秒/10 万行 warmup，并对最多
+2990 万行执行最长 180 秒的正式测量。Warmup 与 Measurement 合计最多覆盖
+`orderline` 全部 3000 万行；先到达 180 秒或行数上限即停止。每个成功删除都在
+计时后用 `queryVisibility` 验证。首次使用可加 `--smoke`。
+
+Visibility 只有 clean baseline：每个 phase 都只选择 readable layout 中生产标记的
+`orderedPaths[0]`，根据 manifest footer 的 `recordNum` 调用
+`addVisibility(fileId, rgId, recordNum, 0, null, false)`。compact、secondary 和
+projection 路径不参与测试，也不读取或恢复任何 Visibility state。
 
 每个 operation 删除一个唯一物理行。若 manifest 包含物理 Index 状态，删除 timestamp 为自动记录的 `snapshotTimestamp+1`；否则为 `1`。warmup 与 measurement 使用不相交的行；每个 phase 都重建同一 clean baseline，并在计时后用 `queryVisibility` 校验所有成功删除。GC 和 Storage GC 在场景内强制关闭。
 
@@ -293,30 +341,42 @@ Visibility 只有 clean baseline：每个 phase 都根据 manifest footer 的 `r
 
 ## 8. WriteBuffer Add
 
-先初始化外部 MySQL、确认外部 etcd 可用并完成配置替换。终端 A 启动前台 Metadata/Node 服务：
+正式测试使用 runtime 自带的隔离脚本。MySQL 必须已经初始化且
+`pixels.properties` 中的登录信息正确；etcd 和 Metadata/Node Server 不要手工启动，
+脚本会在空闲端口上自动管理：
 
 ```bash
-export PIXELS_CONFIG="$PWD/etc/pixels.properties"
-bin/start-metadata-server
-```
-
-可用 `--metadata-port` 和 `--node-port` 覆盖监听端口。看到两个服务 ready 后，在终端 B 运行：
-
-```bash
-export PIXELS_CONFIG="$PWD/etc/pixels.properties"
-export RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
-
-bin/run-benchmark write-buffer-add \
+bin/run-write-buffer-suite \
   --snapshot-dir /data/snapshots/node-a \
-  --snapshot-table lineitem \
-  --threads 32 --clients 4 --batch-size 64 \
-  --warmup-seconds 10 --duration-seconds 60 --data-size 1000000 \
-  --writebuffer-storage-scheme file \
-  --writebuffer-base-uri "file:///data/retina-bench/${RUN_ID}/table" \
-  --writebuffer-object-storage-scheme file \
-  --writebuffer-object-folder "/data/retina-bench/${RUN_ID}/objects" \
-  --writebuffer-row-pool-size 100000
+  --s3-root s3://YOUR_BUCKET/retina-benchmark \
+  --results-dir /data/retina-benchmark-results \
+  --smoke
 ```
+
+冒烟通过后去掉 `--smoke` 运行正式测试。默认固定使用 `orderline`、16 threads、
+4 clients/vnodes、batch 64、30 秒/10 万行 warmup，以及 **180 秒**
+measurement（仅时间截止，无实际行数上限）；服务端和客户端 JVM 均使用
+`-Xms40g -Xmx40g`。
+flush 参数为 10240 行/MemTable、20 个 MemTable/文件、4 个对象存储 flush
+线程、30 秒定时 flush、encoding level 2、2 GiB block。
+
+每轮隔离方式如下：
+
+- etcd 使用新的 data dir 和 `initial-cluster-state=new`，成功后删除，失败时保留；
+- Metadata Server 仍连接配置中的现有 MySQL catalog，但 benchmark 使用唯一逻辑
+  schema，正常 close 时自动 drop，不读取生产表状态；
+- warmup 和 measurement 分别创建独立 Metadata table、SQLite MainIndex 和
+  `PixelsWriteBuffer`；
+- S3 目标自动追加唯一 `RUN_ID`，成功后保留供检查，不会与其他测试共用；
+- Snapshot 只读，提供 `orderline` 列 schema、类型、语义配置和初始描述，不恢复
+  etcd、MySQL、MemTable 或生产 table ID；
+- benchmark client 自动 preload 内置 `libjemalloc.so.2`，避免 JNI 与 glibc
+  malloc 混用导致 native 崩溃。
+
+脚本检查 Snapshot profile、benchmark 返回码、`errors=0`、成功行数、S3/flush
+参数和异步 flush 错误；安装 AWS CLI 时还会确认唯一 prefix 下实际产生了对象。
+可使用 `--dry-run` 查看最终参数，或通过端口参数避开其他服务。不要把
+`--s3-root` 指向 Snapshot 的生产数据 prefix。
 
 真实计时链：
 

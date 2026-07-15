@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="${RETINA_BENCHMARK_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+umask 077
+
+SNAPSHOT_DIR=""
+RESULTS_ROOT="${RESULTS_ROOT:-${ROOT_DIR}/results}"
+JAVA_OPTS_VALUE="${VISIBILITY_JAVA_OPTS:--Xms40g -Xmx40g}"
+NATIVE_TEMP_DIR=""
+JEMALLOC_PRELOAD=""
+
+TABLE="orderline"
+ORDERLINE_ROWS=30000000
+THREADS=16
+CLIENTS=1
+BATCH_SIZE=1
+WARMUP_SECONDS=10
+WARMUP_OPERATIONS=100000
+DURATION_SECONDS=180
+SMOKE=false
+DRY_RUN=false
+
+usage()
+{
+    cat <<'EOF'
+Usage: bin/run-visibility-suite --snapshot-dir DIR [options]
+
+Runs the formal orderline Visibility-delete benchmark. The default warmup and
+measurement operation ceilings together cover at most all 30,000,000 ordered
+physical rows. The measured duration is capped at 180 seconds.
+
+Options:
+  --snapshot-dir DIR             Snapshot v2 directory (required)
+  --results-dir DIR              Results root (default: runtime/results)
+  --java-opts TEXT               Benchmark JVM options (default: -Xms40g -Xmx40g)
+  --threads N                    Worker threads (default: 16)
+  --warmup-seconds N             Warmup time limit (default: 10)
+  --warmup-operations N          Warmup row limit (default: 100000)
+  --duration-seconds N           Measurement limit, 1..180 (default: 180)
+  --smoke                        Delete 100 rows with no warmup
+  --dry-run                      Print configuration without running
+  -h, --help                     Show this help
+EOF
+}
+
+log()
+{
+    printf '[visibility-suite] %s\n' "$*"
+}
+
+die()
+{
+    printf '[visibility-suite] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+require_value()
+{
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "${value}" ]] || die "${option} requires a value"
+}
+
+require_positive_integer()
+{
+    local name="$1"
+    local value="$2"
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] ||
+        die "${name} must be a positive integer: ${value}"
+}
+
+cleanup()
+{
+    if [[ -n "${NATIVE_TEMP_DIR}" ]]
+    then
+        rm -rf -- "${NATIVE_TEMP_DIR}"
+    fi
+}
+
+prepare_jemalloc_preload()
+{
+    if [[ "${LD_PRELOAD:-}" == *libjemalloc* ]]
+    then
+        JEMALLOC_PRELOAD="${LD_PRELOAD}"
+        return
+    fi
+
+    local jemalloc="${ROOT_DIR}/lib/libjemalloc.so.2"
+    if [[ ! -f "${jemalloc}" ]]
+    then
+        local benchmark_jar="${ROOT_DIR}/pixels-retina-benchmark-full.jar"
+        [[ -f "${benchmark_jar}" ]] ||
+            die "benchmark JAR not found: ${benchmark_jar}"
+        command -v unzip >/dev/null 2>&1 ||
+            die "unzip is required to preload bundled jemalloc"
+
+        NATIVE_TEMP_DIR="$(mktemp -d \
+            "${TMPDIR:-/tmp}/pixels-retina-visibility.XXXXXX")"
+        jemalloc="${NATIVE_TEMP_DIR}/libjemalloc.so.2"
+        unzip -p "${benchmark_jar}" native/linux/libjemalloc.so.2 > "${jemalloc}" ||
+            die "failed to extract bundled libjemalloc.so.2"
+        [[ -s "${jemalloc}" ]] ||
+            die "bundled libjemalloc.so.2 is empty"
+    fi
+
+    JEMALLOC_PRELOAD="${jemalloc}${LD_PRELOAD:+:${LD_PRELOAD}}"
+}
+
+trap cleanup EXIT
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        --snapshot-dir) require_value "$1" "${2:-}"; SNAPSHOT_DIR="$2"; shift 2 ;;
+        --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
+        --java-opts) require_value "$1" "${2:-}"; JAVA_OPTS_VALUE="$2"; shift 2 ;;
+        --threads) require_value "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
+        --warmup-seconds) require_value "$1" "${2:-}"; WARMUP_SECONDS="$2"; shift 2 ;;
+        --warmup-operations) require_value "$1" "${2:-}"; WARMUP_OPERATIONS="$2"; shift 2 ;;
+        --duration-seconds) require_value "$1" "${2:-}"; DURATION_SECONDS="$2"; shift 2 ;;
+        --smoke) SMOKE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+[[ -n "${SNAPSHOT_DIR}" ]] || die "--snapshot-dir is required"
+[[ -f "${SNAPSHOT_DIR}/snapshot.json" ]] ||
+    die "snapshot manifest not found: ${SNAPSHOT_DIR}/snapshot.json"
+[[ -x "${ROOT_DIR}/bin/run-benchmark" ]] ||
+    die "run-benchmark not found under ${ROOT_DIR}/bin"
+
+require_positive_integer "threads" "${THREADS}"
+require_positive_integer "duration-seconds" "${DURATION_SECONDS}"
+(( DURATION_SECONDS <= 180 )) ||
+    die "duration-seconds must not exceed 180"
+[[ "${WARMUP_SECONDS}" =~ ^[0-9]+$ ]] ||
+    die "warmup-seconds must be a non-negative integer: ${WARMUP_SECONDS}"
+[[ "${WARMUP_OPERATIONS}" =~ ^[0-9]+$ ]] ||
+    die "warmup-operations must be a non-negative integer: ${WARMUP_OPERATIONS}"
+(( WARMUP_OPERATIONS < ORDERLINE_ROWS )) ||
+    die "warmup-operations must be less than ${ORDERLINE_ROWS}"
+
+if [[ "${SMOKE}" == "true" ]]
+then
+    THREADS=2
+    WARMUP_SECONDS=0
+    WARMUP_OPERATIONS=0
+    DURATION_SECONDS=2
+    MEASUREMENT_OPERATIONS=100
+else
+    MEASUREMENT_OPERATIONS=$((ORDERLINE_ROWS - WARMUP_OPERATIONS))
+fi
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_DIR="${RESULTS_ROOT%/}/visibility-${RUN_ID}"
+
+if [[ "${DRY_RUN}" == "true" ]]
+then
+    log "dry run"
+    printf 'snapshot_dir=%s\ntable=%s\nresults_dir=%s\n' \
+        "${SNAPSHOT_DIR}" "${TABLE}" "${RUN_DIR}"
+    printf 'threads=%s clients=%s batch_size=%s warmup_seconds=%s warmup_operations=%s\n' \
+        "${THREADS}" "${CLIENTS}" "${BATCH_SIZE}" "${WARMUP_SECONDS}" "${WARMUP_OPERATIONS}"
+    printf 'duration_seconds=%s measurement_operations=%s maximum_total_deletes=%s java_opts=%s\n' \
+        "${DURATION_SECONDS}" "${MEASUREMENT_OPERATIONS}" \
+        "$((WARMUP_OPERATIONS + MEASUREMENT_OPERATIONS))" "${JAVA_OPTS_VALUE}"
+    exit 0
+fi
+
+mkdir -p "${RUN_DIR}"
+
+{
+    printf 'snapshot_dir=%q\n' "${SNAPSHOT_DIR}"
+    printf 'table=%q\n' "${TABLE}"
+    printf 'java_opts=%q\n' "${JAVA_OPTS_VALUE}"
+    printf 'threads=%q\n' "${THREADS}"
+    printf 'clients=%q\n' "${CLIENTS}"
+    printf 'batch_size=%q\n' "${BATCH_SIZE}"
+    printf 'warmup_seconds=%q\n' "${WARMUP_SECONDS}"
+    printf 'warmup_operations=%q\n' "${WARMUP_OPERATIONS}"
+    printf 'duration_seconds=%q\n' "${DURATION_SECONDS}"
+    printf 'measurement_operations=%q\n' "${MEASUREMENT_OPERATIONS}"
+    printf 'maximum_total_deletes=%q\n' \
+        "$((WARMUP_OPERATIONS + MEASUREMENT_OPERATIONS))"
+} > "${RUN_DIR}/parameters.env"
+
+{
+    uname -a
+    printf 'nproc=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    java -version
+    free -h 2>/dev/null || true
+} > "${RUN_DIR}/system-info.txt" 2>&1
+
+log "results will be written to ${RUN_DIR}"
+
+set +e
+PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}" \
+JAVA_OPTS="${JAVA_OPTS_VALUE}" \
+    "${ROOT_DIR}/bin/run-benchmark" snapshot-validate \
+    --snapshot-dir "${SNAPSHOT_DIR}" \
+    --snapshot-table "${TABLE}" \
+    --snapshot-require visibility \
+    2>&1 | tee "${RUN_DIR}/snapshot-validation.txt"
+validation_status=${PIPESTATUS[0]}
+set -e
+[[ "${validation_status}" -eq 0 ]] ||
+    die "snapshot visibility validation failed; see ${RUN_DIR}/snapshot-validation.txt"
+grep -q '^status=valid$' "${RUN_DIR}/snapshot-validation.txt" ||
+    die "snapshot validation did not report status=valid"
+
+prepare_jemalloc_preload
+log "running formal orderline Visibility benchmark"
+set +e
+PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}" \
+LD_PRELOAD="${JEMALLOC_PRELOAD}" \
+JAVA_OPTS="${JAVA_OPTS_VALUE}" \
+    "${ROOT_DIR}/bin/run-benchmark" visibility \
+    --snapshot-dir "${SNAPSHOT_DIR}" \
+    --snapshot-table "${TABLE}" \
+    --threads "${THREADS}" \
+    --clients "${CLIENTS}" \
+    --batch-size "${BATCH_SIZE}" \
+    --warmup-seconds "${WARMUP_SECONDS}" \
+    --warmup-operations "${WARMUP_OPERATIONS}" \
+    --duration-seconds "${DURATION_SECONDS}" \
+    --data-size "${MEASUREMENT_OPERATIONS}" \
+    2>&1 | tee "${RUN_DIR}/result.txt"
+benchmark_status=${PIPESTATUS[0]}
+set -e
+[[ "${benchmark_status}" -eq 0 ]] ||
+    die "Visibility benchmark failed with exit code ${benchmark_status}; see ${RUN_DIR}/result.txt"
+
+RESULT="${RUN_DIR}/result.txt"
+grep -q '^benchmark=visibility$' "${RESULT}" ||
+    die "Visibility did not produce a benchmark result"
+grep -q '^errors=0$' "${RESULT}" ||
+    die "Visibility reported errors"
+grep -Eq '^successful_operations=[1-9][0-9]*$' "${RESULT}" ||
+    die "Visibility completed no successful operations"
+grep -Eq '^stop_reason=(duration|data-size)$' "${RESULT}" ||
+    die "Visibility stopped for an unexpected reason"
+grep -q "^detail.manifestVisibilityRows=${ORDERLINE_ROWS}$" "${RESULT}" ||
+    die "orderline ordered-row count does not equal ${ORDERLINE_ROWS}"
+
+successful="$(awk -F= '$1 == "successful_operations" { print $2 }' "${RESULT}")"
+validated="$(awk -F= '$1 == "detail.lastValidatedDeletes" { print $2 }' "${RESULT}")"
+api_calls="$(awk -F= '$1 == "api_calls" { print $2 }' "${RESULT}")"
+[[ "${validated}" == "${successful}" ]] ||
+    die "validated deletes ${validated} do not match successful operations ${successful}"
+[[ "${api_calls}" == "${successful}" ]] ||
+    die "API calls ${api_calls} do not match successful operations ${successful}"
+
+configured_capacity="$(awk -F= '$1 == "detail.configuredTileCapacity" { print $2 }' "${RESULT}")"
+native_capacity="$(awk -F= '$1 == "detail.nativeCompiledTileCapacity" { print $2 }' "${RESULT}")"
+[[ -n "${configured_capacity}" && "${configured_capacity}" == "${native_capacity}" ]] ||
+    die "configured/native Visibility capacities do not match"
+
+awk -F= '
+    /^(benchmark|successful_operations|errors|elapsed_seconds|throughput_ops_per_second|api_calls_per_second|p50_latency_us|p95_latency_us|p99_latency_us|stop_reason|detail.manifestVisibilityRGs|detail.manifestVisibilityRows|detail.lastValidatedDeletes|detail.configuredTileCapacity|detail.nativeCompiledTileCapacity)=/ {
+        print
+    }
+' "${RESULT}" > "${RUN_DIR}/summary.txt"
+
+cat "${RUN_DIR}/summary.txt"
+log "Visibility suite completed successfully"

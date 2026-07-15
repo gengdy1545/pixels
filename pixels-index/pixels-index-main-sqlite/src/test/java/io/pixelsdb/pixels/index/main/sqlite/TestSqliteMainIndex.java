@@ -33,6 +33,10 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.IOException;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -65,7 +69,7 @@ public class TestSqliteMainIndex
     @AfterEach
     public void tearDown() throws Exception
     {
-        mainIndex.close();
+        MainIndexFactory.Instance().closeIndex(tableId, false);
 
         // Clear SQLite Directory
         try
@@ -127,6 +131,40 @@ public class TestSqliteMainIndex
 
         Assertions.assertTrue(mainIndex.deleteRowIdRange(new RowIdRange(rowId, rowId + 1,
                 2, 2, 0, 1)));
+    }
+
+    @Test
+    public void testFlushCacheIsAtomic() throws Exception
+    {
+        long fileId = 3L;
+        long firstRowId = 4000L;
+        long secondRowId = 4002L;
+        Assertions.assertTrue(mainIndex.putEntry(firstRowId, IndexProto.RowLocation.newBuilder()
+                .setFileId(fileId).setRgId(0).setRgRowOffset(0).build()));
+        Assertions.assertTrue(mainIndex.putEntry(secondRowId, IndexProto.RowLocation.newBuilder()
+                .setFileId(fileId).setRgId(0).setRgRowOffset(2).build()));
+
+        String sqlitePath = ConfigFactory.Instance().getProperty("index.sqlite.path");
+        File database = new File(sqlitePath, tableId + ".main.index.db");
+        String jdbcUrl = "jdbc:sqlite:" + database.getAbsolutePath();
+        try (Connection connection = DriverManager.getConnection(jdbcUrl);
+                Statement statement = connection.createStatement())
+        {
+            statement.execute("CREATE TRIGGER fail_second_range BEFORE INSERT ON row_id_ranges "
+                    + "WHEN NEW.row_id_start = " + secondRowId + " "
+                    + "BEGIN SELECT RAISE(ABORT, 'forced failure'); END");
+        }
+
+        Assertions.assertThrows(MainIndexException.class, () -> mainIndex.flushCache(fileId));
+
+        try (Connection connection = DriverManager.getConnection(jdbcUrl);
+                Statement statement = connection.createStatement();
+                ResultSet result = statement.executeQuery("SELECT COUNT(*) FROM row_id_ranges "
+                        + "WHERE row_id_start IN (" + firstRowId + ", " + secondRowId + ")"))
+        {
+            Assertions.assertTrue(result.next());
+            Assertions.assertEquals(0, result.getInt(1));
+        }
     }
 
     @Test

@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="${RETINA_BENCHMARK_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+umask 077
+
+ISOLATION="scenario"
+RESULTS_ROOT="${RESULTS_ROOT:-${ROOT_DIR}/results}"
+STATE_ROOT="${TRANSACTION_STATE_ROOT:-/var/tmp/pixels-retina-benchmark/transaction-suite}"
+ETCD_BIN="${ETCD_BIN:-$(command -v etcd 2>/dev/null || true)}"
+ETCDCTL_BIN="${ETCDCTL_BIN:-$(command -v etcdctl 2>/dev/null || true)}"
+ETCD_HOST="127.0.0.1"
+ETCD_PORT=2379
+ETCD_PEER_PORT=2380
+TRANS_HOST="127.0.0.1"
+TRANS_PORT=18889
+TRANS_JAVA_OPTS="${TRANS_JAVA_OPTS:--Xms40g -Xmx40g}"
+CLIENT_JAVA_OPTS="${CLIENT_JAVA_OPTS:--Xms40g -Xmx40g}"
+SOURCE_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}"
+
+THREADS=16
+CLIENTS=4
+BATCH_SIZE=64
+WARMUP_SECONDS=30
+DURATION_SECONDS=60
+LIFECYCLE_DATA_SIZE=1000000000
+PENDING_DATA_SIZE=20000000
+CLEANUP_BATCH_SIZE=1024
+PREFILL_BATCH_SIZE=1024
+RPC_DEADLINE_MS=180000
+SMOKE=false
+DRY_RUN=false
+
+ETCD_PID=""
+TRANS_PID=""
+RSS_MONITOR_PID=""
+CURRENT_CONFIG=""
+RUN_DIR=""
+RUN_STATE_DIR=""
+
+usage()
+{
+    cat <<'EOF'
+Usage: bin/run-transaction-suite [options]
+
+Runs transaction-begin-commit, transaction-begin, and transaction-commit
+with managed etcd and Transaction Server processes.
+
+Options:
+  --isolation scenario|suite     Fresh etcd per scenario (default) or per suite
+  --results-dir DIR              Results root (default: runtime/results)
+  --state-dir DIR                Runtime state root (default: /var/tmp/...)
+  --config FILE                  Source pixels.properties
+  --etcd-bin FILE                etcd executable
+  --etcdctl-bin FILE             etcdctl executable
+  --etcd-port PORT               Client port (default: 2379)
+  --etcd-peer-port PORT          Peer port (default: 2380)
+  --trans-port PORT              Transaction gRPC port (default: 18889)
+  --java-opts TEXT               JVM options for server and benchmark clients
+  --threads N                    Worker threads (default: 16)
+  --clients N                    gRPC clients (default: 4)
+  --batch-size N                 Logical operations per RPC batch (default: 64)
+  --warmup-seconds N             Normal warmup limit (default: 30)
+  --duration-seconds N           Lifecycle measurement duration (default: 60)
+  --lifecycle-data-size N        Begin-commit operation ceiling (default: 1e9)
+  --pending-data-size N          Begin/commit operation ceiling (default: 2e7)
+  --smoke                        Use tiny functional-test parameters
+  --dry-run                      Print configuration without starting processes
+  -h, --help                     Show this help
+EOF
+}
+
+log()
+{
+    printf '[transaction-suite] %s\n' "$*"
+}
+
+die()
+{
+    printf '[transaction-suite] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+require_value()
+{
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "${value}" ]] || die "${option} requires a value"
+}
+
+require_positive_integer()
+{
+    local name="$1"
+    local value="$2"
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] || die "${name} must be a positive integer: ${value}"
+}
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        --isolation) require_value "$1" "${2:-}"; ISOLATION="$2"; shift 2 ;;
+        --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
+        --state-dir) require_value "$1" "${2:-}"; STATE_ROOT="$2"; shift 2 ;;
+        --config) require_value "$1" "${2:-}"; SOURCE_CONFIG="$2"; shift 2 ;;
+        --etcd-bin) require_value "$1" "${2:-}"; ETCD_BIN="$2"; shift 2 ;;
+        --etcdctl-bin) require_value "$1" "${2:-}"; ETCDCTL_BIN="$2"; shift 2 ;;
+        --etcd-port) require_value "$1" "${2:-}"; ETCD_PORT="$2"; shift 2 ;;
+        --etcd-peer-port) require_value "$1" "${2:-}"; ETCD_PEER_PORT="$2"; shift 2 ;;
+        --trans-port) require_value "$1" "${2:-}"; TRANS_PORT="$2"; shift 2 ;;
+        --java-opts)
+            require_value "$1" "${2:-}"
+            TRANS_JAVA_OPTS="$2"
+            CLIENT_JAVA_OPTS="$2"
+            shift 2
+            ;;
+        --threads) require_value "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
+        --clients) require_value "$1" "${2:-}"; CLIENTS="$2"; shift 2 ;;
+        --batch-size) require_value "$1" "${2:-}"; BATCH_SIZE="$2"; shift 2 ;;
+        --warmup-seconds) require_value "$1" "${2:-}"; WARMUP_SECONDS="$2"; shift 2 ;;
+        --duration-seconds) require_value "$1" "${2:-}"; DURATION_SECONDS="$2"; shift 2 ;;
+        --lifecycle-data-size) require_value "$1" "${2:-}"; LIFECYCLE_DATA_SIZE="$2"; shift 2 ;;
+        --pending-data-size) require_value "$1" "${2:-}"; PENDING_DATA_SIZE="$2"; shift 2 ;;
+        --smoke) SMOKE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+[[ "${ISOLATION}" == "scenario" || "${ISOLATION}" == "suite" ]] ||
+    die "--isolation must be scenario or suite"
+[[ -x "${ETCD_BIN}" ]] || die "etcd executable not found; use --etcd-bin"
+if [[ -z "${ETCDCTL_BIN}" && -n "${ETCD_BIN}" ]]
+then
+    ETCDCTL_BIN="$(dirname "${ETCD_BIN}")/etcdctl"
+fi
+[[ -x "${ETCDCTL_BIN}" ]] || die "etcdctl executable not found; use --etcdctl-bin"
+[[ -f "${SOURCE_CONFIG}" ]] || die "pixels.properties not found: ${SOURCE_CONFIG}"
+[[ -x "${ROOT_DIR}/bin/run-benchmark" ]] || die "run-benchmark not found under ${ROOT_DIR}/bin"
+
+for pair in \
+    "etcd-port:${ETCD_PORT}" "etcd-peer-port:${ETCD_PEER_PORT}" \
+    "trans-port:${TRANS_PORT}" "threads:${THREADS}" "clients:${CLIENTS}" \
+    "batch-size:${BATCH_SIZE}" "duration-seconds:${DURATION_SECONDS}" \
+    "lifecycle-data-size:${LIFECYCLE_DATA_SIZE}" "pending-data-size:${PENDING_DATA_SIZE}"
+do
+    require_positive_integer "${pair%%:*}" "${pair#*:}"
+done
+[[ "${WARMUP_SECONDS}" =~ ^[0-9]+$ ]] ||
+    die "warmup-seconds must be a non-negative integer: ${WARMUP_SECONDS}"
+(( CLIENTS <= THREADS )) || die "clients must not exceed threads"
+
+if [[ "${SMOKE}" == "true" ]]
+then
+    THREADS=2
+    CLIENTS=1
+    BATCH_SIZE=1
+    WARMUP_SECONDS=0
+    DURATION_SECONDS=2
+    LIFECYCLE_DATA_SIZE=100
+    PENDING_DATA_SIZE=100
+    CLEANUP_BATCH_SIZE=64
+    PREFILL_BATCH_SIZE=64
+    RPC_DEADLINE_MS=30000
+fi
+
+port_open()
+{
+    local host="$1"
+    local port="$2"
+    (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1
+}
+
+wait_for_port()
+{
+    local host="$1"
+    local port="$2"
+    local pid="$3"
+    local label="$4"
+    local _
+    for _ in $(seq 1 120)
+    do
+        kill -0 "${pid}" 2>/dev/null || die "${label} exited before becoming ready"
+        if port_open "${host}" "${port}"
+        then
+            return
+        fi
+        sleep 0.5
+    done
+    die "timed out waiting for ${label} on ${host}:${port}"
+}
+
+stop_process()
+{
+    local pid="${1:-}"
+    local label="$2"
+    local _
+    [[ -n "${pid}" ]] || return 0
+    if ! kill -0 "${pid}" 2>/dev/null
+    then
+        wait "${pid}" 2>/dev/null || true
+        return 0
+    fi
+    log "stopping ${label} (pid=${pid})"
+    kill "${pid}" 2>/dev/null || true
+    for _ in $(seq 1 30)
+    do
+        if ! kill -0 "${pid}" 2>/dev/null
+        then
+            wait "${pid}" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.5
+    done
+    log "${label} did not stop gracefully; sending SIGKILL"
+    kill -9 "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+}
+
+stop_transaction_server()
+{
+    stop_process "${TRANS_PID}" "Transaction Server"
+    TRANS_PID=""
+    if [[ -n "${RSS_MONITOR_PID}" ]]
+    then
+        wait "${RSS_MONITOR_PID}" 2>/dev/null || true
+        RSS_MONITOR_PID=""
+    fi
+}
+
+stop_etcd()
+{
+    stop_process "${ETCD_PID}" "etcd"
+    ETCD_PID=""
+}
+
+cleanup()
+{
+    local status=$?
+    trap - EXIT INT TERM
+    stop_transaction_server
+    stop_etcd
+    remove_current_config
+    exit "${status}"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+set_property()
+{
+    local file="$1"
+    local key="$2"
+    local value="$3"
+    local staged="${file}.tmp"
+    awk -v key="${key}" -v value="${value}" '
+        BEGIN { found = 0 }
+        index($0, key "=") == 1 {
+            print key "=" value
+            found = 1
+            next
+        }
+        { print }
+        END {
+            if (!found) print key "=" value
+        }
+    ' "${file}" > "${staged}"
+    mv "${staged}" "${file}"
+}
+
+prepare_config()
+{
+    local directory="$1"
+    local config="${directory}/pixels.properties"
+    cp "${SOURCE_CONFIG}" "${config}"
+    chmod 600 "${config}"
+    set_property "${config}" "etcd.hosts" "${ETCD_HOST}"
+    set_property "${config}" "etcd.port" "${ETCD_PORT}"
+    set_property "${config}" "trans.server.host" "${TRANS_HOST}"
+    set_property "${config}" "trans.server.port" "${TRANS_PORT}"
+    CURRENT_CONFIG="${config}"
+}
+
+remove_current_config()
+{
+    if [[ -n "${CURRENT_CONFIG}" && -n "${RUN_STATE_DIR}" &&
+          "${CURRENT_CONFIG}" == "${RUN_STATE_DIR}/"* ]]
+    then
+        rm -f "${CURRENT_CONFIG}"
+    fi
+    CURRENT_CONFIG=""
+}
+
+start_etcd()
+{
+    local directory="$1"
+    local name="$2"
+    local log_file="$3"
+    local data_directory="${directory}/etcd-data"
+    mkdir -p "${data_directory}"
+
+    port_open "${ETCD_HOST}" "${ETCD_PORT}" &&
+        die "etcd port ${ETCD_HOST}:${ETCD_PORT} is already occupied"
+    port_open "${ETCD_HOST}" "${ETCD_PEER_PORT}" &&
+        die "etcd peer port ${ETCD_HOST}:${ETCD_PEER_PORT} is already occupied"
+
+    log "starting fresh etcd for ${name}"
+    "${ETCD_BIN}" \
+        --name "${name}" \
+        --data-dir "${data_directory}" \
+        --listen-client-urls "http://${ETCD_HOST}:${ETCD_PORT}" \
+        --advertise-client-urls "http://${ETCD_HOST}:${ETCD_PORT}" \
+        --listen-peer-urls "http://${ETCD_HOST}:${ETCD_PEER_PORT}" \
+        --initial-advertise-peer-urls "http://${ETCD_HOST}:${ETCD_PEER_PORT}" \
+        --initial-cluster "${name}=http://${ETCD_HOST}:${ETCD_PEER_PORT}" \
+        --initial-cluster-token "${name}" \
+        --initial-cluster-state new \
+        >"${log_file}" 2>&1 &
+    ETCD_PID=$!
+
+    local _
+    for _ in $(seq 1 120)
+    do
+        kill -0 "${ETCD_PID}" 2>/dev/null || die "etcd exited before becoming healthy; see ${log_file}"
+        if ETCDCTL_API=3 "${ETCDCTL_BIN}" \
+            --endpoints="http://${ETCD_HOST}:${ETCD_PORT}" endpoint health \
+            >/dev/null 2>&1
+        then
+            return
+        fi
+        sleep 0.5
+    done
+    die "timed out waiting for etcd health; see ${log_file}"
+}
+
+monitor_rss()
+{
+    local pid="$1"
+    local output="$2"
+    printf 'epoch_seconds rss_kib\n' > "${output}"
+    while kill -0 "${pid}" 2>/dev/null
+    do
+        local rss
+        rss="$(ps -o rss= -p "${pid}" 2>/dev/null | tr -d ' ' || true)"
+        [[ -n "${rss}" ]] && printf '%s %s\n' "$(date +%s)" "${rss}" >> "${output}"
+        sleep 1
+    done
+}
+
+start_transaction_server()
+{
+    local directory="$1"
+    local log_file="${directory}/transaction-server.log"
+    local rss_file="${directory}/transaction-server-rss.txt"
+
+    port_open "${TRANS_HOST}" "${TRANS_PORT}" &&
+        die "Transaction port ${TRANS_HOST}:${TRANS_PORT} is already occupied"
+
+    log "starting Transaction Server with ${TRANS_JAVA_OPTS}"
+    PIXELS_HOME="${ROOT_DIR}" \
+    PIXELS_CONFIG="${CURRENT_CONFIG}" \
+    JAVA_OPTS="${TRANS_JAVA_OPTS}" \
+        "${ROOT_DIR}/bin/start-transaction-server" \
+        --trans-host "${TRANS_HOST}" --trans-port "${TRANS_PORT}" \
+        >"${log_file}" 2>&1 &
+    TRANS_PID=$!
+    wait_for_port "${TRANS_HOST}" "${TRANS_PORT}" "${TRANS_PID}" "Transaction Server"
+    monitor_rss "${TRANS_PID}" "${rss_file}" &
+    RSS_MONITOR_PID=$!
+}
+
+validate_result()
+{
+    local scenario="$1"
+    local result_file="$2"
+    local expected_stop="$3"
+    grep -q "^benchmark=transaction-${scenario}$" "${result_file}" ||
+        die "${scenario} did not produce a benchmark result; see ${result_file}"
+    grep -q '^errors=0$' "${result_file}" ||
+        die "${scenario} reported errors; see ${result_file}"
+    grep -Eq '^successful_operations=[1-9][0-9]*$' "${result_file}" ||
+        die "${scenario} completed no successful operations; see ${result_file}"
+    local stop_reason
+    stop_reason="$(awk -F= '$1 == "stop_reason" { print $2 }' "${result_file}")"
+    [[ "${stop_reason}" =~ ${expected_stop} ]] ||
+        die "${scenario} stopped for ${stop_reason}, expected ${expected_stop}"
+}
+
+run_benchmark_scenario()
+{
+    local scenario="$1"
+    local directory="$2"
+    local result_file="${directory}/result.txt"
+    local expected_stop
+    local args=(
+        --trans-host "${TRANS_HOST}" --trans-port "${TRANS_PORT}"
+        --threads "${THREADS}" --clients "${CLIENTS}" --batch-size "${BATCH_SIZE}"
+    )
+
+    case "${scenario}" in
+        begin-commit)
+            args+=(
+                --warmup-seconds "${WARMUP_SECONDS}"
+                --duration-seconds "${DURATION_SECONDS}"
+                --data-size "${LIFECYCLE_DATA_SIZE}"
+            )
+            if [[ "${SMOKE}" == "true" ]]; then expected_stop='data-size'; else expected_stop='duration'; fi
+            ;;
+        begin)
+            args+=(
+                --warmup-seconds "${WARMUP_SECONDS}"
+                --duration-seconds 3600
+                --data-size "${PENDING_DATA_SIZE}"
+                --trans-cleanup-batch-size "${CLEANUP_BATCH_SIZE}"
+                --rpc-deadline-ms "${RPC_DEADLINE_MS}"
+            )
+            expected_stop='data-size'
+            ;;
+        commit)
+            args+=(
+                --warmup-seconds "$([[ "${SMOKE}" == "true" ]] && printf 0 || printf 10)"
+                --duration-seconds "${DURATION_SECONDS}"
+                --data-size "${PENDING_DATA_SIZE}"
+                --trans-prefill-batch-size "${PREFILL_BATCH_SIZE}"
+                --rpc-deadline-ms "${RPC_DEADLINE_MS}"
+            )
+            expected_stop='data-size|duration'
+            ;;
+        *) die "unknown scenario: ${scenario}" ;;
+    esac
+
+    log "running transaction-${scenario}"
+    set +e
+    PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
+    JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
+        "${ROOT_DIR}/bin/run-benchmark" "transaction-${scenario}" "${args[@]}" \
+        2>&1 | tee "${result_file}"
+    local benchmark_status=${PIPESTATUS[0]}
+    set -e
+    [[ "${benchmark_status}" -eq 0 ]] ||
+        die "transaction-${scenario} failed with exit code ${benchmark_status}; see ${result_file}"
+    validate_result "${scenario}" "${result_file}" "${expected_stop}"
+}
+
+run_one()
+{
+    local scenario="$1"
+    local directory="${RUN_DIR}/${scenario}"
+    local state_directory="${RUN_STATE_DIR}/${scenario}"
+    mkdir -p "${directory}" "${state_directory}"
+
+    if [[ "${ISOLATION}" == "scenario" ]]
+    then
+        prepare_config "${state_directory}"
+        start_etcd "${state_directory}" "retina-bench-${scenario}-$$" "${directory}/etcd.log"
+    else
+        CURRENT_CONFIG="${RUN_STATE_DIR}/suite/pixels.properties"
+    fi
+
+    start_transaction_server "${directory}"
+    run_benchmark_scenario "${scenario}" "${directory}"
+    stop_transaction_server
+
+    if [[ "${ISOLATION}" == "scenario" ]]
+    then
+        stop_etcd
+        remove_current_config
+    fi
+}
+
+write_parameters()
+{
+    local output="$1"
+    {
+        printf 'isolation=%q\n' "${ISOLATION}"
+        printf 'threads=%q\n' "${THREADS}"
+        printf 'clients=%q\n' "${CLIENTS}"
+        printf 'batch_size=%q\n' "${BATCH_SIZE}"
+        printf 'warmup_seconds=%q\n' "${WARMUP_SECONDS}"
+        printf 'duration_seconds=%q\n' "${DURATION_SECONDS}"
+        printf 'lifecycle_data_size=%q\n' "${LIFECYCLE_DATA_SIZE}"
+        printf 'pending_data_size=%q\n' "${PENDING_DATA_SIZE}"
+        printf 'trans_java_opts=%q\n' "${TRANS_JAVA_OPTS}"
+        printf 'client_java_opts=%q\n' "${CLIENT_JAVA_OPTS}"
+        printf 'etcd_endpoint=%q\n' "http://${ETCD_HOST}:${ETCD_PORT}"
+        printf 'trans_endpoint=%q\n' "${TRANS_HOST}:${TRANS_PORT}"
+        printf 'source_config=%q\n' "${SOURCE_CONFIG}"
+        printf 'state_dir=%q\n' "${RUN_STATE_DIR}"
+    } > "${output}"
+}
+
+write_summary()
+{
+    local output="${RUN_DIR}/summary.txt"
+    {
+        printf 'results_dir=%s\n' "${RUN_DIR}"
+        for scenario in begin-commit begin commit
+        do
+            local result="${RUN_DIR}/${scenario}/result.txt"
+            printf '\n[%s]\n' "${scenario}"
+            awk -F= '
+                /^(benchmark|successful_operations|errors|elapsed_seconds|throughput_ops_per_second|api_calls_per_second|p50_latency_us|p99_latency_us|p50_api_latency_us|p99_api_latency_us|stop_reason)=/ {
+                    print
+                }
+            ' "${result}"
+            local rss_file="${RUN_DIR}/${scenario}/transaction-server-rss.txt"
+            if [[ -f "${rss_file}" ]]
+            then
+                awk 'NR > 1 && $2 > max { max = $2 } END { if (max) printf "peak_server_rss_kib=%d\n", max }' \
+                    "${rss_file}"
+            fi
+        done
+    } > "${output}"
+    cat "${output}"
+}
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_DIR="${RESULTS_ROOT%/}/tx-${RUN_ID}"
+RUN_STATE_DIR="${STATE_ROOT%/}/tx-${RUN_ID}"
+
+if [[ "${DRY_RUN}" == "true" ]]
+then
+    log "dry run"
+    printf 'isolation=%s\nresults_dir=%s\nstate_dir=%s\nsource_config=%s\n' \
+        "${ISOLATION}" "${RUN_DIR}" "${RUN_STATE_DIR}" "${SOURCE_CONFIG}"
+    printf 'threads=%s clients=%s batch_size=%s warmup=%s duration=%s\n' \
+        "${THREADS}" "${CLIENTS}" "${BATCH_SIZE}" "${WARMUP_SECONDS}" "${DURATION_SECONDS}"
+    printf 'lifecycle_data_size=%s pending_data_size=%s\n' \
+        "${LIFECYCLE_DATA_SIZE}" "${PENDING_DATA_SIZE}"
+    printf 'server_java_opts=%s client_java_opts=%s\n' \
+        "${TRANS_JAVA_OPTS}" "${CLIENT_JAVA_OPTS}"
+    exit 0
+fi
+
+port_open "${ETCD_HOST}" "${ETCD_PORT}" &&
+    die "etcd port ${ETCD_HOST}:${ETCD_PORT} is occupied; stop the existing etcd or select another port"
+port_open "${ETCD_HOST}" "${ETCD_PEER_PORT}" &&
+    die "etcd peer port ${ETCD_HOST}:${ETCD_PEER_PORT} is occupied; stop the existing etcd or select another port"
+port_open "${TRANS_HOST}" "${TRANS_PORT}" &&
+    die "Transaction port ${TRANS_HOST}:${TRANS_PORT} is occupied; stop the existing server or select another port"
+
+mkdir -p "${RUN_DIR}"
+mkdir -p "${RUN_STATE_DIR}"
+write_parameters "${RUN_DIR}/parameters.env"
+{
+    uname -a
+    printf 'nproc=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    java -version
+    "${ETCD_BIN}" --version
+} > "${RUN_DIR}/system-info.txt" 2>&1
+
+log "results will be written to ${RUN_DIR}"
+if [[ "${ISOLATION}" == "suite" ]]
+then
+    mkdir -p "${RUN_DIR}/suite" "${RUN_STATE_DIR}/suite"
+    prepare_config "${RUN_STATE_DIR}/suite"
+    start_etcd "${RUN_STATE_DIR}/suite" "retina-bench-suite-$$" "${RUN_DIR}/suite/etcd.log"
+fi
+
+run_one begin-commit
+run_one begin
+run_one commit
+
+if [[ "${ISOLATION}" == "suite" ]]
+then
+    stop_etcd
+    remove_current_config
+fi
+
+write_summary
+log "Transaction suite completed successfully"

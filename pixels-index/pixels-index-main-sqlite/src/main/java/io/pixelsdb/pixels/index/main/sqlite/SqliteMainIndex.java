@@ -422,8 +422,12 @@ public class SqliteMainIndex implements MainIndex
     {
         this.cacheRwLock.writeLock().lock();
         this.dbRwLock.writeLock().lock();
+        boolean transactionStarted = false;
+        Exception failure = null;
         try
         {
+            this.connection.setAutoCommit(false);
+            transactionStarted = true;
             List<RowIdRange> rowIdRanges = this.indexBuffer.flush(fileId);
             try (PreparedStatement pst = this.connection.prepareStatement(insertRangeSql))
             {
@@ -438,17 +442,55 @@ public class SqliteMainIndex implements MainIndex
                     pst.addBatch();
                 }
                 pst.executeBatch();
+                this.connection.commit();
                 return true;
             }
         }
         catch (MainIndexException | SQLException e)
         {
+            failure = e;
+            if (transactionStarted)
+            {
+                try
+                {
+                    this.connection.rollback();
+                }
+                catch (SQLException rollbackException)
+                {
+                    e.addSuppressed(rollbackException);
+                }
+            }
             throw new MainIndexException("Failed to flush index cache into sqlite", e);
         }
         finally
         {
+            MainIndexException restoreFailure = null;
+            if (transactionStarted)
+            {
+                try
+                {
+                    this.connection.setAutoCommit(true);
+                }
+                catch (SQLException restoreException)
+                {
+                    if (failure != null)
+                    {
+                        failure.addSuppressed(restoreException);
+                    }
+                    else
+                    {
+                        restoreFailure = new MainIndexException(
+                                "Failed to restore sqlite auto-commit after flushing index cache",
+                                restoreException);
+                    }
+                }
+            }
             this.cacheRwLock.writeLock().unlock();
             this.dbRwLock.writeLock().unlock();
+            if (restoreFailure != null)
+            {
+                throw restoreFailure;
+            }
         }
     }
 

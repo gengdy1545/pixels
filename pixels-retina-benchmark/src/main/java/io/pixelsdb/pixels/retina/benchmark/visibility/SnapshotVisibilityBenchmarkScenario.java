@@ -61,10 +61,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>Every phase initializes every selected manifest row group through the real
  * clean-state API using the footer's {@code recordNum}.  The row-group topology
  * mirrors {@code RetinaServerImpl} startup: for every
- * readable layout it loads files only from {@code orderedPaths.get(0)} and
- * {@code compactPaths.get(0)}.  The snapshot manifest records precisely those
- * paths with {@code productionSelectedByRetina=true}; secondary and projection
- * paths are excluded.
+ * readable layout it loads files only from {@code orderedPaths.get(0)}.
+ * The snapshot manifest records that path with
+ * {@code productionSelectedByRetina=true}; compact, secondary and projection
+ * paths are excluded from this benchmark.
  * Baseline construction, request construction, verification and native-object cleanup all
  * run outside the measured interval.  Warmup and measurement use disjoint
  * physical rows and each phase starts from a fresh clean baseline.</p>
@@ -265,8 +265,8 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         details.put("manifestVisibilityRows", Long.toString(manifestRowCount));
         details.put("productionSelectedVisibilityPaths",
                 Integer.toString(productionSelectedPathCount));
-        details.put("visibilityRGScope", "readable layouts; only orderedPaths[0]/compactPaths[0] "
-                + "marked productionSelectedByRetina; projections and secondary paths excluded");
+        details.put("visibilityRGScope", "readable layouts; only orderedPaths[0] marked "
+                + "productionSelectedByRetina; compact, projection and secondary paths excluded");
         details.put("baseline",
                 "manifest file/RG recordNum -> addVisibility(fileId,rgId,recordNum,0,null,false)");
         details.put("deleteTargets", "distinct rows from manifest file/RG recordNum");
@@ -418,10 +418,19 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
                     {
                         continue;
                     }
-                    if (path.pathId <= 0 || !("ordered".equalsIgnoreCase(path.role)
-                            || "compact".equalsIgnoreCase(path.role)))
+                    if (path.pathId <= 0)
                     {
                         throw new IllegalArgumentException("invalid production-selected Retina path "
+                                + "for layoutId=" + layout.layoutId + ", pathId=" + path.pathId
+                                + ", role=" + path.role);
+                    }
+                    if ("compact".equalsIgnoreCase(path.role))
+                    {
+                        continue;
+                    }
+                    if (!"ordered".equalsIgnoreCase(path.role))
+                    {
+                        throw new IllegalArgumentException("unexpected production-selected Retina path role "
                                 + "for layoutId=" + layout.layoutId + ", pathId=" + path.pathId
                                 + ", role=" + path.role);
                     }
@@ -441,7 +450,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         if (productionPaths.isEmpty())
         {
             throw new IllegalArgumentException("snapshot table has no production-selected "
-                    + "ordered/compact path in a readable layout: " + table.tableName);
+                    + "ordered path in a readable layout: " + table.tableName);
         }
         this.productionSelectedPathCount = productionPaths.size();
 
@@ -500,7 +509,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         if (selected.isEmpty() || rows <= 0)
         {
             throw new IllegalArgumentException("snapshot table has no rows on the "
-                    + "production-selected ordered/compact paths of readable layouts");
+                    + "production-selected ordered paths of readable layouts");
         }
         selected.sort(Comparator.comparingLong((RowGroupSpec value) -> value.key.fileId)
                 .thenComparingInt(value -> value.key.rgId));

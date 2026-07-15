@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class IndexOperationTest
@@ -27,5 +28,14 @@ class IndexOperationTest
         assertFalse(IndexOperation.PUT_PRIMARY.requiresExistingKey());
         assertTrue(IndexOperation.UPDATE_PRIMARY.requiresExistingKey());
         assertTrue(IndexOperation.DELETE_SECONDARY.requiresExistingKey());
+    }
+
+    @Test
+    void parsesMainIndexFixtureStates()
+    {
+        assertEquals(MainIndexState.HOT_BUFFER, MainIndexState.parse("hot-buffer"));
+        assertEquals(MainIndexState.WARM_CACHE, MainIndexState.parse("WARM-CACHE"));
+        assertEquals(MainIndexState.COLD_START, MainIndexState.parse("cold-start"));
+        assertThrows(IllegalArgumentException.class, () -> MainIndexState.parse("warm"));
     }
 }

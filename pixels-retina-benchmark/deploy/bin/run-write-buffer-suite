@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="${RETINA_BENCHMARK_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+umask 077
+
+SNAPSHOT_DIR=""
+S3_ROOT=""
+RESULTS_ROOT="${RESULTS_ROOT:-${ROOT_DIR}/results}"
+STATE_ROOT="${WRITE_BUFFER_STATE_ROOT:-/var/tmp/pixels-retina-benchmark/write-buffer-suite}"
+SOURCE_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}"
+ETCD_BIN="${ETCD_BIN:-$(command -v etcd 2>/dev/null || true)}"
+ETCDCTL_BIN="${ETCDCTL_BIN:-$(command -v etcdctl 2>/dev/null || true)}"
+
+ETCD_HOST="127.0.0.1"
+ETCD_PORT=2379
+ETCD_PEER_PORT=2380
+METADATA_HOST="127.0.0.1"
+METADATA_PORT=18888
+NODE_HOST="127.0.0.1"
+NODE_PORT=18891
+SERVER_JAVA_OPTS="${WRITE_BUFFER_SERVER_JAVA_OPTS:--Xms40g -Xmx40g}"
+CLIENT_JAVA_OPTS="${WRITE_BUFFER_CLIENT_JAVA_OPTS:--Xms40g -Xmx40g}"
+
+TABLE="orderline"
+THREADS=16
+CLIENTS=4
+BATCH_SIZE=64
+WARMUP_SECONDS=30
+WARMUP_OPERATIONS=100000
+DURATION_SECONDS=180
+# Large enough that a 180s measurement never hits the row cap, while staying
+# below WriteBuffer's 48-bit native timestamp budget (2 * data-size + ops).
+DATA_SIZE=281474976710000
+ROW_POOL_SIZE=100000
+
+MEMTABLE_SIZE=10240
+FLUSH_COUNT=20
+FLUSH_THREADS=4
+FLUSH_INTERVAL=30
+ENCODING_LEVEL=2
+NULLS_PADDING=false
+BLOCK_SIZE=2147483648
+REPLICATION=1
+VNODES=4
+
+SMOKE=false
+DRY_RUN=false
+NATIVE_TEMP_DIR=""
+JEMALLOC_PRELOAD=""
+ETCD_PID=""
+METADATA_PID=""
+RSS_MONITOR_PID=""
+CURRENT_CONFIG=""
+RUN_DIR=""
+RUN_STATE_DIR=""
+RUN_PREFIX=""
+BENCHMARK_SCHEMA=""
+SUITE_SUCCEEDED=false
+
+usage()
+{
+    cat <<'EOF'
+Usage: bin/run-write-buffer-suite --snapshot-dir DIR --s3-root URI [options]
+
+Runs an isolated orderline PixelsWriteBuffer.addRow benchmark. Every run starts
+a new etcd data directory, creates a unique Metadata schema and S3 prefix, and
+uses disposable local SQLite state.
+
+Options:
+  --snapshot-dir DIR             Snapshot v2 directory (required)
+  --s3-root URI                  Dedicated S3 root, e.g. s3://bucket/prefix (required)
+  --results-dir DIR              Results root (default: runtime/results)
+  --state-dir DIR                Disposable state root (default: /var/tmp/...)
+  --config FILE                  Source pixels.properties
+  --etcd-bin FILE                etcd executable
+  --etcdctl-bin FILE             etcdctl executable
+  --etcd-port PORT               Fresh etcd client port (default: 2379)
+  --etcd-peer-port PORT          Fresh etcd peer port (default: 2380)
+  --metadata-port PORT           Metadata gRPC port (default: 18888)
+  --node-port PORT               Node gRPC port (default: 18891)
+  --java-opts TEXT               JVM options for server and client (default: -Xms40g -Xmx40g)
+  --threads N                    Producer threads (default: 16)
+  --duration-seconds N           Measurement time limit (default: 180)
+  --smoke                        Use tiny functional-test parameters
+  --dry-run                      Print configuration without starting services
+  -h, --help                     Show this help
+EOF
+}
+
+log()
+{
+    printf '[write-buffer-suite] %s\n' "$*"
+}
+
+die()
+{
+    printf '[write-buffer-suite] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+require_value()
+{
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "${value}" ]] || die "${option} requires a value"
+}
+
+require_positive_integer()
+{
+    local name="$1"
+    local value="$2"
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] ||
+        die "${name} must be a positive integer: ${value}"
+}
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        --snapshot-dir) require_value "$1" "${2:-}"; SNAPSHOT_DIR="$2"; shift 2 ;;
+        --s3-root) require_value "$1" "${2:-}"; S3_ROOT="$2"; shift 2 ;;
+        --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
+        --state-dir) require_value "$1" "${2:-}"; STATE_ROOT="$2"; shift 2 ;;
+        --config) require_value "$1" "${2:-}"; SOURCE_CONFIG="$2"; shift 2 ;;
+        --etcd-bin) require_value "$1" "${2:-}"; ETCD_BIN="$2"; shift 2 ;;
+        --etcdctl-bin) require_value "$1" "${2:-}"; ETCDCTL_BIN="$2"; shift 2 ;;
+        --etcd-port) require_value "$1" "${2:-}"; ETCD_PORT="$2"; shift 2 ;;
+        --etcd-peer-port) require_value "$1" "${2:-}"; ETCD_PEER_PORT="$2"; shift 2 ;;
+        --metadata-port) require_value "$1" "${2:-}"; METADATA_PORT="$2"; shift 2 ;;
+        --node-port) require_value "$1" "${2:-}"; NODE_PORT="$2"; shift 2 ;;
+        --java-opts)
+            require_value "$1" "${2:-}"
+            SERVER_JAVA_OPTS="$2"
+            CLIENT_JAVA_OPTS="$2"
+            shift 2
+            ;;
+        --threads) require_value "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
+        --duration-seconds) require_value "$1" "${2:-}"; DURATION_SECONDS="$2"; shift 2 ;;
+        --smoke) SMOKE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+[[ -n "${SNAPSHOT_DIR}" ]] || die "--snapshot-dir is required"
+[[ -n "${S3_ROOT}" ]] || die "--s3-root is required"
+[[ "${S3_ROOT}" == s3://* ]] || die "--s3-root must use the s3:// scheme"
+S3_ROOT="${S3_ROOT%/}"
+[[ -f "${SNAPSHOT_DIR}/snapshot.json" ]] ||
+    die "snapshot manifest not found: ${SNAPSHOT_DIR}/snapshot.json"
+[[ -f "${SOURCE_CONFIG}" ]] || die "pixels.properties not found: ${SOURCE_CONFIG}"
+[[ -x "${ROOT_DIR}/bin/run-benchmark" ]] ||
+    die "run-benchmark not found under ${ROOT_DIR}/bin"
+[[ -x "${ROOT_DIR}/bin/start-metadata-server" ]] ||
+    die "start-metadata-server not found under ${ROOT_DIR}/bin"
+[[ -x "${ETCD_BIN}" ]] || die "etcd executable not found; use --etcd-bin"
+if [[ -z "${ETCDCTL_BIN}" && -n "${ETCD_BIN}" ]]
+then
+    ETCDCTL_BIN="$(dirname "${ETCD_BIN}")/etcdctl"
+fi
+[[ -x "${ETCDCTL_BIN}" ]] || die "etcdctl executable not found; use --etcdctl-bin"
+if grep -Eq '^[[:space:]]*[A-Za-z0-9_.-]+=.*REPLACE_WITH_' "${SOURCE_CONFIG}"
+then
+    die "source pixels.properties still contains REPLACE_WITH placeholders"
+fi
+
+for pair in \
+    "etcd-port:${ETCD_PORT}" "etcd-peer-port:${ETCD_PEER_PORT}" \
+    "metadata-port:${METADATA_PORT}" "node-port:${NODE_PORT}" \
+    "threads:${THREADS}" "duration-seconds:${DURATION_SECONDS}"
+do
+    require_positive_integer "${pair%%:*}" "${pair#*:}"
+done
+(( CLIENTS <= THREADS )) || die "clients must not exceed threads"
+(( CLIENTS <= VNODES )) || die "clients must not exceed writebuffer vnodes (${VNODES})"
+
+if [[ "${SMOKE}" == "true" ]]
+then
+    THREADS=2
+    CLIENTS=1
+    BATCH_SIZE=1
+    WARMUP_SECONDS=0
+    WARMUP_OPERATIONS=0
+    DURATION_SECONDS=2
+    DATA_SIZE=100
+    ROW_POOL_SIZE=100
+fi
+
+port_open()
+{
+    local host="$1"
+    local port="$2"
+    (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1
+}
+
+wait_for_port()
+{
+    local host="$1"
+    local port="$2"
+    local pid="$3"
+    local label="$4"
+    local _
+    for _ in $(seq 1 120)
+    do
+        kill -0 "${pid}" 2>/dev/null || die "${label} exited before becoming ready"
+        if port_open "${host}" "${port}"
+        then
+            return
+        fi
+        sleep 0.5
+    done
+    die "timed out waiting for ${label} on ${host}:${port}"
+}
+
+stop_process()
+{
+    local pid="${1:-}"
+    local label="$2"
+    local _
+    [[ -n "${pid}" ]] || return 0
+    if ! kill -0 "${pid}" 2>/dev/null
+    then
+        wait "${pid}" 2>/dev/null || true
+        return 0
+    fi
+    log "stopping ${label} (pid=${pid})"
+    kill "${pid}" 2>/dev/null || true
+    for _ in $(seq 1 30)
+    do
+        if ! kill -0 "${pid}" 2>/dev/null
+        then
+            wait "${pid}" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.5
+    done
+    log "${label} did not stop gracefully; sending SIGKILL"
+    kill -9 "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+}
+
+monitor_rss()
+{
+    local pid="$1"
+    local output="$2"
+    printf 'epoch_seconds rss_kib\n' > "${output}"
+    while kill -0 "${pid}" 2>/dev/null
+    do
+        local rss
+        rss="$(ps -o rss= -p "${pid}" 2>/dev/null | tr -d ' ' || true)"
+        [[ -n "${rss}" ]] && printf '%s %s\n' "$(date +%s)" "${rss}" >> "${output}"
+        sleep 1
+    done
+}
+
+remove_current_config()
+{
+    if [[ -n "${CURRENT_CONFIG}" && -n "${RUN_STATE_DIR}" &&
+          "${CURRENT_CONFIG}" == "${RUN_STATE_DIR}/"* ]]
+    then
+        rm -f "${CURRENT_CONFIG}"
+    fi
+    CURRENT_CONFIG=""
+}
+
+cleanup_native_temp()
+{
+    if [[ -n "${NATIVE_TEMP_DIR}" ]]
+    then
+        rm -rf -- "${NATIVE_TEMP_DIR}"
+    fi
+}
+
+prepare_jemalloc_preload()
+{
+    if [[ "${LD_PRELOAD:-}" == *libjemalloc* ]]
+    then
+        JEMALLOC_PRELOAD="${LD_PRELOAD}"
+        return
+    fi
+
+    local jemalloc="${ROOT_DIR}/lib/libjemalloc.so.2"
+    if [[ ! -f "${jemalloc}" ]]
+    then
+        local benchmark_jar="${ROOT_DIR}/pixels-retina-benchmark-full.jar"
+        [[ -f "${benchmark_jar}" ]] ||
+            die "benchmark JAR not found: ${benchmark_jar}"
+        command -v unzip >/dev/null 2>&1 ||
+            die "unzip is required to preload bundled jemalloc"
+
+        NATIVE_TEMP_DIR="$(mktemp -d \
+            "${TMPDIR:-/tmp}/pixels-retina-write-buffer.XXXXXX")"
+        jemalloc="${NATIVE_TEMP_DIR}/libjemalloc.so.2"
+        unzip -p "${benchmark_jar}" native/linux/libjemalloc.so.2 > "${jemalloc}" ||
+            die "failed to extract bundled libjemalloc.so.2"
+        [[ -s "${jemalloc}" ]] ||
+            die "bundled libjemalloc.so.2 is empty"
+    fi
+
+    JEMALLOC_PRELOAD="${jemalloc}${LD_PRELOAD:+:${LD_PRELOAD}}"
+}
+
+cleanup()
+{
+    local status=$?
+    trap - EXIT INT TERM
+    stop_process "${METADATA_PID}" "Metadata/Node Server"
+    METADATA_PID=""
+    if [[ -n "${RSS_MONITOR_PID}" ]]
+    then
+        wait "${RSS_MONITOR_PID}" 2>/dev/null || true
+        RSS_MONITOR_PID=""
+    fi
+    stop_process "${ETCD_PID}" "etcd"
+    ETCD_PID=""
+    remove_current_config
+    if [[ "${SUITE_SUCCEEDED}" == "true" && -n "${RUN_STATE_DIR}" &&
+          "${RUN_STATE_DIR}" == "${STATE_ROOT%/}/wb-"* ]]
+    then
+        rm -rf -- "${RUN_STATE_DIR}"
+    elif [[ -n "${RUN_STATE_DIR}" && -d "${RUN_STATE_DIR}" ]]
+    then
+        log "failed-run state is preserved at ${RUN_STATE_DIR}"
+    fi
+    cleanup_native_temp
+    exit "${status}"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+set_property()
+{
+    local file="$1"
+    local key="$2"
+    local value="$3"
+    local staged="${file}.tmp"
+    awk -v key="${key}" -v value="${value}" '
+        BEGIN { found = 0 }
+        index($0, key "=") == 1 {
+            print key "=" value
+            found = 1
+            next
+        }
+        { print }
+        END {
+            if (!found) print key "=" value
+        }
+    ' "${file}" > "${staged}"
+    mv "${staged}" "${file}"
+}
+
+prepare_config()
+{
+    CURRENT_CONFIG="${RUN_STATE_DIR}/pixels.properties"
+    cp "${SOURCE_CONFIG}" "${CURRENT_CONFIG}"
+    chmod 600 "${CURRENT_CONFIG}"
+    set_property "${CURRENT_CONFIG}" "etcd.hosts" "${ETCD_HOST}"
+    set_property "${CURRENT_CONFIG}" "etcd.port" "${ETCD_PORT}"
+    set_property "${CURRENT_CONFIG}" "metadata.server.host" "${METADATA_HOST}"
+    set_property "${CURRENT_CONFIG}" "metadata.server.port" "${METADATA_PORT}"
+    set_property "${CURRENT_CONFIG}" "node.server.host" "${NODE_HOST}"
+    set_property "${CURRENT_CONFIG}" "node.server.port" "${NODE_PORT}"
+}
+
+start_etcd()
+{
+    local data_directory="${RUN_STATE_DIR}/etcd-data"
+    mkdir -p "${data_directory}"
+    log "starting fresh etcd"
+    "${ETCD_BIN}" \
+        --name "retina-wb-$$" \
+        --data-dir "${data_directory}" \
+        --listen-client-urls "http://${ETCD_HOST}:${ETCD_PORT}" \
+        --advertise-client-urls "http://${ETCD_HOST}:${ETCD_PORT}" \
+        --listen-peer-urls "http://${ETCD_HOST}:${ETCD_PEER_PORT}" \
+        --initial-advertise-peer-urls "http://${ETCD_HOST}:${ETCD_PEER_PORT}" \
+        --initial-cluster "retina-wb-$$=http://${ETCD_HOST}:${ETCD_PEER_PORT}" \
+        --initial-cluster-token "retina-wb-$$" \
+        --initial-cluster-state new \
+        > "${RUN_DIR}/etcd.log" 2>&1 &
+    ETCD_PID=$!
+
+    local _
+    for _ in $(seq 1 120)
+    do
+        kill -0 "${ETCD_PID}" 2>/dev/null ||
+            die "etcd exited before becoming healthy; see ${RUN_DIR}/etcd.log"
+        if ETCDCTL_API=3 "${ETCDCTL_BIN}" \
+            --endpoints="http://${ETCD_HOST}:${ETCD_PORT}" endpoint health \
+            >/dev/null 2>&1
+        then
+            ETCDCTL_API=3 "${ETCDCTL_BIN}" \
+                --endpoints="http://${ETCD_HOST}:${ETCD_PORT}" \
+                get "" --from-key --keys-only > "${RUN_DIR}/etcd-initial-keys.txt"
+            [[ ! -s "${RUN_DIR}/etcd-initial-keys.txt" ]] ||
+                die "new etcd data directory unexpectedly contains application keys"
+            return
+        fi
+        sleep 0.5
+    done
+    die "timed out waiting for etcd health; see ${RUN_DIR}/etcd.log"
+}
+
+start_metadata_server()
+{
+    log "starting Metadata/Node Server with ${SERVER_JAVA_OPTS}"
+    PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
+    JAVA_OPTS="${SERVER_JAVA_OPTS}" \
+        "${ROOT_DIR}/bin/start-metadata-server" \
+        --metadata-port "${METADATA_PORT}" --node-port "${NODE_PORT}" \
+        > "${RUN_DIR}/metadata-server.log" 2>&1 &
+    METADATA_PID=$!
+    wait_for_port "${NODE_HOST}" "${NODE_PORT}" "${METADATA_PID}" "Node Server"
+    wait_for_port "${METADATA_HOST}" "${METADATA_PORT}" "${METADATA_PID}" "Metadata Server"
+    sleep 1
+    monitor_rss "${METADATA_PID}" "${RUN_DIR}/metadata-server-rss.txt" &
+    RSS_MONITOR_PID=$!
+}
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_DIR="${RESULTS_ROOT%/}/write-buffer-${RUN_ID}"
+RUN_STATE_DIR="${STATE_ROOT%/}/wb-${RUN_ID}"
+RUN_PREFIX="${S3_ROOT}/${RUN_ID}"
+BENCHMARK_SCHEMA="retina_bench_wb_$(printf '%s' "${RUN_ID}" | tr -c '[:alnum:]' '_')"
+
+if [[ "${DRY_RUN}" == "true" ]]
+then
+    log "dry run"
+    printf 'snapshot_dir=%s\ntable=%s\nresults_dir=%s\nstate_dir=%s\n' \
+        "${SNAPSHOT_DIR}" "${TABLE}" "${RUN_DIR}" "${RUN_STATE_DIR}"
+    printf 'schema=%s\ns3_prefix=%s\nsource_config=%s\n' \
+        "${BENCHMARK_SCHEMA}" "${RUN_PREFIX}" "${SOURCE_CONFIG}"
+    printf 'threads=%s clients=%s batch_size=%s warmup_seconds=%s warmup_operations=%s\n' \
+        "${THREADS}" "${CLIENTS}" "${BATCH_SIZE}" "${WARMUP_SECONDS}" "${WARMUP_OPERATIONS}"
+    printf 'duration_seconds=%s data_size=%s row_pool_size=%s\n' \
+        "${DURATION_SECONDS}" "${DATA_SIZE}" "${ROW_POOL_SIZE}"
+    printf 'memtable_size=%s flush_count=%s flush_threads=%s flush_interval=%s\n' \
+        "${MEMTABLE_SIZE}" "${FLUSH_COUNT}" "${FLUSH_THREADS}" "${FLUSH_INTERVAL}"
+    printf 'server_java_opts=%s client_java_opts=%s\n' \
+        "${SERVER_JAVA_OPTS}" "${CLIENT_JAVA_OPTS}"
+    exit 0
+fi
+
+for endpoint in \
+    "${ETCD_HOST}:${ETCD_PORT}" "${ETCD_HOST}:${ETCD_PEER_PORT}" \
+    "${METADATA_HOST}:${METADATA_PORT}" "${NODE_HOST}:${NODE_PORT}"
+do
+    host="${endpoint%:*}"
+    port="${endpoint#*:}"
+    port_open "${host}" "${port}" &&
+        die "required port ${endpoint} is occupied; stop the existing service or select another port"
+done
+
+mkdir -p "${RUN_DIR}" "${RUN_STATE_DIR}"
+prepare_config
+
+{
+    printf 'snapshot_dir=%q\n' "${SNAPSHOT_DIR}"
+    printf 'snapshot_table=%q\n' "${TABLE}"
+    printf 'benchmark_schema=%q\n' "${BENCHMARK_SCHEMA}"
+    printf 's3_prefix=%q\n' "${RUN_PREFIX}"
+    printf 'source_config=%q\n' "${SOURCE_CONFIG}"
+    printf 'state_dir=%q\n' "${RUN_STATE_DIR}"
+    printf 'threads=%q\nclients=%q\nbatch_size=%q\n' "${THREADS}" "${CLIENTS}" "${BATCH_SIZE}"
+    printf 'warmup_seconds=%q\nwarmup_operations=%q\n' "${WARMUP_SECONDS}" "${WARMUP_OPERATIONS}"
+    printf 'duration_seconds=%q\ndata_size=%q\nrow_pool_size=%q\n' \
+        "${DURATION_SECONDS}" "${DATA_SIZE}" "${ROW_POOL_SIZE}"
+    printf 'memtable_size=%q\nflush_count=%q\nflush_threads=%q\nflush_interval=%q\n' \
+        "${MEMTABLE_SIZE}" "${FLUSH_COUNT}" "${FLUSH_THREADS}" "${FLUSH_INTERVAL}"
+    printf 'encoding_level=%q\nnulls_padding=%q\nblock_size=%q\nreplication=%q\nvnodes=%q\n' \
+        "${ENCODING_LEVEL}" "${NULLS_PADDING}" "${BLOCK_SIZE}" "${REPLICATION}" "${VNODES}"
+    printf 'server_java_opts=%q\nclient_java_opts=%q\n' \
+        "${SERVER_JAVA_OPTS}" "${CLIENT_JAVA_OPTS}"
+} > "${RUN_DIR}/parameters.env"
+
+{
+    uname -a
+    printf 'nproc=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    java -version
+    free -h 2>/dev/null || true
+    "${ETCD_BIN}" --version
+} > "${RUN_DIR}/system-info.txt" 2>&1
+
+log "results will be written to ${RUN_DIR}"
+log "isolated S3 prefix is ${RUN_PREFIX}"
+
+prepare_jemalloc_preload
+start_etcd
+start_metadata_server
+
+{
+    printf 'ld_preload=%q\n' "${JEMALLOC_PRELOAD}"
+} >> "${RUN_DIR}/parameters.env"
+
+set +e
+LD_PRELOAD="${JEMALLOC_PRELOAD}" \
+PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
+JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
+    "${ROOT_DIR}/bin/run-benchmark" snapshot-validate \
+    --snapshot-dir "${SNAPSHOT_DIR}" \
+    --snapshot-table "${TABLE}" \
+    --snapshot-require write-buffer \
+    2>&1 | tee "${RUN_DIR}/snapshot-validation.txt"
+validation_status=${PIPESTATUS[0]}
+set -e
+[[ "${validation_status}" -eq 0 ]] ||
+    die "snapshot WriteBuffer validation failed; see ${RUN_DIR}/snapshot-validation.txt"
+grep -q '^status=valid$' "${RUN_DIR}/snapshot-validation.txt" ||
+    die "snapshot validation did not report status=valid"
+
+log "running orderline PixelsWriteBuffer.addRow benchmark"
+set +e
+LD_PRELOAD="${JEMALLOC_PRELOAD}" \
+PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
+JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
+    "${ROOT_DIR}/bin/run-benchmark" write-buffer-add \
+    --snapshot-dir "${SNAPSHOT_DIR}" \
+    --snapshot-table "${TABLE}" \
+    --threads "${THREADS}" \
+    --clients "${CLIENTS}" \
+    --batch-size "${BATCH_SIZE}" \
+    --warmup-seconds "${WARMUP_SECONDS}" \
+    --warmup-operations "${WARMUP_OPERATIONS}" \
+    --duration-seconds "${DURATION_SECONDS}" \
+    --data-size "${DATA_SIZE}" \
+    --writebuffer-row-pool-size "${ROW_POOL_SIZE}" \
+    --writebuffer-schema "${BENCHMARK_SCHEMA}" \
+    --writebuffer-drop-schema true \
+    --writebuffer-host-name "wb-${RUN_ID}" \
+    --writebuffer-memtable-size "${MEMTABLE_SIZE}" \
+    --writebuffer-flush-count "${FLUSH_COUNT}" \
+    --writebuffer-flush-threads "${FLUSH_THREADS}" \
+    --writebuffer-flush-interval "${FLUSH_INTERVAL}" \
+    --writebuffer-encoding-level "${ENCODING_LEVEL}" \
+    --writebuffer-nulls-padding "${NULLS_PADDING}" \
+    --writebuffer-block-size "${BLOCK_SIZE}" \
+    --writebuffer-replication "${REPLICATION}" \
+    --writebuffer-vnodes "${VNODES}" \
+    --writebuffer-storage-scheme s3 \
+    --writebuffer-base-uri "${RUN_PREFIX}/table" \
+    --writebuffer-object-storage-scheme s3 \
+    --writebuffer-object-folder "${RUN_PREFIX}/objects" \
+    --writebuffer-enabled-storage-schemes s3,file \
+    2>&1 | tee "${RUN_DIR}/result.txt"
+benchmark_status=${PIPESTATUS[0]}
+set -e
+[[ "${benchmark_status}" -eq 0 ]] ||
+    die "WriteBuffer benchmark failed with exit code ${benchmark_status}; see ${RUN_DIR}/result.txt"
+
+RESULT="${RUN_DIR}/result.txt"
+grep -q '^benchmark=write-buffer-add$' "${RESULT}" ||
+    die "WriteBuffer did not produce a benchmark result"
+grep -q '^errors=0$' "${RESULT}" || die "WriteBuffer reported errors"
+grep -q '^detail.first_workload_error=none$' "${RESULT}" ||
+    die "WriteBuffer reported a workload error"
+grep -Eq '^successful_operations=[1-9][0-9]*$' "${RESULT}" ||
+    die "WriteBuffer completed no successful operations"
+if [[ "${SMOKE}" == "true" ]]
+then
+    grep -q '^stop_reason=data-size$' "${RESULT}" ||
+        die "WriteBuffer smoke did not reach its row limit"
+else
+    grep -q '^stop_reason=duration$' "${RESULT}" ||
+        die "WriteBuffer formal run did not reach its duration limit"
+fi
+
+successful="$(awk -F= '$1 == "successful_operations" { print $2 }' "${RESULT}")"
+api_calls="$(awk -F= '$1 == "api_calls" { print $2 }' "${RESULT}")"
+[[ "${api_calls}" == "${successful}" ]] ||
+    die "API calls ${api_calls} do not match successful rows ${successful}"
+grep -q "^detail.snapshot_table=.*\\.${TABLE}$" "${RESULT}" ||
+    die "WriteBuffer did not use the ${TABLE} snapshot schema"
+grep -q '^detail.storage=s3$' "${RESULT}" ||
+    die "WriteBuffer did not use S3 table storage"
+grep -q '^detail.object_storage_scheme=s3$' "${RESULT}" ||
+    die "WriteBuffer did not use S3 object storage"
+grep -q "^detail.memtable_size=${MEMTABLE_SIZE}$" "${RESULT}" ||
+    die "unexpected WriteBuffer memtable size"
+grep -q "^detail.memtables_per_file=${FLUSH_COUNT}$" "${RESULT}" ||
+    die "unexpected WriteBuffer flush count"
+grep -q "^detail.object_flush_threads=${FLUSH_THREADS}$" "${RESULT}" ||
+    die "unexpected WriteBuffer flush thread count"
+grep -q "^detail.flush_interval_seconds=${FLUSH_INTERVAL}$" "${RESULT}" ||
+    die "unexpected WriteBuffer flush interval"
+if grep -Eq 'Failed to flush memTable|Failed to flush data to disk' "${RESULT}"
+then
+    die "WriteBuffer output contains an asynchronous flush failure"
+fi
+
+if command -v aws >/dev/null 2>&1
+then
+    aws s3 ls "${RUN_PREFIX}/" --recursive > "${RUN_DIR}/s3-artifacts.txt"
+    [[ -s "${RUN_DIR}/s3-artifacts.txt" ]] ||
+        die "no S3 artifacts found under ${RUN_PREFIX}"
+else
+    printf 'aws CLI unavailable; S3 artifact listing skipped\n' > "${RUN_DIR}/s3-artifacts.txt"
+fi
+
+{
+    awk -F= '
+        /^(benchmark|successful_operations|errors|elapsed_seconds|throughput_ops_per_second|api_calls_per_second|p50_latency_us|p95_latency_us|p99_latency_us|stop_reason|detail.memtable_size|detail.memtables_per_file|detail.object_flush_threads|detail.flush_interval_seconds|detail.storage|detail.object_storage_scheme|detail.seed_rows|detail.warmup_close_ms|detail.measurement_close_ms|detail.first_workload_error)=/ {
+            print
+        }
+    ' "${RESULT}"
+    awk 'NR > 1 && $2 > max { max = $2 } END { if (max) printf "peak_metadata_server_rss_kib=%d\n", max }' \
+        "${RUN_DIR}/metadata-server-rss.txt"
+    printf 's3_prefix=%s\n' "${RUN_PREFIX}"
+    printf 'benchmark_schema=%s\n' "${BENCHMARK_SCHEMA}"
+    printf 'etcd_state=fresh-and-removed-after-success\n'
+    printf 'metadata_schema=unique-and-dropped-after-close\n'
+} > "${RUN_DIR}/summary.txt"
+
+cat "${RUN_DIR}/summary.txt"
+SUITE_SUCCEEDED=true
+log "WriteBuffer suite completed successfully"
+log "S3 artifacts are preserved at ${RUN_PREFIX}; remove them after inspection"

@@ -27,6 +27,10 @@ public interface BenchmarkScenario extends AutoCloseable
     BenchmarkWorker createWorker(BenchmarkPhase phase, int workerId, int clientId,
                                  OperationRange range) throws Exception;
 
+    default void completePreparation(BenchmarkPhase phase) throws Exception
+    {
+    }
+
     default void completePhase(BenchmarkPhase phase, BenchmarkResult result) throws Exception
     {
     }

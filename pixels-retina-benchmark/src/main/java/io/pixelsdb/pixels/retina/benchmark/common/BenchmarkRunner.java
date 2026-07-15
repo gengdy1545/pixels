@@ -119,6 +119,7 @@ public final class BenchmarkRunner
         try
         {
             prepareWorkers(executor, workers, ranges, config.batchSize());
+            scenario.completePreparation(phase);
 
             CountDownLatch ready = new CountDownLatch(workers.size());
             CountDownLatch start = new CountDownLatch(1);

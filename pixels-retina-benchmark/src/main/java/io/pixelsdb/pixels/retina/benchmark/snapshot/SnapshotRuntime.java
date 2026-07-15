@@ -159,6 +159,7 @@ public final class SnapshotRuntime implements AutoCloseable
         {
             throw new IOException("snapshot is missing the table MainIndex: " + tableDb);
         }
+        System.out.println("snapshot_index_copy_completed=" + workDirectory.resolve("index"));
 
         applyConfig(INDEX_CONFIG);
         ConfigFactory pixels = ConfigFactory.Instance();

@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="${RETINA_BENCHMARK_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+umask 077
+
+SNAPSHOT_DIR=""
+RESULTS_ROOT="${RESULTS_ROOT:-${ROOT_DIR}/results}"
+WORK_ROOT="${INDEX_WORK_ROOT:-/var/tmp/pixels-retina-benchmark/index-formal}"
+SOURCE_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}"
+JAVA_OPTS_VALUE="${INDEX_JAVA_OPTS:--Xms40g -Xmx40g}"
+
+THREADS=16
+BATCH_SIZE=64
+WARMUP_SECONDS=30
+WARMUP_OPERATIONS=100000
+DURATION_SECONDS=20
+DATA_SIZE=1000000
+MAIN_INDEX_STATE="warm-cache"
+SMOKE=false
+DRY_RUN=false
+KEEP_WORK_DIRS=false
+
+FORMAL_TABLES=(
+    item
+    stock
+    order
+    orderline
+    history
+)
+
+usage()
+{
+    cat <<'EOF'
+Usage: bin/run-index-formal-suite --snapshot-dir DIR [options]
+
+Runs the formal Index benchmark matrix: Put, Update, and Delete on five
+representative primary-index tables (item, stock, order, orderline, history).
+Each table invokes bin/run-index-suite with the same benchmark parameters.
+
+Index benchmarks do not require Metadata Server, etcd, or MySQL to be running.
+They only need a filled-in pixels.properties (no REPLACE_WITH placeholders).
+
+Options:
+  --snapshot-dir DIR             Snapshot v2 directory (required)
+  --results-dir DIR              Results root (default: runtime/results)
+  --work-dir-root DIR            Disposable Index work root (default: /var/tmp/...)
+  --config FILE                  pixels.properties to use (default: runtime/etc)
+  --java-opts TEXT               Benchmark JVM options (default: -Xms40g -Xmx40g)
+  --threads N                    Worker threads (default: 16)
+  --batch-size N                 Entries per Index batch (default: 64)
+  --warmup-seconds N             Warmup time limit (default: 30)
+  --warmup-operations N          Warmup operation limit (default: 100000)
+  --duration-seconds N           Measurement time limit (default: 20)
+  --data-size N                  Measurement operation limit (default: 1000000)
+  --main-index-state STATE       MainIndex state for Update/Delete (default: warm-cache)
+  --keep-work-dirs               Preserve successful work copies for inspection
+  --smoke                        Use tiny functional-test parameters on every table
+  --dry-run                      Print configuration without running
+  -h, --help                     Show this help
+EOF
+}
+
+log()
+{
+    printf '[index-formal] %s\n' "$*"
+}
+
+die()
+{
+    printf '[index-formal] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+require_value()
+{
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "${value}" ]] || die "${option} requires a value"
+}
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        --snapshot-dir) require_value "$1" "${2:-}"; SNAPSHOT_DIR="$2"; shift 2 ;;
+        --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
+        --work-dir-root) require_value "$1" "${2:-}"; WORK_ROOT="$2"; shift 2 ;;
+        --config) require_value "$1" "${2:-}"; SOURCE_CONFIG="$2"; shift 2 ;;
+        --java-opts) require_value "$1" "${2:-}"; JAVA_OPTS_VALUE="$2"; shift 2 ;;
+        --threads) require_value "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
+        --batch-size) require_value "$1" "${2:-}"; BATCH_SIZE="$2"; shift 2 ;;
+        --warmup-seconds) require_value "$1" "${2:-}"; WARMUP_SECONDS="$2"; shift 2 ;;
+        --warmup-operations) require_value "$1" "${2:-}"; WARMUP_OPERATIONS="$2"; shift 2 ;;
+        --duration-seconds) require_value "$1" "${2:-}"; DURATION_SECONDS="$2"; shift 2 ;;
+        --data-size) require_value "$1" "${2:-}"; DATA_SIZE="$2"; shift 2 ;;
+        --main-index-state) require_value "$1" "${2:-}"; MAIN_INDEX_STATE="$2"; shift 2 ;;
+        --keep-work-dirs) KEEP_WORK_DIRS=true; shift ;;
+        --smoke) SMOKE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+[[ -n "${SNAPSHOT_DIR}" ]] || die "--snapshot-dir is required"
+[[ -f "${SOURCE_CONFIG}" ]] || die "pixels.properties not found: ${SOURCE_CONFIG}"
+[[ -x "${ROOT_DIR}/bin/run-index-suite" ]] ||
+    die "run-index-suite not found under ${ROOT_DIR}/bin"
+
+if grep -Eq '^[[:space:]]*[A-Za-z0-9_.-]+=.*REPLACE_WITH_' "${SOURCE_CONFIG}"
+then
+    die "pixels.properties still contains REPLACE_WITH placeholders: ${SOURCE_CONFIG}"
+fi
+
+FORMAL_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+FORMAL_RESULTS_ROOT="${RESULTS_ROOT%/}/index-formal-${FORMAL_RUN_ID}"
+FORMAL_WORK_ROOT="${WORK_ROOT%/}/index-formal-${FORMAL_RUN_ID}"
+
+if [[ "${DRY_RUN}" == "true" ]]
+then
+    log "dry run"
+    printf 'snapshot_dir=%s\nresults_root=%s\nwork_root=%s\nconfig=%s\n' \
+        "${SNAPSHOT_DIR}" "${FORMAL_RESULTS_ROOT}" "${FORMAL_WORK_ROOT}" "${SOURCE_CONFIG}"
+    printf 'tables=%s\n' "${FORMAL_TABLES[*]}"
+    printf 'threads=%s batch_size=%s warmup_seconds=%s warmup_operations=%s\n' \
+        "${THREADS}" "${BATCH_SIZE}" "${WARMUP_SECONDS}" "${WARMUP_OPERATIONS}"
+    printf 'duration_seconds=%s data_size=%s main_index_state=%s java_opts=%s\n' \
+        "${DURATION_SECONDS}" "${DATA_SIZE}" "${MAIN_INDEX_STATE}" "${JAVA_OPTS_VALUE}"
+    exit 0
+fi
+
+mkdir -p "${FORMAL_RESULTS_ROOT}"
+
+{
+    printf 'snapshot_dir=%q\n' "${SNAPSHOT_DIR}"
+    printf 'results_root=%q\n' "${FORMAL_RESULTS_ROOT}"
+    printf 'work_root=%q\n' "${FORMAL_WORK_ROOT}"
+    printf 'config=%q\n' "${SOURCE_CONFIG}"
+    printf 'tables=%q\n' "${FORMAL_TABLES[*]}"
+    printf 'threads=%q\n' "${THREADS}"
+    printf 'batch_size=%q\n' "${BATCH_SIZE}"
+    printf 'warmup_seconds=%q\n' "${WARMUP_SECONDS}"
+    printf 'warmup_operations=%q\n' "${WARMUP_OPERATIONS}"
+    printf 'duration_seconds=%q\n' "${DURATION_SECONDS}"
+    printf 'data_size=%q\n' "${DATA_SIZE}"
+    printf 'main_index_state=%q\n' "${MAIN_INDEX_STATE}"
+    printf 'java_opts=%q\n' "${JAVA_OPTS_VALUE}"
+    printf 'keep_work_dirs=%q\n' "${KEEP_WORK_DIRS}"
+    printf 'smoke=%q\n' "${SMOKE}"
+} > "${FORMAL_RESULTS_ROOT}/parameters.env"
+
+{
+    uname -a
+    printf 'nproc=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    java -version
+    free -h 2>/dev/null || true
+} > "${FORMAL_RESULTS_ROOT}/system-info.txt" 2>&1
+
+log "formal results will be written to ${FORMAL_RESULTS_ROOT}"
+
+suite_args=(
+    --snapshot-dir "${SNAPSHOT_DIR}"
+    --results-dir "${FORMAL_RESULTS_ROOT}"
+    --work-dir-root "${FORMAL_WORK_ROOT}"
+    --config "${SOURCE_CONFIG}"
+    --java-opts "${JAVA_OPTS_VALUE}"
+    --threads "${THREADS}"
+    --batch-size "${BATCH_SIZE}"
+    --warmup-seconds "${WARMUP_SECONDS}"
+    --warmup-operations "${WARMUP_OPERATIONS}"
+    --duration-seconds "${DURATION_SECONDS}"
+    --data-size "${DATA_SIZE}"
+    --main-index-state "${MAIN_INDEX_STATE}"
+)
+
+if [[ "${KEEP_WORK_DIRS}" == "true" ]]
+then
+    suite_args+=(--keep-work-dirs)
+fi
+if [[ "${SMOKE}" == "true" ]]
+then
+    suite_args+=(--smoke)
+fi
+
+for table in "${FORMAL_TABLES[@]}"
+do
+    log "===== formal Index benchmark: ${table} ====="
+    set +e
+    PIXELS_CONFIG="${SOURCE_CONFIG}" \
+        "${ROOT_DIR}/bin/run-index-suite" \
+            "${suite_args[@]}" \
+            --snapshot-table "${table}" \
+            2>&1 | tee "${FORMAL_RESULTS_ROOT}/${table}-suite.log"
+    suite_status=${PIPESTATUS[0]}
+    set -e
+    [[ "${suite_status}" -eq 0 ]] ||
+        die "index suite failed for table ${table}; see ${FORMAL_RESULTS_ROOT}/${table}-suite.log"
+done
+
+{
+    printf 'results_root=%s\n' "${FORMAL_RESULTS_ROOT}"
+    printf 'tables=%s\n' "${FORMAL_TABLES[*]}"
+    printf 'main_index_state=%s\n' "${MAIN_INDEX_STATE}"
+    for table in "${FORMAL_TABLES[@]}"
+    do
+        printf '\n[%s]\n' "${table}"
+        summary=""
+        for parameters in "${FORMAL_RESULTS_ROOT}"/index-*/parameters.env
+        do
+            [[ -f "${parameters}" ]] || continue
+            if grep -q "^snapshot_table='${table}'$" "${parameters}" ||
+               grep -q "^snapshot_table=${table}$" "${parameters}"
+            then
+                summary="${parameters%/parameters.env}/summary.txt"
+            fi
+        done
+        if [[ -n "${summary}" && -f "${summary}" ]]
+        then
+            cat "${summary}"
+        else
+            printf 'status=missing_summary\n'
+        fi
+    done
+} > "${FORMAL_RESULTS_ROOT}/formal-summary.txt"
+
+cat "${FORMAL_RESULTS_ROOT}/formal-summary.txt"
+log "formal Index suite completed successfully"

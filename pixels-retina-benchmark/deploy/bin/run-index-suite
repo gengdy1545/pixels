@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="${RETINA_BENCHMARK_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+umask 077
+
+SNAPSHOT_DIR=""
+SNAPSHOT_TABLE=""
+RESULTS_ROOT="${RESULTS_ROOT:-${ROOT_DIR}/results}"
+WORK_ROOT="${INDEX_WORK_ROOT:-/var/tmp/pixels-retina-benchmark/index-suite}"
+SOURCE_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}"
+JAVA_OPTS_VALUE="${INDEX_JAVA_OPTS:--Xms40g -Xmx40g}"
+
+THREADS=16
+CLIENTS=1
+BATCH_SIZE=64
+WARMUP_SECONDS=30
+WARMUP_OPERATIONS=100000
+DURATION_SECONDS=20
+DATA_SIZE=1000000
+MAIN_INDEX_STATE="warm-cache"
+SMOKE=false
+DRY_RUN=false
+KEEP_WORK_DIRS=false
+
+RUN_DIR=""
+RUN_WORK_DIR=""
+
+usage()
+{
+    cat <<'EOF'
+Usage: bin/run-index-suite --snapshot-dir DIR --snapshot-table TABLE [options]
+
+Validates a Snapshot v2 index profile, then runs primary-index Put, Update,
+and Delete. Every operation restores RocksDB and SQLite into a distinct,
+previously unused work directory.
+
+Index benchmarks do not require Metadata Server, etcd, or MySQL to be running.
+They only need a filled-in pixels.properties (no REPLACE_WITH placeholders).
+
+Options:
+  --snapshot-dir DIR             Snapshot v2 directory (required)
+  --snapshot-table TABLE         Snapshot table name (required)
+  --config FILE                  pixels.properties to use (default: runtime/etc)
+  --results-dir DIR              Results root (default: runtime/results)
+  --work-dir-root DIR            Disposable Index work root (default: /var/tmp/...)
+  --java-opts TEXT               Benchmark JVM options (default: -Xms40g -Xmx40g)
+  --threads N                    Worker threads (default: 16)
+  --batch-size N                 Entries per Index batch (default: 64)
+  --warmup-seconds N             Warmup time limit (default: 30)
+  --warmup-operations N          Warmup operation limit (default: 100000)
+  --duration-seconds N           Measurement time limit (default: 20)
+  --data-size N                  Measurement operation limit (default: 1000000)
+  --main-index-state STATE       MainIndex state for Update/Delete: hot-buffer,
+                                 warm-cache (default), or cold-start
+  --keep-work-dirs               Preserve successful work copies for inspection
+  --smoke                        Use tiny functional-test parameters
+  --dry-run                      Print configuration without running
+  -h, --help                     Show this help
+EOF
+}
+
+log()
+{
+    printf '[index-suite] %s\n' "$*"
+}
+
+die()
+{
+    printf '[index-suite] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+require_value()
+{
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "${value}" ]] || die "${option} requires a value"
+}
+
+require_positive_integer()
+{
+    local name="$1"
+    local value="$2"
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] || die "${name} must be a positive integer: ${value}"
+}
+
+validate_pixels_config()
+{
+    local config_file="$1"
+    [[ -f "${config_file}" ]] || die "pixels.properties not found: ${config_file}"
+    if grep -Eq '^[[:space:]]*[A-Za-z0-9_.-]+=.*REPLACE_WITH_' "${config_file}"
+    then
+        die "pixels.properties still contains REPLACE_WITH placeholders: ${config_file}"
+    fi
+    local metadata_port
+    metadata_port="$(awk -F= '$1 == "metadata.server.port" { print $2; exit }' "${config_file}")"
+    [[ -n "${metadata_port}" ]] ||
+        die "pixels.properties is missing metadata.server.port"
+    [[ "${metadata_port}" =~ ^[0-9]+$ ]] ||
+        die "metadata.server.port must be numeric in ${config_file}, got: ${metadata_port}"
+}
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        --snapshot-dir) require_value "$1" "${2:-}"; SNAPSHOT_DIR="$2"; shift 2 ;;
+        --snapshot-table) require_value "$1" "${2:-}"; SNAPSHOT_TABLE="$2"; shift 2 ;;
+        --config) require_value "$1" "${2:-}"; SOURCE_CONFIG="$2"; shift 2 ;;
+        --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
+        --work-dir-root) require_value "$1" "${2:-}"; WORK_ROOT="$2"; shift 2 ;;
+        --java-opts) require_value "$1" "${2:-}"; JAVA_OPTS_VALUE="$2"; shift 2 ;;
+        --threads) require_value "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
+        --batch-size) require_value "$1" "${2:-}"; BATCH_SIZE="$2"; shift 2 ;;
+        --warmup-seconds) require_value "$1" "${2:-}"; WARMUP_SECONDS="$2"; shift 2 ;;
+        --warmup-operations) require_value "$1" "${2:-}"; WARMUP_OPERATIONS="$2"; shift 2 ;;
+        --duration-seconds) require_value "$1" "${2:-}"; DURATION_SECONDS="$2"; shift 2 ;;
+        --data-size) require_value "$1" "${2:-}"; DATA_SIZE="$2"; shift 2 ;;
+        --main-index-state) require_value "$1" "${2:-}"; MAIN_INDEX_STATE="$2"; shift 2 ;;
+        --keep-work-dirs) KEEP_WORK_DIRS=true; shift ;;
+        --smoke) SMOKE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+[[ -n "${SNAPSHOT_DIR}" ]] || die "--snapshot-dir is required"
+[[ -n "${SNAPSHOT_TABLE}" ]] || die "--snapshot-table is required"
+[[ -f "${SNAPSHOT_DIR}/snapshot.json" ]] ||
+    die "snapshot manifest not found: ${SNAPSHOT_DIR}/snapshot.json"
+[[ -d "${SNAPSHOT_DIR}/state/index/rocksdb" ]] ||
+    die "snapshot RocksDB state not found"
+[[ -d "${SNAPSHOT_DIR}/state/index/sqlite" ]] ||
+    die "snapshot SQLite state not found"
+[[ -x "${ROOT_DIR}/bin/run-benchmark" ]] ||
+    die "run-benchmark not found under ${ROOT_DIR}/bin"
+validate_pixels_config "${SOURCE_CONFIG}"
+
+for pair in \
+    "threads:${THREADS}" "batch-size:${BATCH_SIZE}" \
+    "duration-seconds:${DURATION_SECONDS}" "data-size:${DATA_SIZE}"
+do
+    require_positive_integer "${pair%%:*}" "${pair#*:}"
+done
+[[ "${WARMUP_SECONDS}" =~ ^[0-9]+$ ]] ||
+    die "warmup-seconds must be a non-negative integer: ${WARMUP_SECONDS}"
+[[ "${WARMUP_OPERATIONS}" =~ ^[0-9]+$ ]] ||
+    die "warmup-operations must be a non-negative integer: ${WARMUP_OPERATIONS}"
+case "${MAIN_INDEX_STATE}" in
+    hot-buffer|warm-cache|cold-start) ;;
+    *) die "main-index-state must be hot-buffer, warm-cache, or cold-start: ${MAIN_INDEX_STATE}" ;;
+esac
+
+if [[ "${SMOKE}" == "true" ]]
+then
+    THREADS=2
+    BATCH_SIZE=1
+    WARMUP_SECONDS=0
+    WARMUP_OPERATIONS=0
+    DURATION_SECONDS=2
+    DATA_SIZE=100
+fi
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_DIR="${RESULTS_ROOT%/}/index-${RUN_ID}"
+RUN_WORK_DIR="${WORK_ROOT%/}/index-${RUN_ID}"
+
+if [[ "${DRY_RUN}" == "true" ]]
+then
+    log "dry run"
+    printf 'snapshot_dir=%s\nsnapshot_table=%s\nconfig=%s\nresults_dir=%s\nwork_dir=%s\n' \
+        "${SNAPSHOT_DIR}" "${SNAPSHOT_TABLE}" "${SOURCE_CONFIG}" "${RUN_DIR}" "${RUN_WORK_DIR}"
+    printf 'threads=%s clients=%s batch_size=%s warmup_seconds=%s warmup_operations=%s\n' \
+        "${THREADS}" "${CLIENTS}" "${BATCH_SIZE}" "${WARMUP_SECONDS}" "${WARMUP_OPERATIONS}"
+    printf 'duration_seconds=%s data_size=%s main_index_state=%s java_opts=%s keep_work_dirs=%s\n' \
+        "${DURATION_SECONDS}" "${DATA_SIZE}" "${MAIN_INDEX_STATE}" \
+        "${JAVA_OPTS_VALUE}" "${KEEP_WORK_DIRS}"
+    exit 0
+fi
+
+mkdir -p "${RUN_DIR}" "${RUN_WORK_DIR}"
+
+snapshot_size_kib="$(du -sk "${SNAPSHOT_DIR}/state/index" | awk '{ print $1 }')"
+available_kib="$(df -Pk "${RUN_WORK_DIR}" | awk 'NR == 2 { print $4 }')"
+if [[ "${KEEP_WORK_DIRS}" == "true" ]]
+then
+    minimum_kib=$((snapshot_size_kib * 4))
+else
+    minimum_kib=$((snapshot_size_kib * 2))
+fi
+if (( available_kib < minimum_kib ))
+then
+    die "insufficient work-disk space: available=${available_kib} KiB, minimum=${minimum_kib} KiB"
+fi
+
+{
+    printf 'snapshot_dir=%q\n' "${SNAPSHOT_DIR}"
+    printf 'snapshot_table=%q\n' "${SNAPSHOT_TABLE}"
+    printf 'config=%q\n' "${SOURCE_CONFIG}"
+    printf 'work_dir=%q\n' "${RUN_WORK_DIR}"
+    printf 'java_opts=%q\n' "${JAVA_OPTS_VALUE}"
+    printf 'threads=%q\n' "${THREADS}"
+    printf 'clients=%q\n' "${CLIENTS}"
+    printf 'batch_size=%q\n' "${BATCH_SIZE}"
+    printf 'warmup_seconds=%q\n' "${WARMUP_SECONDS}"
+    printf 'warmup_operations=%q\n' "${WARMUP_OPERATIONS}"
+    printf 'duration_seconds=%q\n' "${DURATION_SECONDS}"
+    printf 'data_size=%q\n' "${DATA_SIZE}"
+    printf 'main_index_state=%q\n' "${MAIN_INDEX_STATE}"
+    printf 'keep_work_dirs=%q\n' "${KEEP_WORK_DIRS}"
+    printf 'snapshot_index_size_kib=%q\n' "${snapshot_size_kib}"
+    printf 'initial_work_disk_available_kib=%q\n' "${available_kib}"
+} > "${RUN_DIR}/parameters.env"
+
+{
+    uname -a
+    printf 'nproc=%s\n' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    java -version
+    free -h 2>/dev/null || true
+    df -h "${RUN_WORK_DIR}"
+} > "${RUN_DIR}/system-info.txt" 2>&1
+
+log "results will be written to ${RUN_DIR}"
+log "fresh Index work copies will be written to ${RUN_WORK_DIR}"
+
+set +e
+PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${SOURCE_CONFIG}" \
+JAVA_OPTS="${JAVA_OPTS_VALUE}" \
+    "${ROOT_DIR}/bin/run-benchmark" snapshot-validate \
+    --snapshot-dir "${SNAPSHOT_DIR}" \
+    --snapshot-table "${SNAPSHOT_TABLE}" \
+    --snapshot-require index \
+    2>&1 | tee "${RUN_DIR}/snapshot-validation.txt"
+validation_status=${PIPESTATUS[0]}
+set -e
+[[ "${validation_status}" -eq 0 ]] ||
+    die "snapshot index validation failed; see ${RUN_DIR}/snapshot-validation.txt"
+grep -q '^status=valid$' "${RUN_DIR}/snapshot-validation.txt" ||
+    die "snapshot validation did not report status=valid"
+
+validate_result()
+{
+    local operation="$1"
+    local result_file="$2"
+    grep -q "^benchmark=index-${operation}-primary$" "${result_file}" ||
+        die "${operation} did not produce a benchmark result; see ${result_file}"
+    grep -q '^errors=0$' "${result_file}" ||
+        die "${operation} reported errors; see ${result_file}"
+    grep -Eq '^successful_operations=[1-9][0-9]*$' "${result_file}" ||
+        die "${operation} completed no successful operations"
+    if [[ "${operation}" != "put" ]]
+    then
+        grep -q "^detail.mainIndexState=${MAIN_INDEX_STATE}$" "${result_file}" ||
+            die "${operation} did not use MainIndex state ${MAIN_INDEX_STATE}"
+    fi
+    local stop_reason
+    stop_reason="$(awk -F= '$1 == "stop_reason" { print $2 }' "${result_file}")"
+    if [[ "${SMOKE}" == "true" ]]
+    then
+        [[ "${stop_reason}" == "data-size" ]] ||
+            die "${operation} smoke stopped for ${stop_reason}, expected data-size"
+    else
+        [[ "${stop_reason}" == "duration" || "${stop_reason}" == "data-size" ]] ||
+            die "${operation} stopped for unexpected reason ${stop_reason}"
+    fi
+}
+
+run_operation()
+{
+    local operation="$1"
+    local operation_work="${RUN_WORK_DIR}/${operation}"
+    local result_file="${RUN_DIR}/index-${operation}-primary.txt"
+    [[ ! -e "${operation_work}" ]] ||
+        die "operation work directory already exists: ${operation_work}"
+
+    log "running index-${operation}-primary with fresh Snapshot state"
+    local args=(
+        --snapshot-dir "${SNAPSHOT_DIR}"
+        --snapshot-table "${SNAPSHOT_TABLE}"
+        --snapshot-work-dir "${operation_work}"
+        --threads "${THREADS}"
+        --clients "${CLIENTS}"
+        --batch-size "${BATCH_SIZE}"
+        --warmup-seconds "${WARMUP_SECONDS}"
+        --warmup-operations "${WARMUP_OPERATIONS}"
+        --duration-seconds "${DURATION_SECONDS}"
+        --data-size "${DATA_SIZE}"
+        --main-index-state "${MAIN_INDEX_STATE}"
+    )
+
+    set +e
+    PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${SOURCE_CONFIG}" \
+    JAVA_OPTS="${JAVA_OPTS_VALUE}" \
+        "${ROOT_DIR}/bin/run-benchmark" "index-${operation}-primary" "${args[@]}" \
+        2>&1 | tee "${result_file}"
+    local benchmark_status=${PIPESTATUS[0]}
+    set -e
+    [[ "${benchmark_status}" -eq 0 ]] ||
+        die "index-${operation}-primary failed with exit code ${benchmark_status}; see ${result_file}"
+    validate_result "${operation}" "${result_file}"
+    du -sk "${operation_work}" | awk '{ print $1 }' > "${RUN_DIR}/index-${operation}-work-size-kib.txt"
+    if [[ "${KEEP_WORK_DIRS}" == "false" ]]
+    then
+        [[ "${operation_work}" == "${RUN_WORK_DIR}/"* ]] ||
+            die "refusing to remove unexpected work directory: ${operation_work}"
+        rm -rf -- "${operation_work}"
+        log "removed successful ${operation} work copy"
+    fi
+}
+
+run_operation put
+run_operation update
+run_operation delete
+
+{
+    printf 'results_dir=%s\n' "${RUN_DIR}"
+    printf 'work_dir=%s\n' "${RUN_WORK_DIR}"
+    printf 'main_index_state=%s\n' "${MAIN_INDEX_STATE}"
+    if [[ "${KEEP_WORK_DIRS}" == "true" ]]
+    then
+        printf 'work_dir_status=preserved\n'
+    else
+        printf 'work_dir_status=removed_after_each_success\n'
+    fi
+    for operation in put update delete
+    do
+        printf '\n[%s]\n' "${operation}"
+        awk -F= '
+            /^(benchmark|successful_operations|errors|elapsed_seconds|throughput_ops_per_second|api_calls_per_second|p50_latency_us|p99_latency_us|p50_api_latency_us|p99_api_latency_us|stop_reason)=/ {
+                print
+            }
+        ' "${RUN_DIR}/index-${operation}-primary.txt"
+        printf 'work_size_kib=%s\n' \
+            "$(cat "${RUN_DIR}/index-${operation}-work-size-kib.txt")"
+    done
+} > "${RUN_DIR}/summary.txt"
+
+if [[ "${KEEP_WORK_DIRS}" == "false" ]]
+then
+    rmdir "${RUN_WORK_DIR}"
+fi
+
+cat "${RUN_DIR}/summary.txt"
+log "Index suite completed successfully"
+if [[ "${KEEP_WORK_DIRS}" == "true" ]]
+then
+    log "work directories are preserved for inspection; remove ${RUN_WORK_DIR} manually when no longer needed"
+else
+    log "successful work directories were removed; failed scenarios are preserved"
+fi

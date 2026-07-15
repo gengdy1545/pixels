@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+ROOT_DIR="${RETINA_BENCHMARK_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="${ROOT_DIR}/../install"
+PATHS_FILE="${INSTALL_DIR}/paths.env"
+
+if [[ -f "${PATHS_FILE}" ]]
+then
+    # shellcheck source=../install/paths.env
+    source "${PATHS_FILE}"
+    BUNDLE_ROOT="$(resolve_bundle_root "${SCRIPT_DIR}/run-retina-formal-suite" 2>/dev/null || true)"
+fi
+if [[ -z "${BUNDLE_ROOT:-}" || ! -f "${BUNDLE_ROOT}/formal-defaults.env" ]]
+then
+    BUNDLE_ROOT="$(cd "${ROOT_DIR}/.." && pwd)"
+fi
+if [[ -f "${BUNDLE_ROOT}/formal-defaults.env" ]]
+then
+    # shellcheck source=../formal-defaults.env
+    source "${BUNDLE_ROOT}/formal-defaults.env"
+fi
+
+PIXELS_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}"
+ETCD_BIN="${ETCD_BIN:-${BUNDLE_ROOT}/third-party/etcd/etcd}"
+ETCDCTL_BIN="${ETCDCTL_BIN:-${BUNDLE_ROOT}/third-party/etcd/etcdctl}"
+
+SMOKE=false
+DRY_RUN=false
+SKIP_BOOTSTRAP=false
+SKIP_UPLOAD=false
+
+RUN_ID=""
+FORMAL_RESULTS=""
+FAILED_STAGE=""
+STARTED_AT=""
+FINISHED_AT=""
+SUITE_STATUS="success"
+
+usage()
+{
+    cat <<'EOF'
+Usage: bin/run-retina-formal-suite [options]
+
+Runs the formal Retina benchmark matrix sequentially:
+  Index -> Visibility -> Transaction -> WriteBuffer
+
+Options:
+  --smoke                        Run smoke-sized parameters in every module
+  --dry-run                      Print the resolved plan without running benchmarks
+  --skip-bootstrap               Do not invoke install/bootstrap.sh
+  --skip-upload                  Keep results local; do not sync to RESULTS_S3_ROOT
+  --results-dir DIR              Override RESULTS_ROOT parent for this run
+  --snapshot-dir DIR             Override SNAPSHOT_DIR
+  --s3-root URI                  Override WriteBuffer S3 root
+  --results-s3-root URI          Override results upload root
+  -h, --help                     Show this help
+EOF
+}
+
+log()
+{
+    printf '[formal-suite] %s\n' "$*"
+}
+
+die()
+{
+    printf '[formal-suite] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+require_value()
+{
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "${value}" ]] || die "${option} requires a value"
+}
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        --smoke) SMOKE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --skip-bootstrap) SKIP_BOOTSTRAP=true; shift ;;
+        --skip-upload) SKIP_UPLOAD=true; shift ;;
+        --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
+        --snapshot-dir) require_value "$1" "${2:-}"; SNAPSHOT_DIR="$2"; shift 2 ;;
+        --s3-root) require_value "$1" "${2:-}"; S3_ROOT="$2"; shift 2 ;;
+        --results-s3-root) require_value "$1" "${2:-}"; RESULTS_S3_ROOT="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+[[ -x "${ROOT_DIR}/bin/run-index-formal-suite" ]] ||
+    die "run-index-formal-suite not found under ${ROOT_DIR}/bin"
+[[ -x "${ROOT_DIR}/bin/run-visibility-suite" ]] ||
+    die "run-visibility-suite not found under ${ROOT_DIR}/bin"
+[[ -x "${ROOT_DIR}/bin/run-transaction-suite" ]] ||
+    die "run-transaction-suite not found under ${ROOT_DIR}/bin"
+[[ -x "${ROOT_DIR}/bin/run-write-buffer-suite" ]] ||
+    die "run-write-buffer-suite not found under ${ROOT_DIR}/bin"
+[[ -f "${PIXELS_CONFIG}" ]] || die "pixels.properties not found: ${PIXELS_CONFIG}"
+[[ -x "${ETCD_BIN}" ]] || die "etcd binary not found: ${ETCD_BIN}"
+[[ -x "${ETCDCTL_BIN}" ]] || die "etcdctl binary not found: ${ETCDCTL_BIN}"
+
+RUN_ID="formal-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+FORMAL_RESULTS="${RESULTS_ROOT%/}/${RUN_ID}"
+RESULTS_S3_URI="${RESULTS_S3_ROOT%/}/${RUN_ID}"
+
+stage_args()
+{
+    if [[ "${SMOKE}" == "true" ]]
+    then
+        printf '%s' --smoke
+    fi
+}
+
+run_stage()
+{
+    local stage="$1"
+    shift
+    local start_ts end_ts elapsed rc
+    log "===== stage start: ${stage} ====="
+    start_ts="$(date +%s)"
+    set +e
+    "$@"
+    rc=$?
+    set -e
+    end_ts="$(date +%s)"
+    elapsed=$((end_ts - start_ts))
+    printf '%s stage_seconds=%s exit_code=%s\n' "${stage}" "${elapsed}" "${rc}" \
+        >> "${FORMAL_RESULTS}/stage-timing.txt"
+    if (( rc != 0 ))
+    then
+        FAILED_STAGE="${stage}"
+        SUITE_STATUS="failed"
+        die "stage ${stage} failed with exit code ${rc}"
+    fi
+    canonicalize_module_summary "${stage}"
+    log "===== stage complete: ${stage} (${elapsed}s) ====="
+}
+
+write_manifest()
+{
+    local output="${FORMAL_RESULTS}/manifest.json"
+    FINISHED_AT="$(date -u --iso-8601=seconds)"
+    {
+        printf '{'
+        printf '"run_id":"%s",' "${RUN_ID}"
+        printf '"status":"%s",' "${SUITE_STATUS}"
+        printf '"failed_stage":%s,' "$( [[ -n "${FAILED_STAGE}" ]] && printf '"%s"' "${FAILED_STAGE}" || printf 'null' )"
+        printf '"started_at":"%s",' "${STARTED_AT}"
+        printf '"finished_at":"%s",' "${FINISHED_AT}"
+        printf '"host":"%s",' "$(hostname -f 2>/dev/null || hostname)"
+        printf '"bundle_root":"%s",' "${BUNDLE_ROOT}"
+        printf '"snapshot_dir":"%s",' "${SNAPSHOT_DIR}"
+        printf '"results_dir":"%s",' "${FORMAL_RESULTS}"
+        printf '"results_s3_uri":"%s",' "${RESULTS_S3_URI}"
+        printf '"smoke":%s' "$( [[ "${SMOKE}" == "true" ]] && printf 'true' || printf 'false' )"
+        printf '}\n'
+    } > "${output}"
+}
+
+canonicalize_module_summary()
+{
+    local module="$1"
+    local canonical="${FORMAL_RESULTS}/${module}/summary.txt"
+    local found=""
+    if [[ "${module}" == "index" ]]
+    then
+        found="$(find "${FORMAL_RESULTS}/${module}" -name formal-summary.txt 2>/dev/null | sort | tail -1)"
+        if [[ -n "${found}" && -f "${found}" ]]
+        then
+            cp "${found}" "${FORMAL_RESULTS}/${module}/formal-summary.txt"
+        fi
+        return
+    fi
+    found="$(find "${FORMAL_RESULTS}/${module}" -maxdepth 2 -name summary.txt 2>/dev/null | sort | tail -1)"
+    if [[ -n "${found}" && -f "${found}" ]]
+    then
+        cp "${found}" "${canonical}"
+    fi
+}
+
+write_summary()
+{
+    local output="${FORMAL_RESULTS}/summary.txt"
+    {
+        printf 'run_id=%s\n' "${RUN_ID}"
+        printf 'status=%s\n' "${SUITE_STATUS}"
+        printf 'failed_stage=%s\n' "${FAILED_STAGE:-none}"
+        printf 'started_at=%s\n' "${STARTED_AT}"
+        printf 'finished_at=%s\n' "${FINISHED_AT:-pending}"
+        printf 'results_dir=%s\n' "${FORMAL_RESULTS}"
+        printf 'results_s3_uri=%s\n' "${RESULTS_S3_URI}"
+        printf 'snapshot_dir=%s\n' "${SNAPSHOT_DIR}"
+        printf 's3_root=%s\n' "${S3_ROOT}"
+        if [[ -f "${FORMAL_RESULTS}/index/formal-summary.txt" ]]
+        then
+            printf '\n[index]\n'
+            cat "${FORMAL_RESULTS}/index/formal-summary.txt"
+        else
+            local index_summary=""
+            index_summary="$(find "${FORMAL_RESULTS}/index" -name formal-summary.txt 2>/dev/null | sort | tail -1)"
+            if [[ -n "${index_summary}" && -f "${index_summary}" ]]
+            then
+                cp "${index_summary}" "${FORMAL_RESULTS}/index/formal-summary.txt"
+                printf '\n[index]\n'
+                cat "${FORMAL_RESULTS}/index/formal-summary.txt"
+            fi
+        fi
+        if [[ -f "${FORMAL_RESULTS}/visibility/summary.txt" ]]
+        then
+            printf '\n[visibility]\n'
+            cat "${FORMAL_RESULTS}/visibility/summary.txt"
+        fi
+        if [[ -f "${FORMAL_RESULTS}/transaction/summary.txt" ]]
+        then
+            printf '\n[transaction]\n'
+            cat "${FORMAL_RESULTS}/transaction/summary.txt"
+        fi
+        if [[ -f "${FORMAL_RESULTS}/write-buffer/summary.txt" ]]
+        then
+            printf '\n[write-buffer]\n'
+            cat "${FORMAL_RESULTS}/write-buffer/summary.txt"
+        fi
+    } > "${output}"
+}
+
+upload_results()
+{
+    if [[ "${SKIP_UPLOAD}" == "true" ]]
+    then
+        log "skipping results upload (--skip-upload)"
+        return
+    fi
+    command -v aws >/dev/null 2>&1 || die "aws CLI is required to upload results"
+    log "uploading results to ${RESULTS_S3_URI}"
+    aws s3 sync "${FORMAL_RESULTS}/" "${RESULTS_S3_URI}/"
+    log "results uploaded to ${RESULTS_S3_URI}"
+}
+
+on_exit()
+{
+    local status=$?
+    trap - EXIT
+    if [[ -n "${FORMAL_RESULTS}" && -d "${FORMAL_RESULTS}" ]]
+    then
+        if [[ "${status}" -ne 0 && -z "${FAILED_STAGE}" ]]
+        then
+            SUITE_STATUS="failed"
+        fi
+        write_manifest
+        write_summary
+        if [[ "${SUITE_STATUS}" == "success" ]]
+        then
+            upload_results || log "results upload failed; local copy preserved at ${FORMAL_RESULTS}"
+        else
+            log "suite failed; uploading partial results for inspection"
+            upload_results || true
+        fi
+        cat "${FORMAL_RESULTS}/summary.txt" 2>/dev/null || true
+    fi
+    exit "${status}"
+}
+
+trap on_exit EXIT
+
+if [[ "${DRY_RUN}" == "true" ]]
+then
+    log "dry run"
+    printf 'bundle_root=%s\n' "${BUNDLE_ROOT}"
+    printf 'runtime_dir=%s\n' "${ROOT_DIR}"
+    printf 'snapshot_dir=%s\n' "${SNAPSHOT_DIR}"
+    printf 'results_dir=%s\n' "${FORMAL_RESULTS}"
+    printf 'results_s3_uri=%s\n' "${RESULTS_S3_URI}"
+    printf 's3_root=%s\n' "${S3_ROOT}"
+    printf 'etcd_bin=%s\n' "${ETCD_BIN}"
+    printf 'java_opts=%s\n' "${FORMAL_JAVA_OPTS}"
+    printf 'smoke=%s skip_bootstrap=%s skip_upload=%s\n' \
+        "${SMOKE}" "${SKIP_BOOTSTRAP}" "${SKIP_UPLOAD}"
+    trap - EXIT
+    exit 0
+fi
+
+STARTED_AT="$(date -u --iso-8601=seconds)"
+mkdir -p "${FORMAL_RESULTS}"/{index,visibility,transaction,write-buffer}
+
+{
+    printf 'run_id=%q\n' "${RUN_ID}"
+    printf 'bundle_root=%q\n' "${BUNDLE_ROOT}"
+    printf 'runtime_dir=%q\n' "${ROOT_DIR}"
+    printf 'snapshot_dir=%q\n' "${SNAPSHOT_DIR}"
+    printf 'results_dir=%q\n' "${FORMAL_RESULTS}"
+    printf 'results_s3_uri=%q\n' "${RESULTS_S3_URI}"
+    printf 's3_root=%q\n' "${S3_ROOT}"
+    printf 'work_root=%q\n' "${WORK_ROOT}"
+    printf 'state_root=%q\n' "${STATE_ROOT}"
+    printf 'java_opts=%q\n' "${FORMAL_JAVA_OPTS}"
+    printf 'smoke=%q\n' "${SMOKE}"
+} > "${FORMAL_RESULTS}/parameters.env"
+
+if [[ "${SKIP_BOOTSTRAP}" == "false" && -x "${BUNDLE_ROOT}/install/bootstrap.sh" ]]
+then
+    log "running bootstrap"
+    BUNDLE_ROOT="${BUNDLE_ROOT}" "${BUNDLE_ROOT}/install/bootstrap.sh" \
+        2>&1 | tee "${FORMAL_RESULTS}/bootstrap.log"
+elif [[ ! -f "${SNAPSHOT_DIR}/snapshot.json" ]]
+then
+    die "snapshot not found at ${SNAPSHOT_DIR}; run bootstrap first or pass --skip-bootstrap after preparing the host"
+fi
+
+[[ -f "${SNAPSHOT_DIR}/snapshot.json" ]] ||
+    die "snapshot manifest missing: ${SNAPSHOT_DIR}/snapshot.json"
+
+common_env=(
+    "RETINA_BENCHMARK_HOME=${ROOT_DIR}"
+    "PIXELS_HOME=${ROOT_DIR}"
+    "PIXELS_CONFIG=${PIXELS_CONFIG}"
+)
+
+smoke_flags=()
+if [[ "${SMOKE}" == "true" ]]
+then
+    smoke_flags=(--smoke)
+fi
+
+run_stage index env "${common_env[@]}" \
+    INDEX_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \
+    "${ROOT_DIR}/bin/run-index-formal-suite" \
+        --snapshot-dir "${SNAPSHOT_DIR}" \
+        --results-dir "${FORMAL_RESULTS}/index" \
+        --work-dir-root "${WORK_ROOT}/index" \
+        --config "${PIXELS_CONFIG}" \
+        --java-opts "${FORMAL_JAVA_OPTS}" \
+        "${smoke_flags[@]}"
+
+run_stage visibility env "${common_env[@]}" \
+    VISIBILITY_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \
+    "${ROOT_DIR}/bin/run-visibility-suite" \
+        --snapshot-dir "${SNAPSHOT_DIR}" \
+        --results-dir "${FORMAL_RESULTS}/visibility" \
+        "${smoke_flags[@]}"
+
+run_stage transaction env "${common_env[@]}" \
+    TRANS_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \
+    CLIENT_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \
+    TRANSACTION_STATE_ROOT="${STATE_ROOT}/transaction-suite" \
+    "${ROOT_DIR}/bin/run-transaction-suite" \
+        --results-dir "${FORMAL_RESULTS}/transaction" \
+        --state-dir "${STATE_ROOT}/transaction-suite" \
+        --config "${PIXELS_CONFIG}" \
+        --etcd-bin "${ETCD_BIN}" \
+        --etcdctl-bin "${ETCDCTL_BIN}" \
+        --java-opts "${FORMAL_JAVA_OPTS}" \
+        "${smoke_flags[@]}"
+
+run_stage write-buffer env "${common_env[@]}" \
+    WRITE_BUFFER_SERVER_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \
+    WRITE_BUFFER_CLIENT_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \
+    WRITE_BUFFER_STATE_ROOT="${STATE_ROOT}/write-buffer-suite" \
+    "${ROOT_DIR}/bin/run-write-buffer-suite" \
+        --snapshot-dir "${SNAPSHOT_DIR}" \
+        --s3-root "${S3_ROOT}" \
+        --results-dir "${FORMAL_RESULTS}/write-buffer" \
+        --state-dir "${STATE_ROOT}/write-buffer-suite" \
+        --config "${PIXELS_CONFIG}" \
+        --etcd-bin "${ETCD_BIN}" \
+        --etcdctl-bin "${ETCDCTL_BIN}" \
+        --java-opts "${FORMAL_JAVA_OPTS}" \
+        "${smoke_flags[@]}"
+
+canonicalize_module_summary write-buffer
+
+log "formal Retina benchmark suite completed successfully"
