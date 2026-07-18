@@ -13,11 +13,11 @@ JAVA_OPTS_VALUE="${INDEX_JAVA_OPTS:--Xms40g -Xmx40g}"
 
 THREADS=16
 CLIENTS=1
-BATCH_SIZE=64
+BATCH_SIZE=4
 WARMUP_SECONDS=30
 WARMUP_OPERATIONS=100000
-DURATION_SECONDS=20
-DATA_SIZE=1000000
+DURATION_SECONDS=60
+DATA_SIZE=10000000
 MAIN_INDEX_STATE="warm-cache"
 SMOKE=false
 DRY_RUN=false
@@ -46,11 +46,11 @@ Options:
   --work-dir-root DIR            Disposable Index work root (default: /var/tmp/...)
   --java-opts TEXT               Benchmark JVM options (default: -Xms40g -Xmx40g)
   --threads N                    Worker threads (default: 16)
-  --batch-size N                 Entries per Index batch (default: 64)
+  --batch-size N                 Entries per Index batch (default: 4)
   --warmup-seconds N             Warmup time limit (default: 30)
   --warmup-operations N          Warmup operation limit (default: 100000)
-  --duration-seconds N           Measurement time limit (default: 20)
-  --data-size N                  Measurement operation limit (default: 1000000)
+  --duration-seconds N           Measurement time limit (default: 60)
+  --data-size N                  Measurement operation limit (default: 10000000)
   --main-index-state STATE       MainIndex state for Update/Delete: hot-buffer,
                                  warm-cache (default), or cold-start
   --keep-work-dirs               Preserve successful work copies for inspection

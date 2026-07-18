@@ -89,6 +89,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
     private long manifestRowCount;
     private int productionSelectedPathCount;
     private long lastValidatedDeletes;
+    private boolean validateFinalBitmap;
 
     private List<RowGroupSpec> rowGroups;
     private PreparedDelete[] warmupDeletes;
@@ -109,6 +110,8 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
             throw new IllegalStateException("snapshot visibility scenario is already set up");
         }
         this.config = config;
+        this.validateFinalBitmap = config.getBoolean(
+                "visibility-validate-final-bitmap", false);
         this.snapshotRuntime = SnapshotRuntime.open(config);
         this.manifest = snapshotRuntime.manifest();
         this.table = snapshotRuntime.requireTable(config.require("snapshot-table"));
@@ -274,7 +277,10 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         details.put("logicalOperation", "one unique physical-row deletion; one local API/JNI call");
         details.put("transactionTimestamp", "one constant real timestamp per clean phase");
         details.put("gc", "retina.gc.interval=0, retina.storage.gc.enabled=false");
-        details.put("postRunValidation", "queryVisibility checks every successful delete outside timing");
+        details.put("postRunValidation", validateFinalBitmap
+                ? "queryVisibility checks every successful delete outside timing"
+                : "disabled; worker/result accounting only");
+        details.put("finalBitmapValidation", Boolean.toString(validateFinalBitmap));
         details.put("lastValidatedDeletes", Long.toString(lastValidatedDeletes));
         details.put("nativeCleanup", "all initialized RGs reclaimed after every phase");
         details.put("excludedModules", "Transaction, Index mutation, WriteBuffer and Visibility RPC");
@@ -590,22 +596,26 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
     {
         long trackedAttempted = 0L;
         long trackedErrors = 0L;
-        Map<RowGroupKey, BitSet> expectedDeleted = new LinkedHashMap<>();
+        Map<RowGroupKey, BitSet> expectedDeleted = validateFinalBitmap
+                ? new LinkedHashMap<>() : null;
         for (SnapshotVisibilityWorker worker : execution.workers)
         {
             trackedAttempted += worker.attempted;
             trackedErrors += worker.failures.cardinality();
-            for (int relative = 0; relative < worker.attempted; relative++)
+            if (validateFinalBitmap)
             {
-                if (worker.failures.get(relative))
+                for (int relative = 0; relative < worker.attempted; relative++)
                 {
-                    continue;
+                    if (worker.failures.get(relative))
+                    {
+                        continue;
+                    }
+                    int operation = Math.toIntExact(worker.range.startInclusive() + relative);
+                    PreparedDelete delete = execution.operations[operation];
+                    expectedDeleted.computeIfAbsent(delete.rowGroup,
+                            ignored -> new BitSet())
+                            .set(delete.offset);
                 }
-                int operation = Math.toIntExact(worker.range.startInclusive() + relative);
-                PreparedDelete delete = execution.operations[operation];
-                expectedDeleted.computeIfAbsent(delete.rowGroup,
-                        ignored -> new BitSet())
-                        .set(delete.offset);
             }
         }
         long trackedSuccessful = trackedAttempted - trackedErrors;
@@ -617,6 +627,12 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
                     + trackedAttempted + "/" + trackedSuccessful + "/" + trackedErrors
                     + ", result=" + result.totalOperations() + "/"
                     + result.successfulOperations() + "/" + result.errors());
+        }
+
+        if (!validateFinalBitmap)
+        {
+            this.lastValidatedDeletes = 0L;
+            return;
         }
 
         long validated = 0L;

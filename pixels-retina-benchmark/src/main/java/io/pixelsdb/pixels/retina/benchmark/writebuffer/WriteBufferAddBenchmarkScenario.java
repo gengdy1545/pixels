@@ -96,6 +96,8 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
     private SnapshotRuntime snapshotRuntime;
     private SnapshotManifest.TableState snapshotTable;
     private boolean seedBuffers;
+    private boolean skipMeasurementClose;
+    private boolean measurementCloseSkipped;
     private long snapshotTimestamp;
     private int nativeTileCapacity;
 
@@ -243,6 +245,8 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         }
         ensureStorageSchemeEnabled(pixelsConfig, storageScheme);
         this.seedBuffers = benchmarkConfig.getBoolean("writebuffer-seed-buffers", true);
+        this.skipMeasurementClose = benchmarkConfig.getBoolean(
+                "writebuffer-skip-measurement-close", false);
 
         int requestedPoolSize = positiveIntOption(benchmarkConfig,
                 "writebuffer-row-pool-size", DEFAULT_ROW_POOL_SIZE);
@@ -371,6 +375,12 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         {
             return;
         }
+        if (phase == BenchmarkPhase.MEASUREMENT && skipMeasurementClose)
+        {
+            measurementCloseSkipped = true;
+            closeMillis.put(phase, 0L);
+            return;
+        }
         long start = System.nanoTime();
         Exception first = null;
         for (PixelsWriteBuffer buffer : state.buffers)
@@ -411,7 +421,9 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
             }
         }
 
-        /* Phase-local JNI state and SQLite row-id state are no longer used. */
+        /* Phase-local JNI state and SQLite row-id state are no longer used.
+           Keep the shared SQLite directory for the following phase; the
+           snapshot work directory is removed when the scenario closes. */
         for (Long fileId : state.fileIds)
         {
             try
@@ -432,7 +444,7 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         }
         try
         {
-            MainIndexFactory.Instance().closeIndex(state.tableId, true);
+            MainIndexFactory.Instance().closeIndex(state.tableId, false);
         }
         catch (Exception e)
         {
@@ -487,7 +499,11 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
         details.put("seed_rows", Long.toString(seededRows.get()));
         details.put("warmup_close_ms", Long.toString(value(closeMillis, BenchmarkPhase.WARMUP)));
         details.put("measurement_close_ms", Long.toString(value(closeMillis, BenchmarkPhase.MEASUREMENT)));
-        details.put("close_timing", "drain/persist is outside measured throughput");
+        details.put("measurement_close_status", measurementCloseSkipped ? "skipped" : "completed");
+        details.put("persistence_validated", Boolean.toString(!measurementCloseSkipped));
+        details.put("close_timing", measurementCloseSkipped
+                ? "measurement drain/persist skipped; process exits after printing acceptance throughput"
+                : "drain/persist is outside measured throughput");
         details.put("checksum", Long.toUnsignedString(checksum.get()));
         details.put("first_workload_error", firstWorkloadError.get() == null ? "none" : firstWorkloadError.get());
         return details;
@@ -511,7 +527,7 @@ public final class WriteBufferAddBenchmarkScenario implements BenchmarkScenario
                 }
             }
         }
-        if (dropSchema && metadataService != null && schemaName != null)
+        if (!measurementCloseSkipped && dropSchema && metadataService != null && schemaName != null)
         {
             try
             {

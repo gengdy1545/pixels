@@ -216,19 +216,19 @@ bin/run-benchmark snapshot-validate \
 bin/run-benchmark index-put-primary \
   --snapshot-dir /data/snapshots/tpch-sf100-node-a \
   --snapshot-table lineitem \
-  --threads 32 --clients 1 --batch-size 64 \
+  --threads 32 --clients 1 --batch-size 4 \
   --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
 
 bin/run-benchmark index-update-primary \
   --snapshot-dir /data/snapshots/tpch-sf100-node-a \
   --snapshot-table lineitem \
-  --threads 32 --clients 1 --batch-size 64 \
+  --threads 32 --clients 1 --batch-size 4 \
   --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
 
 bin/run-benchmark index-delete-primary \
   --snapshot-dir /data/snapshots/tpch-sf100-node-a \
   --snapshot-table lineitem \
-  --threads 32 --clients 1 --batch-size 64 \
+  --threads 32 --clients 1 --batch-size 4 \
   --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
 ```
 
@@ -243,21 +243,21 @@ bin/run-benchmark index-put-secondary \
   --snapshot-dir /data/snapshots/tpch-sf100-node-a \
   --snapshot-table lineitem \
   --snapshot-secondary-index SECONDARY_INDEX_ID_OR_KEY_COLUMNS \
-  --threads 32 --clients 1 --batch-size 64 \
+  --threads 32 --clients 1 --batch-size 4 \
   --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
 
 bin/run-benchmark index-update-secondary \
   --snapshot-dir /data/snapshots/tpch-sf100-node-a \
   --snapshot-table lineitem \
   --snapshot-secondary-index SECONDARY_INDEX_ID_OR_KEY_COLUMNS \
-  --threads 32 --clients 1 --batch-size 64 \
+  --threads 32 --clients 1 --batch-size 4 \
   --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
 
 bin/run-benchmark index-delete-secondary \
   --snapshot-dir /data/snapshots/tpch-sf100-node-a \
   --snapshot-table lineitem \
   --snapshot-secondary-index SECONDARY_INDEX_ID_OR_KEY_COLUMNS \
-  --threads 32 --clients 1 --batch-size 64 \
+  --threads 32 --clients 1 --batch-size 4 \
   --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
 ```
 
@@ -273,7 +273,7 @@ bin/run-benchmark visibility \
   --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
 ```
 
-每个 phase 都从 footer `recordNum` 调用 `addVisibility(..., 0, null, false)` 重建同一 clean baseline，使用不相交物理行，并在计时后校验 delete 结果。没有 Visibility state、checkpoint profile 或恢复流程。
+每个 phase 都从 footer `recordNum` 调用 `addVisibility(..., 0, null, false)` 重建同一 clean baseline，并使用不相交物理行。最终 bitmap 校验默认关闭，可通过 `--visibility-validate-final-bitmap true` 显式启用。没有 Visibility state、checkpoint profile 或恢复流程。
 
 运行的 fat JAR 必须用 manifest 中相同的 `retina.tile.visibility.capacity` 构建。native capacity 不一致会在 setup 阶段失败。
 

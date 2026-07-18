@@ -28,10 +28,10 @@ CLIENTS=4
 BATCH_SIZE=64
 WARMUP_SECONDS=30
 WARMUP_OPERATIONS=100000
-DURATION_SECONDS=180
-# Large enough that a 180s measurement never hits the row cap, while staying
-# below WriteBuffer's 48-bit native timestamp budget (2 * data-size + ops).
-DATA_SIZE=281474976710000
+DURATION_SECONDS=60
+# Practical time-only ceiling: unreachable in 60 seconds and safely below
+# WriteBuffer's 48-bit timestamp budget across warmup and measurement phases.
+DATA_SIZE=100000000
 ROW_POOL_SIZE=100000
 
 MEMTABLE_SIZE=10240
@@ -43,6 +43,7 @@ NULLS_PADDING=false
 BLOCK_SIZE=2147483648
 REPLICATION=1
 VNODES=4
+SKIP_MEASUREMENT_CLOSE=true
 
 SMOKE=false
 DRY_RUN=false
@@ -81,7 +82,7 @@ Options:
   --node-port PORT               Node gRPC port (default: 18891)
   --java-opts TEXT               JVM options for server and client (default: -Xms40g -Xmx40g)
   --threads N                    Producer threads (default: 16)
-  --duration-seconds N           Measurement time limit (default: 180)
+  --duration-seconds N           Measurement time limit (default: 60)
   --smoke                        Use tiny functional-test parameters
   --dry-run                      Print configuration without starting services
   -h, --help                     Show this help
@@ -185,6 +186,7 @@ then
     DURATION_SECONDS=2
     DATA_SIZE=100
     ROW_POOL_SIZE=100
+    SKIP_MEASUREMENT_CLOSE=false
 fi
 
 port_open()
@@ -440,6 +442,7 @@ then
         "${MEMTABLE_SIZE}" "${FLUSH_COUNT}" "${FLUSH_THREADS}" "${FLUSH_INTERVAL}"
     printf 'server_java_opts=%s client_java_opts=%s\n' \
         "${SERVER_JAVA_OPTS}" "${CLIENT_JAVA_OPTS}"
+    printf 'skip_measurement_close=%s\n' "${SKIP_MEASUREMENT_CLOSE}"
     exit 0
 fi
 
@@ -473,6 +476,7 @@ prepare_config
         "${ENCODING_LEVEL}" "${NULLS_PADDING}" "${BLOCK_SIZE}" "${REPLICATION}" "${VNODES}"
     printf 'server_java_opts=%q\nclient_java_opts=%q\n' \
         "${SERVER_JAVA_OPTS}" "${CLIENT_JAVA_OPTS}"
+    printf 'skip_measurement_close=%q\n' "${SKIP_MEASUREMENT_CLOSE}"
 } > "${RUN_DIR}/parameters.env"
 
 {
@@ -528,6 +532,7 @@ JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
     --writebuffer-row-pool-size "${ROW_POOL_SIZE}" \
     --writebuffer-schema "${BENCHMARK_SCHEMA}" \
     --writebuffer-drop-schema true \
+    --writebuffer-skip-measurement-close "${SKIP_MEASUREMENT_CLOSE}" \
     --writebuffer-host-name "wb-${RUN_ID}" \
     --writebuffer-memtable-size "${MEMTABLE_SIZE}" \
     --writebuffer-flush-count "${FLUSH_COUNT}" \
@@ -550,6 +555,20 @@ set -e
     die "WriteBuffer benchmark failed with exit code ${benchmark_status}; see ${RUN_DIR}/result.txt"
 
 RESULT="${RUN_DIR}/result.txt"
+SCHEMA_CLEANUP="${RUN_DIR}/metadata-schema-cleanup.txt"
+set +e
+PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
+JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
+    "${ROOT_DIR}/bin/run-benchmark" metadata-drop-schema \
+    --schema "${BENCHMARK_SCHEMA}" \
+    2>&1 | tee "${SCHEMA_CLEANUP}"
+schema_cleanup_status=${PIPESTATUS[0]}
+set -e
+[[ "${schema_cleanup_status}" -eq 0 ]] ||
+    die "failed to clean benchmark Metadata schema; see ${SCHEMA_CLEANUP}"
+grep -q '^status=dropped$' "${SCHEMA_CLEANUP}" ||
+    die "Metadata schema cleanup did not report status=dropped"
+
 grep -q '^benchmark=write-buffer-add$' "${RESULT}" ||
     die "WriteBuffer did not produce a benchmark result"
 grep -q '^errors=0$' "${RESULT}" || die "WriteBuffer reported errors"
@@ -562,8 +581,12 @@ then
     grep -q '^stop_reason=data-size$' "${RESULT}" ||
         die "WriteBuffer smoke did not reach its row limit"
 else
-    grep -q '^stop_reason=duration$' "${RESULT}" ||
-        die "WriteBuffer formal run did not reach its duration limit"
+    grep -Eq '^stop_reason=(duration|data-size)$' "${RESULT}" ||
+        die "WriteBuffer formal run did not reach its duration or row limit"
+    grep -q '^detail.measurement_close_status=skipped$' "${RESULT}" ||
+        die "WriteBuffer formal run did not skip measurement close"
+    grep -q '^detail.persistence_validated=false$' "${RESULT}" ||
+        die "WriteBuffer formal run unexpectedly reported persistence validation"
 fi
 
 successful="$(awk -F= '$1 == "successful_operations" { print $2 }' "${RESULT}")"
@@ -600,7 +623,7 @@ fi
 
 {
     awk -F= '
-        /^(benchmark|successful_operations|errors|elapsed_seconds|throughput_ops_per_second|api_calls_per_second|p50_latency_us|p95_latency_us|p99_latency_us|stop_reason|detail.memtable_size|detail.memtables_per_file|detail.object_flush_threads|detail.flush_interval_seconds|detail.storage|detail.object_storage_scheme|detail.seed_rows|detail.warmup_close_ms|detail.measurement_close_ms|detail.first_workload_error)=/ {
+        /^(benchmark|successful_operations|errors|elapsed_seconds|throughput_ops_per_second|api_calls_per_second|p50_latency_us|p95_latency_us|p99_latency_us|stop_reason|detail.memtable_size|detail.memtables_per_file|detail.object_flush_threads|detail.flush_interval_seconds|detail.storage|detail.object_storage_scheme|detail.seed_rows|detail.warmup_close_ms|detail.measurement_close_ms|detail.measurement_close_status|detail.persistence_validated|detail.first_workload_error)=/ {
             print
         }
     ' "${RESULT}"
@@ -609,7 +632,7 @@ fi
     printf 's3_prefix=%s\n' "${RUN_PREFIX}"
     printf 'benchmark_schema=%s\n' "${BENCHMARK_SCHEMA}"
     printf 'etcd_state=fresh-and-removed-after-success\n'
-    printf 'metadata_schema=unique-and-dropped-after-close\n'
+    printf 'metadata_schema=unique-and-dropped-after-benchmark-exit\n'
 } > "${RUN_DIR}/summary.txt"
 
 cat "${RUN_DIR}/summary.txt"

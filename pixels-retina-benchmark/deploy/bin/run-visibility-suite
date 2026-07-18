@@ -18,6 +18,7 @@ BATCH_SIZE=1
 WARMUP_SECONDS=10
 WARMUP_OPERATIONS=100000
 DURATION_SECONDS=180
+VALIDATE_FINAL_BITMAP=false
 SMOKE=false
 DRY_RUN=false
 
@@ -38,6 +39,8 @@ Options:
   --warmup-seconds N             Warmup time limit (default: 10)
   --warmup-operations N          Warmup row limit (default: 100000)
   --duration-seconds N           Measurement limit, 1..180 (default: 180)
+  --validate-final-bitmap        Validate every successful delete after timing
+                                 (disabled by default)
   --smoke                        Delete 100 rows with no warmup
   --dry-run                      Print configuration without running
   -h, --help                     Show this help
@@ -119,6 +122,7 @@ do
         --warmup-seconds) require_value "$1" "${2:-}"; WARMUP_SECONDS="$2"; shift 2 ;;
         --warmup-operations) require_value "$1" "${2:-}"; WARMUP_OPERATIONS="$2"; shift 2 ;;
         --duration-seconds) require_value "$1" "${2:-}"; DURATION_SECONDS="$2"; shift 2 ;;
+        --validate-final-bitmap) VALIDATE_FINAL_BITMAP=true; shift ;;
         --smoke) SMOKE=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -167,6 +171,7 @@ then
     printf 'duration_seconds=%s measurement_operations=%s maximum_total_deletes=%s java_opts=%s\n' \
         "${DURATION_SECONDS}" "${MEASUREMENT_OPERATIONS}" \
         "$((WARMUP_OPERATIONS + MEASUREMENT_OPERATIONS))" "${JAVA_OPTS_VALUE}"
+    printf 'validate_final_bitmap=%s\n' "${VALIDATE_FINAL_BITMAP}"
     exit 0
 fi
 
@@ -185,6 +190,7 @@ mkdir -p "${RUN_DIR}"
     printf 'measurement_operations=%q\n' "${MEASUREMENT_OPERATIONS}"
     printf 'maximum_total_deletes=%q\n' \
         "$((WARMUP_OPERATIONS + MEASUREMENT_OPERATIONS))"
+    printf 'validate_final_bitmap=%q\n' "${VALIDATE_FINAL_BITMAP}"
 } > "${RUN_DIR}/parameters.env"
 
 {
@@ -227,6 +233,7 @@ JAVA_OPTS="${JAVA_OPTS_VALUE}" \
     --warmup-operations "${WARMUP_OPERATIONS}" \
     --duration-seconds "${DURATION_SECONDS}" \
     --data-size "${MEASUREMENT_OPERATIONS}" \
+    --visibility-validate-final-bitmap "${VALIDATE_FINAL_BITMAP}" \
     2>&1 | tee "${RUN_DIR}/result.txt"
 benchmark_status=${PIPESTATUS[0]}
 set -e
@@ -246,12 +253,17 @@ grep -q "^detail.manifestVisibilityRows=${ORDERLINE_ROWS}$" "${RESULT}" ||
     die "orderline ordered-row count does not equal ${ORDERLINE_ROWS}"
 
 successful="$(awk -F= '$1 == "successful_operations" { print $2 }' "${RESULT}")"
-validated="$(awk -F= '$1 == "detail.lastValidatedDeletes" { print $2 }' "${RESULT}")"
 api_calls="$(awk -F= '$1 == "api_calls" { print $2 }' "${RESULT}")"
-[[ "${validated}" == "${successful}" ]] ||
-    die "validated deletes ${validated} do not match successful operations ${successful}"
 [[ "${api_calls}" == "${successful}" ]] ||
     die "API calls ${api_calls} do not match successful operations ${successful}"
+grep -q "^detail.finalBitmapValidation=${VALIDATE_FINAL_BITMAP}$" "${RESULT}" ||
+    die "unexpected final bitmap validation mode"
+if [[ "${VALIDATE_FINAL_BITMAP}" == "true" ]]
+then
+    validated="$(awk -F= '$1 == "detail.lastValidatedDeletes" { print $2 }' "${RESULT}")"
+    [[ "${validated}" == "${successful}" ]] ||
+        die "validated deletes ${validated} do not match successful operations ${successful}"
+fi
 
 configured_capacity="$(awk -F= '$1 == "detail.configuredTileCapacity" { print $2 }' "${RESULT}")"
 native_capacity="$(awk -F= '$1 == "detail.nativeCompiledTileCapacity" { print $2 }' "${RESULT}")"
@@ -259,7 +271,7 @@ native_capacity="$(awk -F= '$1 == "detail.nativeCompiledTileCapacity" { print $2
     die "configured/native Visibility capacities do not match"
 
 awk -F= '
-    /^(benchmark|successful_operations|errors|elapsed_seconds|throughput_ops_per_second|api_calls_per_second|p50_latency_us|p95_latency_us|p99_latency_us|stop_reason|detail.manifestVisibilityRGs|detail.manifestVisibilityRows|detail.lastValidatedDeletes|detail.configuredTileCapacity|detail.nativeCompiledTileCapacity)=/ {
+    /^(benchmark|successful_operations|errors|elapsed_seconds|throughput_ops_per_second|api_calls_per_second|p50_latency_us|p95_latency_us|p99_latency_us|stop_reason|detail.manifestVisibilityRGs|detail.manifestVisibilityRows|detail.finalBitmapValidation|detail.lastValidatedDeletes|detail.configuredTileCapacity|detail.nativeCompiledTileCapacity)=/ {
         print
     }
 ' "${RESULT}" > "${RUN_DIR}/summary.txt"

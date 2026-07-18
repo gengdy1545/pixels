@@ -251,7 +251,7 @@ LocalIndexService
 bin/run-benchmark index-update-primary \
   --snapshot-dir /data/snapshots/node-a \
   --snapshot-table lineitem \
-  --threads 32 --clients 1 --batch-size 64 \
+  --threads 32 --clients 1 --batch-size 4 \
   --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
 ```
 
@@ -274,9 +274,10 @@ bin/run-index-suite \
   --results-dir /data/retina-benchmark-results
 ```
 
-正式默认参数为 16 threads、1 client、batch 64、warmup 最多 10 万 entries、
-测量最多 100 万 entries 或 20 秒，JVM 为 `-Xms40g -Xmx40g`。100 万 entries
-对应约 15,625 次完整 batch API，避免在计时前预生成 `1e9` 请求。首次运行先加 `--smoke`
+正式默认参数为 16 threads、1 client、batch 4、warmup 最多 10 万 entries、
+测量最多 1000 万 entries 或 60 秒，JVM 为 `-Xms40g -Xmx40g`。1000 万 entries
+对应约 2,500,000 次完整 batch API，贴近生产中个位数 entries 的请求规模，同时避免
+在计时前预生成 `1e9` 请求。首次运行先加 `--smoke`
 做小规模功能验证。结果写入 `index-<RUN_ID>`。每项成功并记录结果后，脚本会
 立即删除该项工作副本，再从 snapshot 恢复下一项；失败项则保留现场。调试时可
 加 `--keep-work-dirs` 保留三个副本。每个副本的 RocksDB 和 SQLite 复制完成后
@@ -296,7 +297,7 @@ bin/run-benchmark index-update-secondary \
   --snapshot-dir /data/snapshots/node-a \
   --snapshot-table lineitem \
   --snapshot-secondary-index SECONDARY_INDEX_ID_OR_KEY_COLUMNS \
-  --threads 32 --clients 1 --batch-size 64 \
+  --threads 32 --clients 1 --batch-size 4 \
   --warmup-seconds 10 --duration-seconds 60 --data-size 1000000
 ```
 
@@ -328,14 +329,17 @@ bin/run-visibility-suite \
 脚本默认使用 16 threads、batch 1、10 秒/10 万行 warmup，并对最多
 2990 万行执行最长 180 秒的正式测量。Warmup 与 Measurement 合计最多覆盖
 `orderline` 全部 3000 万行；先到达 180 秒或行数上限即停止。每个成功删除都在
-计时后用 `queryVisibility` 验证。首次使用可加 `--smoke`。
+默认不执行最终 bitmap 校验，避免已知的 native 并发丢更新中断吞吐测试；仍检查
+API 错误数和 worker/result 计数。诊断正确性时可加
+`--validate-final-bitmap`，在计时后用 `queryVisibility` 验证所有成功删除。
+首次使用可加 `--smoke`。
 
 Visibility 只有 clean baseline：每个 phase 都只选择 readable layout 中生产标记的
 `orderedPaths[0]`，根据 manifest footer 的 `recordNum` 调用
 `addVisibility(fileId, rgId, recordNum, 0, null, false)`。compact、secondary 和
 projection 路径不参与测试，也不读取或恢复任何 Visibility state。
 
-每个 operation 删除一个唯一物理行。若 manifest 包含物理 Index 状态，删除 timestamp 为自动记录的 `snapshotTimestamp+1`；否则为 `1`。warmup 与 measurement 使用不相交的行；每个 phase 都重建同一 clean baseline，并在计时后用 `queryVisibility` 校验所有成功删除。GC 和 Storage GC 在场景内强制关闭。
+每个 operation 删除一个唯一物理行。若 manifest 包含物理 Index 状态，删除 timestamp 为自动记录的 `snapshotTimestamp+1`；否则为 `1`。warmup 与 measurement 使用不相交的行；每个 phase 都重建同一 clean baseline。最终 bitmap 校验默认关闭，可通过 `--validate-final-bitmap` 显式启用。GC 和 Storage GC 在场景内强制关闭。
 
 `--clients` 只影响 runner 分片，不创建外部 client。吞吐并发度由 `--threads` 控制；需要精确 JNI 单次延迟时保持 `--batch-size 1`。
 
@@ -354,9 +358,11 @@ bin/run-write-buffer-suite \
 ```
 
 冒烟通过后去掉 `--smoke` 运行正式测试。默认固定使用 `orderline`、16 threads、
-4 clients/vnodes、batch 64、30 秒/10 万行 warmup，以及 **180 秒**
-measurement（仅时间截止，无实际行数上限）；服务端和客户端 JVM 均使用
-`-Xms40g -Xmx40g`。
+4 clients/vnodes、batch 64、30 秒/10 万行 warmup，以及 **60 秒**
+measurement。框架行数上限设为 1 亿，时间或行数先到即停止，对应
+`stop_reason=duration` 或 `data-size`；该上限同时
+确保两阶段 timestamp 不超过 native
+48-bit 表示。服务端和客户端 JVM 均使用 `-Xms40g -Xmx40g`。
 flush 参数为 10240 行/MemTable、20 个 MemTable/文件、4 个对象存储 flush
 线程、30 秒定时 flush、encoding level 2、2 GiB block。
 
@@ -364,7 +370,7 @@ flush 参数为 10240 行/MemTable、20 个 MemTable/文件、4 个对象存储 
 
 - etcd 使用新的 data dir 和 `initial-cluster-state=new`，成功后删除，失败时保留；
 - Metadata Server 仍连接配置中的现有 MySQL catalog，但 benchmark 使用唯一逻辑
-  schema，正常 close 时自动 drop，不读取生产表状态；
+  schema；正式 benchmark JVM 退出后由脚本通过 Metadata RPC drop，不读取生产表状态；
 - warmup 和 measurement 分别创建独立 Metadata table、SQLite MainIndex 和
   `PixelsWriteBuffer`；
 - S3 目标自动追加唯一 `RUN_ID`，成功后保留供检查，不会与其他测试共用；
@@ -373,8 +379,11 @@ flush 参数为 10240 行/MemTable、20 个 MemTable/文件、4 个对象存储 
 - benchmark client 自动 preload 内置 `libjemalloc.so.2`，避免 JNI 与 glibc
   malloc 混用导致 native 崩溃。
 
-脚本检查 Snapshot profile、benchmark 返回码、`errors=0`、成功行数、S3/flush
-参数和异步 flush 错误；安装 AWS CLI 时还会确认唯一 prefix 下实际产生了对象。
+正式 measurement 结束后不等待 `PixelsWriteBuffer.close()`，而是立即输出接纳吞吐并
+结束 benchmark JVM；结果明确记录 `measurement_close_status=skipped` 和
+`persistence_validated=false`。Warmup 仍完整 close，脚本仍检查 Snapshot profile、
+benchmark 返回码、`errors=0`、成功行数、S3/flush 参数和计时期间的异步 flush 错误；
+安装 AWS CLI 时还会确认唯一 prefix 下实际产生了对象。
 可使用 `--dry-run` 查看最终参数，或通过端口参数避开其他服务。不要把
 `--s3-root` 指向 Snapshot 的生产数据 prefix。
 
@@ -405,7 +414,7 @@ PixelsWriteBuffer.addRow
 - `--writebuffer-seed-buffers`：默认 `true`，每个 buffer 在计时外先执行一次真实 addRow。
 - `--writebuffer-schema`、`--writebuffer-host-name`、`--writebuffer-drop-schema`。
 
-一个 client 对应一个真实 vnode/`PixelsWriteBuffer`。同一 buffer 的热路径受 `rowLock` 串行化；增加 threads 会包含锁竞争，增加 clients 才会创建更多 buffer。`throughput_ops_per_second` 是 addRow 接纳吞吐；异步 flush 的最终 drain/persist 在计时外，并通过 close 指标单列。
+一个 client 对应一个真实 vnode/`PixelsWriteBuffer`。同一 buffer 的热路径受 `rowLock` 串行化；增加 threads 会包含锁竞争，增加 clients 才会创建更多 buffer。`throughput_ops_per_second` 只表示 addRow 接纳吞吐；正式 measurement 不执行最终 drain/persist，因此不能解释为持久化吞吐。
 
 所有输出 URI/prefix 都必须专属于本轮 benchmark。程序会拒绝与 manifest 中生产 ordered/compact 路径相同或互为父子的目标，但该字符串检查不能替代账号、bucket、文件系统和权限隔离。
 

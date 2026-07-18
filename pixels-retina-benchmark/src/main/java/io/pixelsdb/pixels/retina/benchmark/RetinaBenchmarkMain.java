@@ -10,6 +10,7 @@
  */
 package io.pixelsdb.pixels.retina.benchmark;
 
+import io.pixelsdb.pixels.common.metadata.MetadataService;
 import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkConfig;
 import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkResult;
 import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkRunner;
@@ -61,6 +62,22 @@ public final class RetinaBenchmarkMain
             return;
         }
         BenchmarkConfig config = BenchmarkConfig.parse(commandArgs);
+        if ("metadata-drop-schema".equals(command))
+        {
+            String schema = config.require("schema");
+            MetadataService metadata = MetadataService.Instance();
+            boolean existed = metadata.existSchema(schema);
+            if (existed)
+            {
+                metadata.dropSchema(schema);
+            }
+            System.out.println("schema=" + schema);
+            System.out.println("existed=" + existed);
+            System.out.println("status=dropped");
+            System.out.flush();
+            Runtime.getRuntime().halt(0);
+            return;
+        }
         if ("snapshot-export".equals(command))
         {
             SnapshotExporter.run(config);
@@ -115,6 +132,12 @@ public final class RetinaBenchmarkMain
 
         BenchmarkResult result = BenchmarkRunner.run(scenario, config);
         ResultPrinter.print(result, System.out);
+        System.out.flush();
+        if ("write-buffer-add".equals(command)
+                && config.getBoolean("writebuffer-skip-measurement-close", false))
+        {
+            Runtime.getRuntime().halt(0);
+        }
     }
 
     private static void printUsage()
