@@ -6,6 +6,7 @@ umask 077
 
 SNAPSHOT_DIR=""
 SNAPSHOT_TABLE=""
+INDEX_STATE_DIR=""
 RESULTS_ROOT="${RESULTS_ROOT:-${ROOT_DIR}/results}"
 WORK_ROOT="${INDEX_WORK_ROOT:-/var/tmp/pixels-retina-benchmark/index-suite}"
 SOURCE_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}"
@@ -36,11 +37,12 @@ and Delete. Every operation restores RocksDB and SQLite into a distinct,
 previously unused work directory.
 
 Index benchmarks do not require Metadata Server, etcd, or MySQL to be running.
-They only need a filled-in pixels.properties (no REPLACE_WITH placeholders).
+Only local Index properties are used; unrelated service placeholders are allowed.
 
 Options:
   --snapshot-dir DIR             Snapshot v2 directory (required)
   --snapshot-table TABLE         Snapshot table name (required)
+  --index-state-dir DIR          Prepared RocksDB/SQLite state root (optional)
   --config FILE                  pixels.properties to use (default: runtime/etc)
   --results-dir DIR              Results root (default: runtime/results)
   --work-dir-root DIR            Disposable Index work root (default: /var/tmp/...)
@@ -89,16 +91,6 @@ validate_pixels_config()
 {
     local config_file="$1"
     [[ -f "${config_file}" ]] || die "pixels.properties not found: ${config_file}"
-    if grep -Eq '^[[:space:]]*[A-Za-z0-9_.-]+=.*REPLACE_WITH_' "${config_file}"
-    then
-        die "pixels.properties still contains REPLACE_WITH placeholders: ${config_file}"
-    fi
-    local metadata_port
-    metadata_port="$(awk -F= '$1 == "metadata.server.port" { print $2; exit }' "${config_file}")"
-    [[ -n "${metadata_port}" ]] ||
-        die "pixels.properties is missing metadata.server.port"
-    [[ "${metadata_port}" =~ ^[0-9]+$ ]] ||
-        die "metadata.server.port must be numeric in ${config_file}, got: ${metadata_port}"
 }
 
 while [[ $# -gt 0 ]]
@@ -106,6 +98,7 @@ do
     case "$1" in
         --snapshot-dir) require_value "$1" "${2:-}"; SNAPSHOT_DIR="$2"; shift 2 ;;
         --snapshot-table) require_value "$1" "${2:-}"; SNAPSHOT_TABLE="$2"; shift 2 ;;
+        --index-state-dir) require_value "$1" "${2:-}"; INDEX_STATE_DIR="$2"; shift 2 ;;
         --config) require_value "$1" "${2:-}"; SOURCE_CONFIG="$2"; shift 2 ;;
         --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
         --work-dir-root) require_value "$1" "${2:-}"; WORK_ROOT="$2"; shift 2 ;;
@@ -129,10 +122,20 @@ done
 [[ -n "${SNAPSHOT_TABLE}" ]] || die "--snapshot-table is required"
 [[ -f "${SNAPSHOT_DIR}/snapshot.json" ]] ||
     die "snapshot manifest not found: ${SNAPSHOT_DIR}/snapshot.json"
-[[ -d "${SNAPSHOT_DIR}/state/index/rocksdb" ]] ||
-    die "snapshot RocksDB state not found"
-[[ -d "${SNAPSHOT_DIR}/state/index/sqlite" ]] ||
-    die "snapshot SQLite state not found"
+if [[ -n "${INDEX_STATE_DIR}" ]]
+then
+    [[ -d "${INDEX_STATE_DIR}/rocksdb" ]] ||
+        die "prepared RocksDB state not found: ${INDEX_STATE_DIR}/rocksdb"
+    [[ -d "${INDEX_STATE_DIR}/sqlite" ]] ||
+        die "prepared SQLite state not found: ${INDEX_STATE_DIR}/sqlite"
+    INDEX_SOURCE_DIR="${INDEX_STATE_DIR}"
+else
+    [[ -d "${SNAPSHOT_DIR}/state/index/rocksdb" ]] ||
+        die "snapshot RocksDB state not found"
+    [[ -d "${SNAPSHOT_DIR}/state/index/sqlite" ]] ||
+        die "snapshot SQLite state not found"
+    INDEX_SOURCE_DIR="${SNAPSHOT_DIR}/state/index"
+fi
 [[ -x "${ROOT_DIR}/bin/run-benchmark" ]] ||
     die "run-benchmark not found under ${ROOT_DIR}/bin"
 validate_pixels_config "${SOURCE_CONFIG}"
@@ -169,8 +172,8 @@ RUN_WORK_DIR="${WORK_ROOT%/}/index-${RUN_ID}"
 if [[ "${DRY_RUN}" == "true" ]]
 then
     log "dry run"
-    printf 'snapshot_dir=%s\nsnapshot_table=%s\nconfig=%s\nresults_dir=%s\nwork_dir=%s\n' \
-        "${SNAPSHOT_DIR}" "${SNAPSHOT_TABLE}" "${SOURCE_CONFIG}" "${RUN_DIR}" "${RUN_WORK_DIR}"
+    printf 'snapshot_dir=%s\nsnapshot_table=%s\nindex_state_dir=%s\nconfig=%s\nresults_dir=%s\nwork_dir=%s\n' \
+        "${SNAPSHOT_DIR}" "${SNAPSHOT_TABLE}" "${INDEX_STATE_DIR}" "${SOURCE_CONFIG}" "${RUN_DIR}" "${RUN_WORK_DIR}"
     printf 'threads=%s clients=%s batch_size=%s warmup_seconds=%s warmup_operations=%s\n' \
         "${THREADS}" "${CLIENTS}" "${BATCH_SIZE}" "${WARMUP_SECONDS}" "${WARMUP_OPERATIONS}"
     printf 'duration_seconds=%s data_size=%s main_index_state=%s java_opts=%s keep_work_dirs=%s\n' \
@@ -181,7 +184,7 @@ fi
 
 mkdir -p "${RUN_DIR}" "${RUN_WORK_DIR}"
 
-snapshot_size_kib="$(du -sk "${SNAPSHOT_DIR}/state/index" | awk '{ print $1 }')"
+snapshot_size_kib="$(du -sk "${INDEX_SOURCE_DIR}" | awk '{ print $1 }')"
 available_kib="$(df -Pk "${RUN_WORK_DIR}" | awk 'NR == 2 { print $4 }')"
 if [[ "${KEEP_WORK_DIRS}" == "true" ]]
 then
@@ -197,6 +200,7 @@ fi
 {
     printf 'snapshot_dir=%q\n' "${SNAPSHOT_DIR}"
     printf 'snapshot_table=%q\n' "${SNAPSHOT_TABLE}"
+    printf 'index_state_dir=%q\n' "${INDEX_STATE_DIR}"
     printf 'config=%q\n' "${SOURCE_CONFIG}"
     printf 'work_dir=%q\n' "${RUN_WORK_DIR}"
     printf 'java_opts=%q\n' "${JAVA_OPTS_VALUE}"
@@ -288,6 +292,10 @@ run_operation()
         --data-size "${DATA_SIZE}"
         --main-index-state "${MAIN_INDEX_STATE}"
     )
+    if [[ -n "${INDEX_STATE_DIR}" ]]
+    then
+        args+=(--index-state-dir "${INDEX_STATE_DIR}")
+    fi
 
     set +e
     PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${SOURCE_CONFIG}" \

@@ -17,6 +17,8 @@ import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkRunner;
 import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkScenario;
 import io.pixelsdb.pixels.retina.benchmark.common.ResultPrinter;
 import io.pixelsdb.pixels.retina.benchmark.index.IndexOperation;
+import io.pixelsdb.pixels.retina.benchmark.index.IndexStateBuilder;
+import io.pixelsdb.pixels.retina.benchmark.index.HyBenchIndexStateBuilder;
 import io.pixelsdb.pixels.retina.benchmark.index.PhysicalIndexBenchmarkScenario;
 import io.pixelsdb.pixels.retina.benchmark.server.MetadataOnlyMain;
 import io.pixelsdb.pixels.retina.benchmark.server.TransactionOnlyMain;
@@ -86,6 +88,16 @@ public final class RetinaBenchmarkMain
         if ("snapshot-validate".equals(command))
         {
             SnapshotValidator.run(config);
+            return;
+        }
+        if ("index-state-build".equals(command))
+        {
+            IndexStateBuilder.run(config);
+            return;
+        }
+        if ("hybench-index-state-build".equals(command))
+        {
+            HyBenchIndexStateBuilder.run(config);
             return;
         }
 
@@ -162,6 +174,8 @@ public final class RetinaBenchmarkMain
         System.out.println("Snapshot commands:");
         System.out.println("  snapshot-export     export v2 topology and optional quiesced physical state");
         System.out.println("  snapshot-validate   verify v2 semantics, profiles, and SHA-256 artifacts");
+        System.out.println("  index-state-build   build RocksDB + SQLite Index state without Pixels payload files");
+        System.out.println("  hybench-index-state-build   build real HyBench primary Index state without Pixels payload files");
         System.out.println();
         System.out.println("Minimal real service commands:");
         System.out.println("  transaction-server  production TransServer only (requires etcd)");
@@ -179,6 +193,7 @@ public final class RetinaBenchmarkMain
         System.out.println("  --rpc-deadline-ms N     per-call Begin/Commit gRPC deadline (default: 30000)");
         System.out.println("  --snapshot-dir DIR      restore Index/Visibility/WriteBuffer input from a validated snapshot");
         System.out.println("  --snapshot-table NAME   target table");
+        System.out.println("  --index-state-dir DIR   prepared Index state input/output (rocksdb/ and sqlite/ below DIR)");
         System.out.println("  --snapshot-secondary-index ID|NAME  target secondary index for secondary commands");
         System.out.println("  --snapshot-require LIST validation profiles: index, visibility, write-buffer");
         System.out.println();

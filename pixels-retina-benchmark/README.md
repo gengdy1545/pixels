@@ -9,6 +9,8 @@
 - Visibility：`visibility`
 - WriteBuffer：`write-buffer-add`
 - Snapshot v2：`snapshot-export`、`snapshot-validate`
+- Index state：`index-state-build`
+- HyBench Index-only：`hybench-index-state-build`
 - 最小服务：`transaction-server`、`metadata-server`
 
 快照导出、一致性与恢复规则见 [SNAPSHOT.md](SNAPSHOT.md)。
@@ -19,10 +21,12 @@
 
 Index 和 Visibility 不连接 MySQL、etcd 或 gRPC 服务：
 
-- 六个 Index 命令只打开 Snapshot v2 中 RocksDB/SQLite 的一次性工作副本；
+- 六个 Index 命令只打开 Snapshot v2 或 `--index-state-dir` 中 RocksDB/SQLite 的一次性工作副本；
 - Visibility 只读取 manifest footer 拓扑，以 clean baseline 调用本地 JNI；
 - 两者都必须提供 `--snapshot-dir` 和 `--snapshot-table`；
-- Index 还要求快照包含停写后复制的完整 `state/index`。
+- Snapshot 仍需包含停写后复制的完整 `state/index`，因为它同时提供 schema、Index
+  descriptor、文件拓扑和 semanticConfig；`--index-state-dir` 只替换测试实际打开的
+  RocksDB/SQLite 数据。
 
 ### 1.2 Transaction
 
@@ -228,7 +232,39 @@ Begin-Commit 的一个 logical operation 是一个完成的事务生命周期；
 
 ## 6. Index 六个命令
 
-Index 必须使用 Snapshot v2 的完整 RocksDB 与 SQLite 状态，但不需要任何外部服务。每次 JVM 都先把 `state/index` 复制到临时目录或 `--snapshot-work-dir` 指定的空目录，再打开真实 `LocalIndexService`：
+Index state 可以先独立构建，再用于六个 Index 测试命令。构建阶段只写 RocksDB
+SinglePointIndex 和 SQLite MainIndex，不创建 `.pxl` payload 文件；构建的
+`RowLocation` 仅用于 Index 组件测试，不能用于读取 Pixels 数据文件。
+
+```bash
+bin/run-benchmark index-state-build \
+  --snapshot-dir /data/snapshots/node-a \
+  --snapshot-table customer \
+  --index-state-dir /data/retina-benchmark-index/sf1/customer \
+  --index-entry-count 300000 \
+  --index-build-batch-size 4096
+```
+
+`--index-entry-count` 控制预构建的逻辑 row 数；sf1、sf10 应使用不同的输出目录，
+不能在 sf100 的物理 Index 副本上追加。构建完成后，测试命令通过同一个
+`--index-state-dir` 读取 `rocksdb/` 和 `sqlite/`，并复制到独立工作目录后再计时：
+
+```bash
+bin/run-benchmark index-update-primary \
+  --snapshot-dir /data/snapshots/node-a \
+  --snapshot-table customer \
+  --index-state-dir /data/retina-benchmark-index/sf1/customer \
+  --threads 16 --batch-size 4 --warmup-seconds 10 \
+  --duration-seconds 60 --data-size 1000000
+```
+
+Index state builder 和测试都在首次打开 RocksDB/SQLite singleton 之前应用 Snapshot
+manifest 的 `semanticConfig`。`index-state-build` 需要 Snapshot manifest 提供
+table/index descriptor；它不连接 Metadata Server，也不执行 CLI `LOAD`。
+
+Index 测试必须使用 Snapshot v2 的完整 RocksDB 与 SQLite 状态，或使用上面生成的
+独立 Index state，但不需要任何外部服务。每次 JVM 都先把状态复制到临时目录或
+`--snapshot-work-dir` 指定的空目录，再打开真实 `LocalIndexService`：
 
 ```text
 LocalIndexService
@@ -270,9 +306,14 @@ export PIXELS_CONFIG="$PWD/etc/pixels.properties"
 bin/run-index-suite \
   --snapshot-dir /data/snapshots/node-a \
   --snapshot-table customer \
+  --index-state-dir /data/retina-benchmark-index/sf1/customer \
   --work-dir-root /data/retina-benchmark-work/index \
   --results-dir /data/retina-benchmark-results
 ```
+
+如果使用 `run-index-formal-suite` 批量测试多个表，传入
+`--index-state-root /data/retina-benchmark-index/sf1`，脚本会为每个表读取其
+`TABLE/rocksdb` 和 `TABLE/sqlite` 子目录。
 
 正式默认参数为 16 threads、1 client、batch 4、warmup 最多 10 万 entries、
 测量最多 1000 万 entries 或 60 秒，JVM 为 `-Xms40g -Xmx40g`。1000 万 entries
@@ -306,6 +347,64 @@ bin/run-benchmark index-update-secondary \
 每个计时 batch 只包含同一 bucket 的 entries，并使用真实 `IndexUtils.getBucketIdFromByteBuffer` 分桶。Put 在计时前确认 key 不存在；Update/Delete 用真实 put 在计时外准备旧版本。Secondary fixture 还会准备可由 MainIndex 解析的真实 primary row。warmup 与 measurement 使用不相交的 key、rowId 和 timestamp 域；结束时抽查 lookup 结果。
 
 `--clients` 不创建多个 IndexService；Index 并发度由 `--threads` 控制。原始快照只读，但工作副本会增长 MVCC 版本和 MainIndex row ranges。
+
+### 6.1 HyBench 三种规模的 Index-only 实验
+
+HyBench Index-only 使用 8 张业务表：`customer`、`company`、
+`savingAccount`、`checkingAccount`、`transfer`、`checking`、`loanApps` 和
+`loanTrans`。`blocked_checking.csv`、`blocked_transfer.csv` 是异常负载辅助文件，
+不作为表，也不生成 secondary Index。每张表只建立真实第一列 primary key 的
+RocksDB SinglePointIndex 和 SQLite MainIndex。
+
+先准备 HyBench 的真实 CSV 数据，目录约定如下；不同 scale 必须使用对应目录，
+不要把 sf100 的 Index state 复制给 sf1/sf10：
+
+```text
+HYBENCH_ROOT/sf1/Data_1x/
+HYBENCH_ROOT/sf10/Data_10x/
+HYBENCH_ROOT/sf100/Data_100x/
+```
+
+通过 Index-only LOAD 生成三份可恢复的 Index package：
+
+```bash
+bin/build-hybench-index-suite \
+  --snapshot-dir /data/retina-benchmark/snapshot/node-a \
+  --hybench-root /data/retina-benchmark/hybench \
+  --output-root /data/retina-benchmark/index-state/hybench \
+  --rows-per-file 1000000 \
+  --config "$PIXELS_CONFIG"
+```
+
+`--rows-per-file` 是 Index-only physical `RowLocation` 的显式 LOAD 布局参数，
+不是隐藏的 Pixels 默认值；`pixel.stride` 和其他 Index 语义配置则从 source
+Snapshot manifest 复制。因为测试不会读取 payload，文件 URI 可以是
+`synthetic://`，而且不创建 `.pxl` 文件。这个布局只保证 Index 的 file/row-group
+定位结构可恢复；Index 吞吐结果不应解释为 payload writer 吞吐。
+
+打包时只把 Index state 和 manifest 放入归档，不包含 CSV、构建日志或其他 Retina
+测试：
+
+```bash
+bin/package-hybench-index-suite \
+  --index-root /data/retina-benchmark/index-state/hybench \
+  --output /data/retina-benchmark/packages/hybench-index-state.tar.gz
+```
+
+解压后对三种 scale 使用完全相同的 Index workload；正式测试固定测量 60 秒，
+并默认对 Update/Delete 使用 `warm-cache` MainIndex state：
+
+```bash
+bin/run-hybench-index-formal-suite \
+  --snapshot-root /data/retina-benchmark/index-state/hybench \
+  --results-dir /data/retina-benchmark/results/hybench-index \
+  --work-dir-root /data/retina-benchmark/work/hybench-index \
+  --config "$PIXELS_CONFIG"
+```
+
+首次运行应加 `--smoke`；需要单独验证某个 scale 时加
+`--scale sf1`、`--scale sf10` 或 `--scale sf100`。该入口只执行 Index，不启动
+Metadata、Transaction、Retina、MySQL 或 etcd。
 
 ## 7. Visibility
 

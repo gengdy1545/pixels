@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="${RETINA_BENCHMARK_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+umask 077
+
+INDEX_ROOT=""
+OUTPUT_ARCHIVE=""
+ONLY_SCALE=""
+
+usage()
+{
+    cat <<'EOF'
+Usage: bin/package-hybench-index-suite --index-root DIR --output FILE [options]
+
+Packages only the prepared HyBench Index profiles. The archive contains each
+selected sf*/snapshot.json and sf*/state/index/{rocksdb,sqlite}; source CSVs,
+build logs, and all non-Index benchmark suites are excluded.
+
+Options:
+  --index-root DIR               Parent containing sf1/, sf10/, sf100/
+  --output FILE                  New .tar.gz archive (must not already exist)
+  --scale NAME                   Package only sf1, sf10, or sf100
+  -h, --help                     Show this help
+EOF
+}
+
+die()
+{
+    printf '[hybench-index-package] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+require_value()
+{
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "${value}" ]] || die "${option} requires a value"
+}
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        --index-root) require_value "$1" "${2:-}"; INDEX_ROOT="$2"; shift 2 ;;
+        --output) require_value "$1" "${2:-}"; OUTPUT_ARCHIVE="$2"; shift 2 ;;
+        --scale) require_value "$1" "${2:-}"; ONLY_SCALE="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+[[ -n "${INDEX_ROOT}" ]] || die "--index-root is required"
+[[ -n "${OUTPUT_ARCHIVE}" ]] || die "--output is required"
+[[ -d "${INDEX_ROOT}" ]] || die "Index root not found: ${INDEX_ROOT}"
+[[ ! -e "${OUTPUT_ARCHIVE}" ]] || die "refusing to overwrite archive: ${OUTPUT_ARCHIVE}"
+
+if [[ -n "${ONLY_SCALE}" ]]
+then
+    case "${ONLY_SCALE}" in
+        sf1|sf10|sf100) SCALES=("${ONLY_SCALE}") ;;
+        *) die "scale must be sf1, sf10, or sf100: ${ONLY_SCALE}" ;;
+    esac
+else
+    SCALES=(sf1 sf10 sf100)
+fi
+
+for scale in "${SCALES[@]}"
+do
+    profile="${INDEX_ROOT%/}/${scale}"
+    [[ -f "${profile}/snapshot.json" ]] || die "missing ${profile}/snapshot.json"
+    [[ -d "${profile}/state/index/rocksdb" ]] || die "missing ${profile}/state/index/rocksdb"
+    [[ -d "${profile}/state/index/sqlite" ]] || die "missing ${profile}/state/index/sqlite"
+done
+
+mkdir -p "$(dirname "${OUTPUT_ARCHIVE}")"
+tar -czf "${OUTPUT_ARCHIVE}" -C "${INDEX_ROOT}" "${SCALES[@]}"
+printf 'archive=%s\n' "${OUTPUT_ARCHIVE}"
+printf 'scales=%s\n' "${SCALES[*]}"
+printf 'contents=index-only\n'

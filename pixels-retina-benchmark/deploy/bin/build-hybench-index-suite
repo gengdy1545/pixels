@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="${RETINA_BENCHMARK_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+umask 077
+
+SNAPSHOT_DIR=""
+HYBENCH_ROOT=""
+OUTPUT_ROOT=""
+SOURCE_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}"
+JAVA_OPTS_VALUE="${HYBENCH_BUILD_JAVA_OPTS:--Xms8g -Xmx8g}"
+ROWS_PER_FILE=""
+BATCH_SIZE=4096
+MAX_ROWS=0
+ONLY_SCALE=""
+
+usage()
+{
+    cat <<'EOF'
+Usage: bin/build-hybench-index-suite --snapshot-dir DIR --hybench-root DIR \
+       --output-root DIR --rows-per-file N [options]
+
+Builds independent HyBench Index-only packages for sf1, sf10, and sf100.
+The source Snapshot supplies semantic Pixels configuration only. The builder
+reads the real HyBench primary-key fields and writes RocksDB + SQLite state;
+it does not start Pixels services or create .pxl payload files.
+
+Expected data layout:
+  HYBENCH_ROOT/sf1/Data_1x
+  HYBENCH_ROOT/sf10/Data_10x
+  HYBENCH_ROOT/sf100/Data_100x
+
+Options:
+  --snapshot-dir DIR             Source Snapshot v2 (semantic config only)
+  --hybench-root DIR             Parent directory containing sf* data
+  --output-root DIR              Output parent; writes DIR/sf*/
+  --rows-per-file N              Synthetic LOAD file boundary (required)
+  --config FILE                  pixels.properties (default: runtime/etc)
+  --java-opts TEXT               Builder JVM options (default: -Xms8g -Xmx8g)
+  --index-build-batch-size N     Entries per Index flush batch (default: 4096)
+  --max-rows-per-table N         Limit rows per table; 0 means all (default: 0)
+  --scale NAME                   Build only sf1, sf10, or sf100
+  -h, --help                     Show this help
+EOF
+}
+
+log()
+{
+    printf '[hybench-index-build] %s\n' "$*"
+}
+
+die()
+{
+    printf '[hybench-index-build] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+require_value()
+{
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "${value}" ]] || die "${option} requires a value"
+}
+
+positive_integer()
+{
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+scale_multiplier()
+{
+    case "$1" in
+        sf1) printf '1' ;;
+        sf10) printf '10' ;;
+        sf100) printf '100' ;;
+        *) return 1 ;;
+    esac
+}
+
+data_dir_for_scale()
+{
+    local scale="$1"
+    local multiplier
+    multiplier="$(scale_multiplier "${scale}")" || return 1
+    local conventional="${HYBENCH_ROOT%/}/${scale}/Data_${multiplier}x"
+    if [[ -d "${conventional}" ]]
+    then
+        printf '%s' "${conventional}"
+        return 0
+    fi
+    local nested="${HYBENCH_ROOT%/}/${scale}"
+    if [[ -d "${nested}" ]]
+    then
+        printf '%s' "${nested}"
+        return 0
+    fi
+    return 1
+}
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        --snapshot-dir) require_value "$1" "${2:-}"; SNAPSHOT_DIR="$2"; shift 2 ;;
+        --hybench-root) require_value "$1" "${2:-}"; HYBENCH_ROOT="$2"; shift 2 ;;
+        --output-root) require_value "$1" "${2:-}"; OUTPUT_ROOT="$2"; shift 2 ;;
+        --rows-per-file) require_value "$1" "${2:-}"; ROWS_PER_FILE="$2"; shift 2 ;;
+        --config) require_value "$1" "${2:-}"; SOURCE_CONFIG="$2"; shift 2 ;;
+        --java-opts) require_value "$1" "${2:-}"; JAVA_OPTS_VALUE="$2"; shift 2 ;;
+        --index-build-batch-size) require_value "$1" "${2:-}"; BATCH_SIZE="$2"; shift 2 ;;
+        --max-rows-per-table) require_value "$1" "${2:-}"; MAX_ROWS="$2"; shift 2 ;;
+        --scale) require_value "$1" "${2:-}"; ONLY_SCALE="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+[[ -n "${SNAPSHOT_DIR}" ]] || die "--snapshot-dir is required"
+[[ -n "${HYBENCH_ROOT}" ]] || die "--hybench-root is required"
+[[ -n "${OUTPUT_ROOT}" ]] || die "--output-root is required"
+[[ -n "${ROWS_PER_FILE}" ]] || die "--rows-per-file is required; do not rely on a hidden file-layout default"
+[[ -d "${SNAPSHOT_DIR}" ]] || die "source Snapshot not found: ${SNAPSHOT_DIR}"
+[[ -d "${HYBENCH_ROOT}" ]] || die "HyBench root not found: ${HYBENCH_ROOT}"
+[[ -x "${ROOT_DIR}/bin/run-benchmark" ]] || die "run-benchmark not found under ${ROOT_DIR}/bin"
+positive_integer "${ROWS_PER_FILE}" || die "rows-per-file must be positive: ${ROWS_PER_FILE}"
+positive_integer "${BATCH_SIZE}" || die "index-build-batch-size must be positive: ${BATCH_SIZE}"
+[[ "${MAX_ROWS}" =~ ^[0-9]+$ ]] || die "max-rows-per-table must be non-negative: ${MAX_ROWS}"
+
+if [[ -n "${ONLY_SCALE}" ]]
+then
+    scale_multiplier "${ONLY_SCALE}" >/dev/null ||
+        die "scale must be sf1, sf10, or sf100: ${ONLY_SCALE}"
+    SCALES=("${ONLY_SCALE}")
+else
+    SCALES=(sf1 sf10 sf100)
+fi
+
+mkdir -p "${OUTPUT_ROOT}"
+for scale in "${SCALES[@]}"
+do
+    data_dir="$(data_dir_for_scale "${scale}")" ||
+        die "could not find ${scale} data under ${HYBENCH_ROOT}"
+    output_dir="${OUTPUT_ROOT%/}/${scale}"
+    [[ ! -e "${output_dir}" || -z "$(find "${output_dir}" -mindepth 1 -print -quit 2>/dev/null)" ]] ||
+        die "output directory is not empty: ${output_dir}"
+    log "building ${scale}: data=${data_dir}, output=${output_dir}"
+    set +e
+    PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${SOURCE_CONFIG}" \
+    JAVA_OPTS="${JAVA_OPTS_VALUE}" \
+        "${ROOT_DIR}/bin/run-benchmark" hybench-index-state-build \
+        --snapshot-dir "${SNAPSHOT_DIR}" \
+        --hybench-data-dir "${data_dir}" \
+        --output-dir "${output_dir}" \
+        --hybench-scale "${scale}" \
+        --hybench-rows-per-file "${ROWS_PER_FILE}" \
+        --index-build-batch-size "${BATCH_SIZE}" \
+        --hybench-max-rows-per-table "${MAX_ROWS}" \
+        2>&1 | tee "${OUTPUT_ROOT%/}/${scale}.build.log"
+    build_status=${PIPESTATUS[0]}
+    set -e
+    [[ "${build_status}" -eq 0 ]] || die "${scale} Index state build failed"
+done
+
+log "all requested HyBench Index packages completed under ${OUTPUT_ROOT}"

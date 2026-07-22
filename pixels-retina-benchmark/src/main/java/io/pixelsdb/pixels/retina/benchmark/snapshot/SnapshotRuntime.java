@@ -41,7 +41,7 @@ public final class SnapshotRuntime implements AutoCloseable
             "index.rocksdb.target.file.size.multiplier", "index.rocksdb.prefix.length",
             "index.rocksdb.max.subcompactions", "index.rocksdb.compression.type",
             "index.rocksdb.bottommost.compression.type", "index.rocksdb.compaction.style",
-            "index.rocksdb.stats.enabled"));
+            "index.rocksdb.stats.enabled", "retina.upsert-mode.enabled"));
     private static final Set<String> VISIBILITY_CONFIG = new HashSet<>(Arrays.asList(
             "enabled.storage.schemes", "node.virtual.num",
             "retina.tile.visibility.capacity", "retina.checkpoint.threads"));
@@ -68,18 +68,31 @@ public final class SnapshotRuntime implements AutoCloseable
     private final SnapshotManifest manifest;
     private final Path workDirectory;
     private final boolean ownsWorkDirectory;
+    /** Optional prepared Index state supplied by an IndexStateBuilder. */
+    private final Path preparedIndexStateDirectory;
 
     private SnapshotRuntime(Path snapshotDirectory, SnapshotManifest manifest,
-                            Path workDirectory, boolean ownsWorkDirectory)
+                            Path workDirectory, boolean ownsWorkDirectory,
+                            Path preparedIndexStateDirectory)
     {
         this.snapshotDirectory = snapshotDirectory;
         this.manifest = manifest;
         this.workDirectory = workDirectory;
         this.ownsWorkDirectory = ownsWorkDirectory;
+        this.preparedIndexStateDirectory = preparedIndexStateDirectory;
     }
 
     public static SnapshotRuntime open(BenchmarkConfig config) throws IOException
     {
+        /* Index/Visibility snapshot benchmarks do not start MetadataServer.
+         * A production Index utility may nevertheless initialize the unused
+         * MetadataService singleton, so deployment templates must not force
+         * unrelated service endpoints to be configured for local tests. */
+        ConfigFactory pixels = ConfigFactory.Instance();
+        pixels.addProperty("metadata.server.host",
+                config.get("index-only-metadata-host", "127.0.0.1"));
+        pixels.addProperty("metadata.server.port",
+                config.get("index-only-metadata-port", "18888"));
         Path snapshot = Paths.get(config.require("snapshot-dir")).toAbsolutePath().normalize();
         SnapshotManifest manifest = SnapshotIO.readManifest(snapshot);
         String configuredWork = config.get("snapshot-work-dir", null);
@@ -105,7 +118,18 @@ public final class SnapshotRuntime implements AutoCloseable
             throw new IOException("snapshot and work directories must not contain each other: "
                     + snapshot + " / " + work);
         }
-        return new SnapshotRuntime(snapshot, manifest, work, owns);
+        Path prepared = null;
+        String configuredIndexState = config.get("index-state-dir", null);
+        if (configuredIndexState != null && !configuredIndexState.trim().isEmpty())
+        {
+            prepared = Paths.get(configuredIndexState).toAbsolutePath().normalize();
+            if (prepared.startsWith(work) || work.startsWith(prepared))
+            {
+                throw new IOException("--index-state-dir and --snapshot-work-dir must not contain each other: "
+                        + prepared + " / " + work);
+            }
+        }
+        return new SnapshotRuntime(snapshot, manifest, work, owns, prepared);
     }
 
     public SnapshotManifest manifest()
@@ -148,10 +172,16 @@ public final class SnapshotRuntime implements AutoCloseable
         {
             throw new IOException("physical snapshot index benchmark currently requires RocksDB, found " + scheme);
         }
-        Path sourceRocks = snapshotDirectory.resolve("state/index/rocksdb");
-        Path sourceSqlite = snapshotDirectory.resolve("state/index/sqlite");
+        Path sourceIndexRoot = preparedIndexStateDirectory == null
+                ? snapshotDirectory.resolve("state/index") : preparedIndexStateDirectory;
+        Path sourceRocks = sourceIndexRoot.resolve("rocksdb");
+        Path sourceSqlite = sourceIndexRoot.resolve("sqlite");
         Path targetRocks = workDirectory.resolve("index/rocksdb");
         Path targetSqlite = workDirectory.resolve("index/sqlite");
+        if (!Files.isDirectory(sourceRocks) || !Files.isDirectory(sourceSqlite))
+        {
+            throw new IOException("Index state must contain rocksdb/ and sqlite/: " + sourceIndexRoot);
+        }
         SnapshotIO.copyDirectory(sourceRocks, targetRocks);
         SnapshotIO.copyDirectory(sourceSqlite, targetSqlite);
         Path tableDb = targetSqlite.resolve(table.tableId + ".main.index.db");
@@ -161,16 +191,52 @@ public final class SnapshotRuntime implements AutoCloseable
         }
         System.out.println("snapshot_index_copy_completed=" + workDirectory.resolve("index"));
 
+        Path stats = workDirectory.resolve("index/rocksdb-stats");
+        configureIndexState(targetRocks, targetSqlite, stats, scheme);
+    }
+
+    /**
+     * Prepare an empty, writable Index state directory for the standalone
+     * IndexStateBuilder. The directory is deliberately not owned by this
+     * runtime and therefore survives {@link #close()}.
+     */
+    public void prepareEmptyIndexState(Path indexStateDirectory) throws IOException
+    {
+        Path root = indexStateDirectory.toAbsolutePath().normalize();
+        if (root.startsWith(snapshotDirectory) || snapshotDirectory.startsWith(root))
+        {
+            throw new IOException("Index state output and snapshot directories must not contain each other: "
+                    + root + " / " + snapshotDirectory);
+        }
+        if (Files.exists(root) && !isEmptyDirectory(root))
+        {
+            throw new IOException("Index state output directory must be empty: " + root);
+        }
+        Path rocks = root.resolve("rocksdb");
+        Path sqlite = root.resolve("sqlite");
+        Path stats = root.resolve("rocksdb-stats");
+        configureIndexState(rocks, sqlite, stats, "rocksdb");
+    }
+
+    private void configureIndexState(Path rocks, Path sqlite, Path stats, String scheme)
+    {
         applyConfig(INDEX_CONFIG);
         ConfigFactory pixels = ConfigFactory.Instance();
-        Path stats = workDirectory.resolve("index/rocksdb-stats");
-        Files.createDirectories(stats);
         pixels.addProperty("enabled.single.point.index.schemes", scheme);
         pixels.addProperty("enabled.main.index.scheme", "sqlite");
-        pixels.addProperty("index.rocksdb.data.path", targetRocks.toString());
+        pixels.addProperty("index.rocksdb.data.path", rocks.toString());
         pixels.addProperty("index.rocksdb.stats.path", stats.toString());
-        pixels.addProperty("index.sqlite.path", targetSqlite.toString());
-        pixels.addProperty("retina.upsert-mode.enabled", "false");
+        pixels.addProperty("index.sqlite.path", sqlite.toString());
+        try
+        {
+            Files.createDirectories(rocks);
+            Files.createDirectories(sqlite);
+            Files.createDirectories(stats);
+        }
+        catch (IOException e)
+        {
+            throw new IllegalStateException("failed to create Index state directories", e);
+        }
     }
 
     /**
