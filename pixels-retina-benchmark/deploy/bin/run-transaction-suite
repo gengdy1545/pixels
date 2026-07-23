@@ -30,6 +30,8 @@ PREFILL_BATCH_SIZE=1024
 RPC_DEADLINE_MS=180000
 SMOKE=false
 DRY_RUN=false
+RUN_SPLIT_SCENARIOS=false
+MAX_DURATION_ATTEMPTS=6
 
 ETCD_PID=""
 TRANS_PID=""
@@ -37,14 +39,15 @@ RSS_MONITOR_PID=""
 CURRENT_CONFIG=""
 RUN_DIR=""
 RUN_STATE_DIR=""
+SCENARIOS=()
 
 usage()
 {
     cat <<'EOF'
 Usage: bin/run-transaction-suite [options]
 
-Runs transaction-begin-commit, transaction-begin, and transaction-commit
-with managed etcd and Transaction Server processes.
+Runs transaction-begin-commit with managed etcd and Transaction Server
+processes. Optional split scenarios (begin, commit) can be enabled.
 
 Options:
   --isolation scenario|suite     Fresh etcd per scenario (default) or per suite
@@ -64,6 +67,7 @@ Options:
   --duration-seconds N           Lifecycle measurement duration (default: 60)
   --lifecycle-data-size N        Begin-commit operation ceiling (default: 1e9)
   --pending-data-size N          Begin/commit operation ceiling (default: 2e7)
+  --include-split-scenarios      Also run transaction-begin and transaction-commit
   --smoke                        Use tiny functional-test parameters
   --dry-run                      Print configuration without starting processes
   -h, --help                     Show this help
@@ -120,6 +124,7 @@ do
         --duration-seconds) require_value "$1" "${2:-}"; DURATION_SECONDS="$2"; shift 2 ;;
         --lifecycle-data-size) require_value "$1" "${2:-}"; LIFECYCLE_DATA_SIZE="$2"; shift 2 ;;
         --pending-data-size) require_value "$1" "${2:-}"; PENDING_DATA_SIZE="$2"; shift 2 ;;
+        --include-split-scenarios) RUN_SPLIT_SCENARIOS=true; shift ;;
         --smoke) SMOKE=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -149,6 +154,10 @@ done
 [[ "${WARMUP_SECONDS}" =~ ^[0-9]+$ ]] ||
     die "warmup-seconds must be a non-negative integer: ${WARMUP_SECONDS}"
 (( CLIENTS <= THREADS )) || die "clients must not exceed threads"
+if [[ "${SMOKE}" == "false" && "${DURATION_SECONDS}" -ne 60 ]]
+then
+    die "formal Transaction benchmark enforces duration-seconds=60"
+fi
 
 if [[ "${SMOKE}" == "true" ]]
 then
@@ -162,6 +171,11 @@ then
     CLEANUP_BATCH_SIZE=64
     PREFILL_BATCH_SIZE=64
     RPC_DEADLINE_MS=30000
+fi
+SCENARIOS=(begin-commit)
+if [[ "${RUN_SPLIT_SCENARIOS}" == "true" ]]
+then
+    SCENARIOS+=(begin commit)
 fi
 
 port_open()
@@ -392,6 +406,7 @@ run_benchmark_scenario()
     local directory="$2"
     local result_file="${directory}/result.txt"
     local expected_stop
+    local begin_commit_data_size=""
     local args=(
         --trans-host "${TRANS_HOST}" --trans-port "${TRANS_PORT}"
         --threads "${THREADS}" --clients "${CLIENTS}" --batch-size "${BATCH_SIZE}"
@@ -402,8 +417,8 @@ run_benchmark_scenario()
             args+=(
                 --warmup-seconds "${WARMUP_SECONDS}"
                 --duration-seconds "${DURATION_SECONDS}"
-                --data-size "${LIFECYCLE_DATA_SIZE}"
             )
+            begin_commit_data_size="${LIFECYCLE_DATA_SIZE}"
             if [[ "${SMOKE}" == "true" ]]; then expected_stop='data-size'; else expected_stop='duration'; fi
             ;;
         begin)
@@ -429,11 +444,63 @@ run_benchmark_scenario()
         *) die "unknown scenario: ${scenario}" ;;
     esac
 
+    if [[ "${scenario}" == "begin-commit" && "${SMOKE}" == "false" ]]
+    then
+        local current_data_size="${begin_commit_data_size}"
+        local attempt=1
+        local final_result=""
+        while (( attempt <= MAX_DURATION_ATTEMPTS ))
+        do
+            local attempt_result="${directory}/result-attempt${attempt}.txt"
+            log "running transaction-${scenario} attempt=${attempt} data-size=${current_data_size}"
+            set +e
+            PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
+            JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
+                "${ROOT_DIR}/bin/run-benchmark" "transaction-${scenario}" \
+                "${args[@]}" --data-size "${current_data_size}" \
+                2>&1 | tee "${attempt_result}"
+            local benchmark_status=${PIPESTATUS[0]}
+            set -e
+            [[ "${benchmark_status}" -eq 0 ]] ||
+                die "transaction-${scenario} failed with exit code ${benchmark_status}; see ${attempt_result}"
+            validate_result "${scenario}" "${attempt_result}" 'data-size|duration'
+            local stop_reason
+            stop_reason="$(awk -F= '$1 == "stop_reason" { print $2 }' "${attempt_result}")"
+            if [[ "${stop_reason}" == "duration" ]]
+            then
+                final_result="${attempt_result}"
+                break
+            fi
+            if [[ "${stop_reason}" != "data-size" ]]
+            then
+                die "transaction-${scenario} stopped for unexpected reason ${stop_reason}; see ${attempt_result}"
+            fi
+            if (( attempt >= MAX_DURATION_ATTEMPTS ))
+            then
+                die "transaction-${scenario} did not reach duration after ${MAX_DURATION_ATTEMPTS} attempts; last data-size=${current_data_size}"
+            fi
+            current_data_size=$((current_data_size * 2))
+            attempt=$((attempt + 1))
+        done
+        [[ -n "${final_result}" ]] ||
+            die "transaction-${scenario} did not produce a final result"
+        cp "${final_result}" "${result_file}"
+        printf '%s\n' "${attempt}" > "${directory}/attempts.txt"
+        printf '%s\n' "${current_data_size}" > "${directory}/final-data-size.txt"
+        validate_result "${scenario}" "${result_file}" "${expected_stop}"
+        return
+    fi
+
     log "running transaction-${scenario}"
+    local run_args=("${args[@]}")
+    if [[ -n "${begin_commit_data_size}" ]]
+    then
+        run_args+=(--data-size "${begin_commit_data_size}")
+    fi
     set +e
     PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
     JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
-        "${ROOT_DIR}/bin/run-benchmark" "transaction-${scenario}" "${args[@]}" \
+        "${ROOT_DIR}/bin/run-benchmark" "transaction-${scenario}" "${run_args[@]}" \
         2>&1 | tee "${result_file}"
     local benchmark_status=${PIPESTATUS[0]}
     set -e
@@ -479,7 +546,10 @@ write_parameters()
         printf 'warmup_seconds=%q\n' "${WARMUP_SECONDS}"
         printf 'duration_seconds=%q\n' "${DURATION_SECONDS}"
         printf 'lifecycle_data_size=%q\n' "${LIFECYCLE_DATA_SIZE}"
+        printf 'max_duration_attempts=%q\n' "${MAX_DURATION_ATTEMPTS}"
         printf 'pending_data_size=%q\n' "${PENDING_DATA_SIZE}"
+        printf 'include_split_scenarios=%q\n' "${RUN_SPLIT_SCENARIOS}"
+        printf 'scenarios=%q\n' "${SCENARIOS[*]}"
         printf 'trans_java_opts=%q\n' "${TRANS_JAVA_OPTS}"
         printf 'client_java_opts=%q\n' "${CLIENT_JAVA_OPTS}"
         printf 'etcd_endpoint=%q\n' "http://${ETCD_HOST}:${ETCD_PORT}"
@@ -494,7 +564,7 @@ write_summary()
     local output="${RUN_DIR}/summary.txt"
     {
         printf 'results_dir=%s\n' "${RUN_DIR}"
-        for scenario in begin-commit begin commit
+        for scenario in "${SCENARIOS[@]}"
         do
             local result="${RUN_DIR}/${scenario}/result.txt"
             printf '\n[%s]\n' "${scenario}"
@@ -508,6 +578,13 @@ write_summary()
             then
                 awk 'NR > 1 && $2 > max { max = $2 } END { if (max) printf "peak_server_rss_kib=%d\n", max }' \
                     "${rss_file}"
+            fi
+            local attempts_file="${RUN_DIR}/${scenario}/attempts.txt"
+            local final_data_size_file="${RUN_DIR}/${scenario}/final-data-size.txt"
+            if [[ -f "${attempts_file}" ]]
+            then
+                printf 'attempts=%s\n' "$(cat "${attempts_file}")"
+                printf 'final_data_size=%s\n' "$(cat "${final_data_size_file}")"
             fi
         done
     } > "${output}"
@@ -527,6 +604,7 @@ then
         "${THREADS}" "${CLIENTS}" "${BATCH_SIZE}" "${WARMUP_SECONDS}" "${DURATION_SECONDS}"
     printf 'lifecycle_data_size=%s pending_data_size=%s\n' \
         "${LIFECYCLE_DATA_SIZE}" "${PENDING_DATA_SIZE}"
+    printf 'max_duration_attempts=%s\n' "${MAX_DURATION_ATTEMPTS}"
     printf 'server_java_opts=%s client_java_opts=%s\n' \
         "${TRANS_JAVA_OPTS}" "${CLIENT_JAVA_OPTS}"
     exit 0
@@ -557,9 +635,10 @@ then
     start_etcd "${RUN_STATE_DIR}/suite" "retina-bench-suite-$$" "${RUN_DIR}/suite/etcd.log"
 fi
 
-run_one begin-commit
-run_one begin
-run_one commit
+for scenario in "${SCENARIOS[@]}"
+do
+    run_one "${scenario}"
+done
 
 if [[ "${ISOLATION}" == "suite" ]]
 then

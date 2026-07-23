@@ -52,13 +52,15 @@ public final class BenchmarkRunner
         try
         {
             scenario.setup(config);
-            if (config.warmupSeconds() > 0 && config.warmupOperations() > 0)
+            long warmupOps = scenario.warmupOperations(config);
+            long measurementOps = scenario.measurementOperations(config);
+            if (config.warmupSeconds() > 0 && warmupOps > 0)
             {
                 runPhase(scenario, config, executor, BenchmarkPhase.WARMUP,
-                        config.warmupOperations(), config.warmupSeconds());
+                        warmupOps, config.warmupSeconds());
             }
             BenchmarkResult measured = runPhase(scenario, config, executor,
-                    BenchmarkPhase.MEASUREMENT, config.dataSize(), config.durationSeconds());
+                    BenchmarkPhase.MEASUREMENT, measurementOps, config.durationSeconds());
             Map<String, String> details = scenario.details();
             return measured.withDetails(details);
         }

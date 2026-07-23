@@ -19,10 +19,11 @@ WARMUP_SECONDS=30
 WARMUP_OPERATIONS=100000
 DURATION_SECONDS=60
 DATA_SIZE=10000000
-MAIN_INDEX_STATE="warm-cache"
+MAIN_INDEX_STATE="natural"
 SMOKE=false
 DRY_RUN=false
 KEEP_WORK_DIRS=false
+MAX_DURATION_ATTEMPTS=6
 
 RUN_DIR=""
 RUN_WORK_DIR=""
@@ -53,8 +54,9 @@ Options:
   --warmup-operations N          Warmup operation limit (default: 100000)
   --duration-seconds N           Measurement time limit (default: 60)
   --data-size N                  Measurement operation limit (default: 10000000)
-  --main-index-state STATE       MainIndex state for Update/Delete: hot-buffer,
-                                 warm-cache (default), or cold-start
+  --main-index-state STATE       MainIndex state for Update/Delete: natural
+                                 (default; existing snapshot keys, no warm),
+                                 hot-buffer, warm-cache, or cold-start
   --keep-work-dirs               Preserve successful work copies for inspection
   --smoke                        Use tiny functional-test parameters
   --dry-run                      Print configuration without running
@@ -151,8 +153,8 @@ done
 [[ "${WARMUP_OPERATIONS}" =~ ^[0-9]+$ ]] ||
     die "warmup-operations must be a non-negative integer: ${WARMUP_OPERATIONS}"
 case "${MAIN_INDEX_STATE}" in
-    hot-buffer|warm-cache|cold-start) ;;
-    *) die "main-index-state must be hot-buffer, warm-cache, or cold-start: ${MAIN_INDEX_STATE}" ;;
+    natural|hot-buffer|warm-cache|cold-start) ;;
+    *) die "main-index-state must be natural, hot-buffer, warm-cache, or cold-start: ${MAIN_INDEX_STATE}" ;;
 esac
 
 if [[ "${SMOKE}" == "true" ]]
@@ -186,7 +188,10 @@ mkdir -p "${RUN_DIR}" "${RUN_WORK_DIR}"
 
 snapshot_size_kib="$(du -sk "${INDEX_SOURCE_DIR}" | awk '{ print $1 }')"
 available_kib="$(df -Pk "${RUN_WORK_DIR}" | awk 'NR == 2 { print $4 }')"
-if [[ "${KEEP_WORK_DIRS}" == "true" ]]
+if [[ "${SMOKE}" == "true" ]]
+then
+    minimum_kib=$((snapshot_size_kib + snapshot_size_kib / 5))
+elif [[ "${KEEP_WORK_DIRS}" == "true" ]]
 then
     minimum_kib=$((snapshot_size_kib * 4))
 else
@@ -258,61 +263,108 @@ validate_result()
         grep -q "^detail.mainIndexState=${MAIN_INDEX_STATE}$" "${result_file}" ||
             die "${operation} did not use MainIndex state ${MAIN_INDEX_STATE}"
     fi
-    local stop_reason
-    stop_reason="$(awk -F= '$1 == "stop_reason" { print $2 }' "${result_file}")"
-    if [[ "${SMOKE}" == "true" ]]
-    then
-        [[ "${stop_reason}" == "data-size" ]] ||
-            die "${operation} smoke stopped for ${stop_reason}, expected data-size"
-    else
-        [[ "${stop_reason}" == "duration" || "${stop_reason}" == "data-size" ]] ||
-            die "${operation} stopped for unexpected reason ${stop_reason}"
-    fi
 }
 
 run_operation()
 {
     local operation="$1"
-    local operation_work="${RUN_WORK_DIR}/${operation}"
-    local result_file="${RUN_DIR}/index-${operation}-primary.txt"
-    [[ ! -e "${operation_work}" ]] ||
-        die "operation work directory already exists: ${operation_work}"
+    local attempt=1
+    local current_data_size="${DATA_SIZE}"
+    local final_result_file=""
+    local final_work_dir=""
+    local final_stop_reason=""
+    while (( attempt <= MAX_DURATION_ATTEMPTS ))
+    do
+        local operation_work="${RUN_WORK_DIR}/${operation}-attempt${attempt}"
+        local attempt_result="${RUN_DIR}/index-${operation}-primary-attempt${attempt}.txt"
+        [[ ! -e "${operation_work}" ]] ||
+            die "operation work directory already exists: ${operation_work}"
 
-    log "running index-${operation}-primary with fresh Snapshot state"
-    local args=(
-        --snapshot-dir "${SNAPSHOT_DIR}"
-        --snapshot-table "${SNAPSHOT_TABLE}"
-        --snapshot-work-dir "${operation_work}"
-        --threads "${THREADS}"
-        --clients "${CLIENTS}"
-        --batch-size "${BATCH_SIZE}"
-        --warmup-seconds "${WARMUP_SECONDS}"
-        --warmup-operations "${WARMUP_OPERATIONS}"
-        --duration-seconds "${DURATION_SECONDS}"
-        --data-size "${DATA_SIZE}"
-        --main-index-state "${MAIN_INDEX_STATE}"
-    )
-    if [[ -n "${INDEX_STATE_DIR}" ]]
-    then
-        args+=(--index-state-dir "${INDEX_STATE_DIR}")
-    fi
+        log "running index-${operation}-primary attempt=${attempt} data-size=${current_data_size}"
+        local args=(
+            --snapshot-dir "${SNAPSHOT_DIR}"
+            --snapshot-table "${SNAPSHOT_TABLE}"
+            --snapshot-work-dir "${operation_work}"
+            --threads "${THREADS}"
+            --clients "${CLIENTS}"
+            --batch-size "${BATCH_SIZE}"
+            --warmup-seconds "${WARMUP_SECONDS}"
+            --warmup-operations "${WARMUP_OPERATIONS}"
+            --duration-seconds "${DURATION_SECONDS}"
+            --data-size "${current_data_size}"
+            --main-index-state "${MAIN_INDEX_STATE}"
+        )
+        if [[ -n "${INDEX_STATE_DIR}" ]]
+        then
+            args+=(--index-state-dir "${INDEX_STATE_DIR}")
+        fi
 
-    set +e
-    PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${SOURCE_CONFIG}" \
-    JAVA_OPTS="${JAVA_OPTS_VALUE}" \
-        "${ROOT_DIR}/bin/run-benchmark" "index-${operation}-primary" "${args[@]}" \
-        2>&1 | tee "${result_file}"
-    local benchmark_status=${PIPESTATUS[0]}
-    set -e
-    [[ "${benchmark_status}" -eq 0 ]] ||
-        die "index-${operation}-primary failed with exit code ${benchmark_status}; see ${result_file}"
-    validate_result "${operation}" "${result_file}"
-    du -sk "${operation_work}" | awk '{ print $1 }' > "${RUN_DIR}/index-${operation}-work-size-kib.txt"
+        set +e
+        PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${SOURCE_CONFIG}" \
+        JAVA_OPTS="${JAVA_OPTS_VALUE}" \
+            "${ROOT_DIR}/bin/run-benchmark" "index-${operation}-primary" "${args[@]}" \
+            2>&1 | tee "${attempt_result}"
+        local benchmark_status=${PIPESTATUS[0]}
+        set -e
+        [[ "${benchmark_status}" -eq 0 ]] ||
+            die "index-${operation}-primary failed with exit code ${benchmark_status}; see ${attempt_result}"
+        validate_result "${operation}" "${attempt_result}"
+        local stop_reason
+        stop_reason="$(awk -F= '$1 == "stop_reason" { print $2 }' "${attempt_result}")"
+        if [[ "${SMOKE}" == "true" ]]
+        then
+            [[ "${stop_reason}" == "data-size" ]] ||
+                die "${operation} smoke stopped for ${stop_reason}, expected data-size"
+            final_result_file="${attempt_result}"
+            final_work_dir="${operation_work}"
+            final_stop_reason="${stop_reason}"
+            break
+        fi
+        if [[ "${stop_reason}" == "duration" ]]
+        then
+            final_result_file="${attempt_result}"
+            final_work_dir="${operation_work}"
+            final_stop_reason="${stop_reason}"
+            break
+        fi
+        if [[ "${stop_reason}" != "data-size" ]]
+        then
+            die "${operation} stopped for unexpected reason ${stop_reason}"
+        fi
+        # Natural delete is bounded by existing snapshot keys; accept data-size.
+        if [[ "${operation}" == "delete" && "${MAIN_INDEX_STATE}" == "natural" ]]
+        then
+            final_result_file="${attempt_result}"
+            final_work_dir="${operation_work}"
+            final_stop_reason="${stop_reason}"
+            break
+        fi
+        if (( attempt >= MAX_DURATION_ATTEMPTS ))
+        then
+            die "${operation} did not reach duration after ${MAX_DURATION_ATTEMPTS} attempts; last data-size=${current_data_size}"
+        fi
+        if [[ "${KEEP_WORK_DIRS}" == "false" ]]
+        then
+            [[ "${operation_work}" == "${RUN_WORK_DIR}/"* ]] ||
+                die "refusing to remove unexpected work directory: ${operation_work}"
+            rm -rf -- "${operation_work}"
+        fi
+        current_data_size=$((current_data_size * 2))
+        attempt=$((attempt + 1))
+    done
+
+    [[ -n "${final_result_file}" ]] ||
+        die "index-${operation}-primary produced no final result"
+    cp "${final_result_file}" "${RUN_DIR}/index-${operation}-primary.txt"
+    printf '%s\n' "${attempt}" > "${RUN_DIR}/index-${operation}-attempts.txt"
+    printf '%s\n' "${current_data_size}" > "${RUN_DIR}/index-${operation}-final-data-size.txt"
+    printf '%s\n' "${final_stop_reason}" > "${RUN_DIR}/index-${operation}-final-stop-reason.txt"
+    du -sk "${final_work_dir}" | awk '{ print $1 }' > "${RUN_DIR}/index-${operation}-work-size-kib.txt"
     if [[ "${KEEP_WORK_DIRS}" == "false" ]]
     then
-        [[ "${operation_work}" == "${RUN_WORK_DIR}/"* ]] ||
-            die "refusing to remove unexpected work directory: ${operation_work}"
-        rm -rf -- "${operation_work}"
+        [[ "${final_work_dir}" == "${RUN_WORK_DIR}/"* ]] ||
+            die "refusing to remove unexpected work directory: ${final_work_dir}"
+        rm -rf -- "${final_work_dir}"
         log "removed successful ${operation} work copy"
     fi
 }
@@ -339,6 +391,8 @@ run_operation delete
                 print
             }
         ' "${RUN_DIR}/index-${operation}-primary.txt"
+        printf 'attempts=%s\n' "$(cat "${RUN_DIR}/index-${operation}-attempts.txt")"
+        printf 'final_data_size=%s\n' "$(cat "${RUN_DIR}/index-${operation}-final-data-size.txt")"
         printf 'work_size_kib=%s\n' \
             "$(cat "${RUN_DIR}/index-${operation}-work-size-kib.txt")"
     done

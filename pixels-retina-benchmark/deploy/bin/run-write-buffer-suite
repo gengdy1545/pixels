@@ -22,7 +22,7 @@ NODE_PORT=18891
 SERVER_JAVA_OPTS="${WRITE_BUFFER_SERVER_JAVA_OPTS:--Xms40g -Xmx40g}"
 CLIENT_JAVA_OPTS="${WRITE_BUFFER_CLIENT_JAVA_OPTS:--Xms40g -Xmx40g}"
 
-TABLE="orderline"
+TABLE=""
 THREADS=16
 CLIENTS=4
 BATCH_SIZE=64
@@ -31,7 +31,7 @@ WARMUP_OPERATIONS=100000
 DURATION_SECONDS=60
 # Practical time-only ceiling: unreachable in 60 seconds and safely below
 # WriteBuffer's 48-bit timestamp budget across warmup and measurement phases.
-DATA_SIZE=100000000
+DATA_SIZE=1000000000
 ROW_POOL_SIZE=100000
 
 MEMTABLE_SIZE=10240
@@ -47,6 +47,7 @@ SKIP_MEASUREMENT_CLOSE=true
 
 SMOKE=false
 DRY_RUN=false
+MAX_DURATION_ATTEMPTS=6
 NATIVE_TEMP_DIR=""
 JEMALLOC_PRELOAD=""
 ETCD_PID=""
@@ -71,6 +72,7 @@ uses disposable local SQLite state.
 Options:
   --snapshot-dir DIR             Snapshot v2 directory (required)
   --s3-root URI                  Dedicated S3 root, e.g. s3://bucket/prefix (required)
+  --snapshot-table NAME          Snapshot table (default: auto: orderline, transfer, or first table)
   --results-dir DIR              Results root (default: runtime/results)
   --state-dir DIR                Disposable state root (default: /var/tmp/...)
   --config FILE                  Source pixels.properties
@@ -119,6 +121,7 @@ while [[ $# -gt 0 ]]
 do
     case "$1" in
         --snapshot-dir) require_value "$1" "${2:-}"; SNAPSHOT_DIR="$2"; shift 2 ;;
+        --snapshot-table) require_value "$1" "${2:-}"; TABLE="$2"; shift 2 ;;
         --s3-root) require_value "$1" "${2:-}"; S3_ROOT="$2"; shift 2 ;;
         --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
         --state-dir) require_value "$1" "${2:-}"; STATE_ROOT="$2"; shift 2 ;;
@@ -165,6 +168,25 @@ if grep -Eq '^[[:space:]]*[A-Za-z0-9_.-]+=.*REPLACE_WITH_' "${SOURCE_CONFIG}"
 then
     die "source pixels.properties still contains REPLACE_WITH placeholders"
 fi
+if [[ -z "${TABLE}" ]]
+then
+    TABLE="$(python3 - "${SNAPSHOT_DIR}/snapshot.json" <<'PY'
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    manifest = json.load(f)
+tables = [str(t.get('tableName', '')) for t in manifest.get('tables', []) if t.get('tableName')]
+preferred = ('orderline', 'customer', 'checkingaccount', 'transfer')
+lower = {name.lower(): name for name in tables}
+for candidate in preferred:
+    if candidate in lower:
+        print(lower[candidate])
+        raise SystemExit(0)
+if not tables:
+    raise SystemExit(1)
+print(tables[0])
+PY
+)" || die "failed to infer snapshot table from ${SNAPSHOT_DIR}/snapshot.json"
+fi
 
 for pair in \
     "etcd-port:${ETCD_PORT}" "etcd-peer-port:${ETCD_PEER_PORT}" \
@@ -187,6 +209,10 @@ then
     DATA_SIZE=100
     ROW_POOL_SIZE=100
     SKIP_MEASUREMENT_CLOSE=false
+fi
+if [[ "${SMOKE}" == "false" && "${DURATION_SECONDS}" -ne 60 ]]
+then
+    die "formal WriteBuffer benchmark enforces duration-seconds=60"
 fi
 
 port_open()
@@ -438,6 +464,7 @@ then
         "${THREADS}" "${CLIENTS}" "${BATCH_SIZE}" "${WARMUP_SECONDS}" "${WARMUP_OPERATIONS}"
     printf 'duration_seconds=%s data_size=%s row_pool_size=%s\n' \
         "${DURATION_SECONDS}" "${DATA_SIZE}" "${ROW_POOL_SIZE}"
+    printf 'max_duration_attempts=%s\n' "${MAX_DURATION_ATTEMPTS}"
     printf 'memtable_size=%s flush_count=%s flush_threads=%s flush_interval=%s\n' \
         "${MEMTABLE_SIZE}" "${FLUSH_COUNT}" "${FLUSH_THREADS}" "${FLUSH_INTERVAL}"
     printf 'server_java_opts=%s client_java_opts=%s\n' \
@@ -470,6 +497,7 @@ prepare_config
     printf 'warmup_seconds=%q\nwarmup_operations=%q\n' "${WARMUP_SECONDS}" "${WARMUP_OPERATIONS}"
     printf 'duration_seconds=%q\ndata_size=%q\nrow_pool_size=%q\n' \
         "${DURATION_SECONDS}" "${DATA_SIZE}" "${ROW_POOL_SIZE}"
+    printf 'max_duration_attempts=%q\n' "${MAX_DURATION_ATTEMPTS}"
     printf 'memtable_size=%q\nflush_count=%q\nflush_threads=%q\nflush_interval=%q\n' \
         "${MEMTABLE_SIZE}" "${FLUSH_COUNT}" "${FLUSH_THREADS}" "${FLUSH_INTERVAL}"
     printf 'encoding_level=%q\nnulls_padding=%q\nblock_size=%q\nreplication=%q\nvnodes=%q\n' \
@@ -514,60 +542,103 @@ set -e
 grep -q '^status=valid$' "${RUN_DIR}/snapshot-validation.txt" ||
     die "snapshot validation did not report status=valid"
 
-log "running orderline PixelsWriteBuffer.addRow benchmark"
-set +e
-LD_PRELOAD="${JEMALLOC_PRELOAD}" \
-PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
-JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
-    "${ROOT_DIR}/bin/run-benchmark" write-buffer-add \
-    --snapshot-dir "${SNAPSHOT_DIR}" \
-    --snapshot-table "${TABLE}" \
-    --threads "${THREADS}" \
-    --clients "${CLIENTS}" \
-    --batch-size "${BATCH_SIZE}" \
-    --warmup-seconds "${WARMUP_SECONDS}" \
-    --warmup-operations "${WARMUP_OPERATIONS}" \
-    --duration-seconds "${DURATION_SECONDS}" \
-    --data-size "${DATA_SIZE}" \
-    --writebuffer-row-pool-size "${ROW_POOL_SIZE}" \
-    --writebuffer-schema "${BENCHMARK_SCHEMA}" \
-    --writebuffer-drop-schema true \
-    --writebuffer-skip-measurement-close "${SKIP_MEASUREMENT_CLOSE}" \
-    --writebuffer-host-name "wb-${RUN_ID}" \
-    --writebuffer-memtable-size "${MEMTABLE_SIZE}" \
-    --writebuffer-flush-count "${FLUSH_COUNT}" \
-    --writebuffer-flush-threads "${FLUSH_THREADS}" \
-    --writebuffer-flush-interval "${FLUSH_INTERVAL}" \
-    --writebuffer-encoding-level "${ENCODING_LEVEL}" \
-    --writebuffer-nulls-padding "${NULLS_PADDING}" \
-    --writebuffer-block-size "${BLOCK_SIZE}" \
-    --writebuffer-replication "${REPLICATION}" \
-    --writebuffer-vnodes "${VNODES}" \
-    --writebuffer-storage-scheme s3 \
-    --writebuffer-base-uri "${RUN_PREFIX}/table" \
-    --writebuffer-object-storage-scheme s3 \
-    --writebuffer-object-folder "${RUN_PREFIX}/objects" \
-    --writebuffer-enabled-storage-schemes s3,file \
-    2>&1 | tee "${RUN_DIR}/result.txt"
-benchmark_status=${PIPESTATUS[0]}
-set -e
-[[ "${benchmark_status}" -eq 0 ]] ||
-    die "WriteBuffer benchmark failed with exit code ${benchmark_status}; see ${RUN_DIR}/result.txt"
+log "running ${TABLE} PixelsWriteBuffer.addRow benchmark"
+current_data_size="${DATA_SIZE}"
+attempt=1
+final_result=""
+final_schema=""
+while (( attempt <= MAX_DURATION_ATTEMPTS ))
+do
+    attempt_schema="${BENCHMARK_SCHEMA}_a${attempt}"
+    attempt_result="${RUN_DIR}/result-attempt${attempt}.txt"
+    schema_cleanup="${RUN_DIR}/metadata-schema-cleanup-attempt${attempt}.txt"
+    log "running ${TABLE} PixelsWriteBuffer.addRow benchmark attempt=${attempt} data-size=${current_data_size}"
+    set +e
+    LD_PRELOAD="${JEMALLOC_PRELOAD}" \
+    PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
+    JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
+        "${ROOT_DIR}/bin/run-benchmark" write-buffer-add \
+        --snapshot-dir "${SNAPSHOT_DIR}" \
+        --snapshot-table "${TABLE}" \
+        --threads "${THREADS}" \
+        --clients "${CLIENTS}" \
+        --batch-size "${BATCH_SIZE}" \
+        --warmup-seconds "${WARMUP_SECONDS}" \
+        --warmup-operations "${WARMUP_OPERATIONS}" \
+        --duration-seconds "${DURATION_SECONDS}" \
+        --data-size "${current_data_size}" \
+        --writebuffer-row-pool-size "${ROW_POOL_SIZE}" \
+        --writebuffer-schema "${attempt_schema}" \
+        --writebuffer-drop-schema true \
+        --writebuffer-skip-measurement-close "${SKIP_MEASUREMENT_CLOSE}" \
+        --writebuffer-host-name "wb-${RUN_ID}" \
+        --writebuffer-memtable-size "${MEMTABLE_SIZE}" \
+        --writebuffer-flush-count "${FLUSH_COUNT}" \
+        --writebuffer-flush-threads "${FLUSH_THREADS}" \
+        --writebuffer-flush-interval "${FLUSH_INTERVAL}" \
+        --writebuffer-encoding-level "${ENCODING_LEVEL}" \
+        --writebuffer-nulls-padding "${NULLS_PADDING}" \
+        --writebuffer-block-size "${BLOCK_SIZE}" \
+        --writebuffer-replication "${REPLICATION}" \
+        --writebuffer-vnodes "${VNODES}" \
+        --writebuffer-storage-scheme s3 \
+        --writebuffer-base-uri "${RUN_PREFIX}/table" \
+        --writebuffer-object-storage-scheme s3 \
+        --writebuffer-object-folder "${RUN_PREFIX}/objects" \
+        --writebuffer-enabled-storage-schemes s3,file \
+        2>&1 | tee "${attempt_result}"
+    benchmark_status=${PIPESTATUS[0]}
+    set -e
+    [[ "${benchmark_status}" -eq 0 ]] ||
+        die "WriteBuffer benchmark failed with exit code ${benchmark_status}; see ${attempt_result}"
+
+    set +e
+    PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
+    JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
+        "${ROOT_DIR}/bin/run-benchmark" metadata-drop-schema \
+        --schema "${attempt_schema}" \
+        2>&1 | tee "${schema_cleanup}"
+    schema_cleanup_status=${PIPESTATUS[0]}
+    set -e
+    [[ "${schema_cleanup_status}" -eq 0 ]] ||
+        die "failed to clean benchmark Metadata schema; see ${schema_cleanup}"
+    grep -q '^status=dropped$' "${schema_cleanup}" ||
+        die "Metadata schema cleanup did not report status=dropped for ${attempt_schema}"
+
+    stop_reason="$(awk -F= '$1 == "stop_reason" { print $2 }' "${attempt_result}")"
+    if [[ "${SMOKE}" == "true" ]]
+    then
+        [[ "${stop_reason}" == "data-size" ]] ||
+            die "WriteBuffer smoke did not reach its row limit"
+        final_result="${attempt_result}"
+        final_schema="${attempt_schema}"
+        break
+    fi
+    if [[ "${stop_reason}" == "duration" ]]
+    then
+        final_result="${attempt_result}"
+        final_schema="${attempt_schema}"
+        break
+    fi
+    if [[ "${stop_reason}" != "data-size" ]]
+    then
+        die "WriteBuffer stopped for unexpected reason ${stop_reason}; see ${attempt_result}"
+    fi
+    if (( attempt >= MAX_DURATION_ATTEMPTS ))
+    then
+        die "WriteBuffer did not reach duration after ${MAX_DURATION_ATTEMPTS} attempts; last data-size=${current_data_size}"
+    fi
+    current_data_size=$((current_data_size * 2))
+    attempt=$((attempt + 1))
+done
+
+[[ -n "${final_result}" ]] || die "WriteBuffer did not produce a final result"
+cp "${final_result}" "${RUN_DIR}/result.txt"
+printf '%s\n' "${attempt}" > "${RUN_DIR}/attempts.txt"
+printf '%s\n' "${current_data_size}" > "${RUN_DIR}/final-data-size.txt"
+printf '%s\n' "${final_schema}" > "${RUN_DIR}/final-schema.txt"
 
 RESULT="${RUN_DIR}/result.txt"
-SCHEMA_CLEANUP="${RUN_DIR}/metadata-schema-cleanup.txt"
-set +e
-PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${CURRENT_CONFIG}" \
-JAVA_OPTS="${CLIENT_JAVA_OPTS}" \
-    "${ROOT_DIR}/bin/run-benchmark" metadata-drop-schema \
-    --schema "${BENCHMARK_SCHEMA}" \
-    2>&1 | tee "${SCHEMA_CLEANUP}"
-schema_cleanup_status=${PIPESTATUS[0]}
-set -e
-[[ "${schema_cleanup_status}" -eq 0 ]] ||
-    die "failed to clean benchmark Metadata schema; see ${SCHEMA_CLEANUP}"
-grep -q '^status=dropped$' "${SCHEMA_CLEANUP}" ||
-    die "Metadata schema cleanup did not report status=dropped"
 
 grep -q '^benchmark=write-buffer-add$' "${RESULT}" ||
     die "WriteBuffer did not produce a benchmark result"
@@ -581,8 +652,8 @@ then
     grep -q '^stop_reason=data-size$' "${RESULT}" ||
         die "WriteBuffer smoke did not reach its row limit"
 else
-    grep -Eq '^stop_reason=(duration|data-size)$' "${RESULT}" ||
-        die "WriteBuffer formal run did not reach its duration or row limit"
+    grep -q '^stop_reason=duration$' "${RESULT}" ||
+        die "WriteBuffer formal run must stop by duration=60s"
     grep -q '^detail.measurement_close_status=skipped$' "${RESULT}" ||
         die "WriteBuffer formal run did not skip measurement close"
     grep -q '^detail.persistence_validated=false$' "${RESULT}" ||
@@ -630,7 +701,9 @@ fi
     awk 'NR > 1 && $2 > max { max = $2 } END { if (max) printf "peak_metadata_server_rss_kib=%d\n", max }' \
         "${RUN_DIR}/metadata-server-rss.txt"
     printf 's3_prefix=%s\n' "${RUN_PREFIX}"
-    printf 'benchmark_schema=%s\n' "${BENCHMARK_SCHEMA}"
+    printf 'benchmark_schema=%s\n' "${final_schema}"
+    printf 'attempts=%s\n' "$(cat "${RUN_DIR}/attempts.txt")"
+    printf 'final_data_size=%s\n' "$(cat "${RUN_DIR}/final-data-size.txt")"
     printf 'etcd_state=fresh-and-removed-after-success\n'
     printf 'metadata_schema=unique-and-dropped-after-benchmark-exit\n'
 } > "${RUN_DIR}/summary.txt"

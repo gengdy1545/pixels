@@ -20,6 +20,18 @@ public interface BenchmarkScenario extends AutoCloseable
 
     void setup(BenchmarkConfig config) throws Exception;
 
+    /** Warmup operation count after setup (may be capped by scenario constraints). */
+    default long warmupOperations(BenchmarkConfig config)
+    {
+        return config.warmupOperations();
+    }
+
+    /** Measurement operation count after setup (may be capped by scenario constraints). */
+    default long measurementOperations(BenchmarkConfig config)
+    {
+        return config.dataSize();
+    }
+
     default void preparePhase(BenchmarkPhase phase, long totalOperations) throws Exception
     {
     }

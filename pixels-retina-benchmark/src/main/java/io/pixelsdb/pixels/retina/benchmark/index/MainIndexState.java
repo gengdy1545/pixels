@@ -12,9 +12,16 @@ package io.pixelsdb.pixels.retina.benchmark.index;
 
 import java.util.Locale;
 
-/** MainIndex fixture state immediately before a timed primary update or delete. */
+/**
+ * MainIndex state immediately before a timed primary update or delete.
+ *
+ * <p>{@link #NATURAL} uses restored snapshot keys as-is with no fixture
+ * prefill and no artificial cache warm-up. Cache hits/misses are part of the
+ * measured path.</p>
+ */
 enum MainIndexState
 {
+    NATURAL("natural"),
     HOT_BUFFER("hot-buffer"),
     WARM_CACHE("warm-cache"),
     COLD_START("cold-start");
@@ -41,7 +48,7 @@ enum MainIndexState
                 return state;
             }
         }
-        throw new IllegalArgumentException("--main-index-state must be hot-buffer, warm-cache, "
-                + "or cold-start: " + value);
+        throw new IllegalArgumentException("--main-index-state must be natural, hot-buffer, "
+                + "warm-cache, or cold-start: " + value);
     }
 }

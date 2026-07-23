@@ -15,23 +15,26 @@ WARMUP_SECONDS=30
 WARMUP_OPERATIONS=100000
 DURATION_SECONDS=60
 DATA_SIZE=10000000
-MAIN_INDEX_STATE="warm-cache"
+MAIN_INDEX_STATE="natural"
 SMOKE=false
 DRY_RUN=false
 KEEP_WORK_DIRS=false
 ONLY_SCALE=""
 
-TABLES=(customer company savingAccount checkingAccount transfer checking loanApps loanTrans)
+# Representative small / medium / large tables for formal Index.
+TABLES=(company customer transfer)
 
 usage()
 {
     cat <<'EOF'
 Usage: bin/run-hybench-index-formal-suite --snapshot-root DIR [options]
 
-Runs Put, Update, and Delete on all eight HyBench primary-index tables for
-sf1, sf10, and sf100 packages. Each package must be a directory containing
-snapshot.json and state/index/{rocksdb,sqlite}. No secondary-index test is
-included because the HyBench Index-only profile contains primary indexes only.
+Runs Put, Update, and Delete on three representative HyBench primary-index
+tables (company, customer, transfer) for sf1, sf10, and sf100 packages. Each
+package must be a directory containing snapshot.json and state/index/{rocksdb,
+sqlite}. MainIndex defaults to natural (no fixture warm). No secondary-index
+test is included because the HyBench Index-only profile contains primary
+indexes only.
 
 Options:
   --snapshot-root DIR             Parent containing sf1/, sf10/, sf100/

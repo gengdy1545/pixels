@@ -192,7 +192,7 @@ public final class RetinaBenchmarkMain
         System.out.println("  --fail-fast true|false  stop after the first failed group (default: false)");
         System.out.println("  --rpc-deadline-ms N     per-call Begin/Commit gRPC deadline (default: 30000)");
         System.out.println("  --snapshot-dir DIR      restore Index/Visibility/WriteBuffer input from a validated snapshot");
-        System.out.println("  --snapshot-table NAME   target table");
+        System.out.println("  --snapshot-table NAME   target table (visibility: all|* for every table)");
         System.out.println("  --index-state-dir DIR   prepared Index state input/output (rocksdb/ and sqlite/ below DIR)");
         System.out.println("  --snapshot-secondary-index ID|NAME  target secondary index for secondary commands");
         System.out.println("  --snapshot-require LIST validation profiles: index, visibility, write-buffer");

@@ -13,7 +13,9 @@ package io.pixelsdb.pixels.retina.benchmark.snapshot;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.serializer.SerializerFeature;
 import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -25,12 +27,15 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Formatter;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /** Reads, writes and validates the versioned Retina benchmark snapshot. */
 public final class SnapshotIO
@@ -139,6 +144,13 @@ public final class SnapshotIO
         }
     }
 
+    /**
+     * Copy a snapshot state directory tree.
+     *
+     * <p>Uses system {@code cp -a} for a full byte copy of RocksDB/SQLite state.
+     * Falls back to a pure Java walk only when {@code cp} is unavailable or
+     * fails.</p>
+     */
     public static void copyDirectory(Path source, Path target) throws IOException
     {
         source = source.toAbsolutePath().normalize();
@@ -152,6 +164,92 @@ public final class SnapshotIO
             throw new IOException("snapshot copy source and target must not contain each other: "
                     + source + " -> " + target);
         }
+        Path parent = target.getParent();
+        if (parent != null)
+        {
+            Files.createDirectories(parent);
+        }
+        if (Files.exists(target))
+        {
+            deleteDirectory(target);
+        }
+
+        long startedNs = System.nanoTime();
+        String mode;
+        if (trySystemCp(source, target))
+        {
+            mode = "cp";
+        }
+        else
+        {
+            copyDirectoryJava(source, target);
+            mode = "java-files-copy";
+        }
+        double seconds = (System.nanoTime() - startedNs) / 1_000_000_000.0d;
+        System.out.println("snapshot_state_copy_mode=" + mode);
+        System.out.println("snapshot_state_copy_source=" + source);
+        System.out.println("snapshot_state_copy_target=" + target);
+        System.out.printf(Locale.ROOT, "snapshot_state_copy_seconds=%.3f%n", seconds);
+    }
+
+    private static boolean trySystemCp(Path source, Path target)
+    {
+        if (Files.exists(target))
+        {
+            try
+            {
+                deleteDirectory(target);
+            }
+            catch (IOException ignored)
+            {
+                return false;
+            }
+        }
+        List<String> command = new ArrayList<>(4);
+        command.add("cp");
+        command.add("-a");
+        command.add(source.toString());
+        command.add(target.toString());
+        ProcessBuilder builder = new ProcessBuilder(command);
+        builder.redirectErrorStream(true);
+        try
+        {
+            Process process = builder.start();
+            try (InputStream in = process.getInputStream())
+            {
+                in.transferTo(new ByteArrayOutputStream());
+            }
+            boolean finished = process.waitFor(2, TimeUnit.HOURS);
+            if (!finished)
+            {
+                process.destroyForcibly();
+                return false;
+            }
+            return process.exitValue() == 0 && Files.isDirectory(target);
+        }
+        catch (IOException | InterruptedException e)
+        {
+            if (e instanceof InterruptedException)
+            {
+                Thread.currentThread().interrupt();
+            }
+            try
+            {
+                if (Files.exists(target))
+                {
+                    deleteDirectory(target);
+                }
+            }
+            catch (IOException ignored)
+            {
+                // best-effort cleanup before falling back
+            }
+            return false;
+        }
+    }
+
+    private static void copyDirectoryJava(Path source, Path target) throws IOException
+    {
         final Path sourceRoot = source;
         final Path targetRoot = target;
         Files.walkFileTree(source, new SimpleFileVisitor<Path>()
@@ -172,6 +270,34 @@ public final class SnapshotIO
                 }
                 Files.copy(file, targetRoot.resolve(sourceRoot.relativize(file)),
                         StandardCopyOption.COPY_ATTRIBUTES, StandardCopyOption.REPLACE_EXISTING);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    private static void deleteDirectory(Path root) throws IOException
+    {
+        if (!Files.exists(root))
+        {
+            return;
+        }
+        Files.walkFileTree(root, new SimpleFileVisitor<Path>()
+        {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException
+            {
+                Files.delete(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException
+            {
+                if (exc != null)
+                {
+                    throw exc;
+                }
+                Files.delete(dir);
                 return FileVisitResult.CONTINUE;
             }
         });

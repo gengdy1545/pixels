@@ -130,10 +130,10 @@ write_bootstrap_info()
     log "wrote ${output}"
 }
 
-log "starting bootstrap for ${BUNDLE_ROOT}"
 require_command java
 require_command aws
 ensure_directories
+log "starting bootstrap for ${BUNDLE_ROOT}"
 validate_pixels_config
 BUNDLE_ROOT="${BUNDLE_ROOT}" "${SCRIPT_DIR}/install-mysql.sh"
 sync_snapshot

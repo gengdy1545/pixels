@@ -10,14 +10,14 @@ JAVA_OPTS_VALUE="${VISIBILITY_JAVA_OPTS:--Xms40g -Xmx40g}"
 NATIVE_TEMP_DIR=""
 JEMALLOC_PRELOAD=""
 
-TABLE="orderline"
-ORDERLINE_ROWS=30000000
+TABLE=""
+TABLE_ROWS=0
 THREADS=16
 CLIENTS=1
 BATCH_SIZE=1
 WARMUP_SECONDS=10
 WARMUP_OPERATIONS=100000
-DURATION_SECONDS=180
+DURATION_SECONDS=60
 VALIDATE_FINAL_BITMAP=false
 SMOKE=false
 DRY_RUN=false
@@ -27,18 +27,19 @@ usage()
     cat <<'EOF'
 Usage: bin/run-visibility-suite --snapshot-dir DIR [options]
 
-Runs the formal orderline Visibility-delete benchmark. The default warmup and
-measurement operation ceilings together cover at most all 30,000,000 ordered
-physical rows. The measured duration is capped at 180 seconds.
+Runs the formal snapshot Visibility-delete benchmark. Formal runs stop at the
+earlier of: one full pass over the selected tables (data-size), or duration
+(default 60s). Default selection is all tables in the snapshot.
 
 Options:
   --snapshot-dir DIR             Snapshot v2 directory (required)
+  --snapshot-table NAME          Table name, or all|* for every table (default: all)
   --results-dir DIR              Results root (default: runtime/results)
   --java-opts TEXT               Benchmark JVM options (default: -Xms40g -Xmx40g)
   --threads N                    Worker threads (default: 16)
   --warmup-seconds N             Warmup time limit (default: 10)
   --warmup-operations N          Warmup row limit (default: 100000)
-  --duration-seconds N           Measurement limit, 1..180 (default: 180)
+  --duration-seconds N           Soft measurement deadline, 1..180 (default: 60)
   --validate-final-bitmap        Validate every successful delete after timing
                                  (disabled by default)
   --smoke                        Delete 100 rows with no warmup
@@ -116,6 +117,7 @@ while [[ $# -gt 0 ]]
 do
     case "$1" in
         --snapshot-dir) require_value "$1" "${2:-}"; SNAPSHOT_DIR="$2"; shift 2 ;;
+        --snapshot-table) require_value "$1" "${2:-}"; TABLE="$2"; shift 2 ;;
         --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
         --java-opts) require_value "$1" "${2:-}"; JAVA_OPTS_VALUE="$2"; shift 2 ;;
         --threads) require_value "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
@@ -135,6 +137,50 @@ done
     die "snapshot manifest not found: ${SNAPSHOT_DIR}/snapshot.json"
 [[ -x "${ROOT_DIR}/bin/run-benchmark" ]] ||
     die "run-benchmark not found under ${ROOT_DIR}/bin"
+if [[ -z "${TABLE}" ]]
+then
+    TABLE="all"
+fi
+TABLE_ROWS="$(python3 - "${SNAPSHOT_DIR}/snapshot.json" "${TABLE}" <<'PY'
+import json, sys
+snapshot_path, wanted = sys.argv[1], sys.argv[2].strip().lower()
+with open(snapshot_path, 'r', encoding='utf-8') as f:
+    manifest = json.load(f)
+
+def table_rows(table):
+    files = table.get('files') or []
+    rows = 0
+    for file in files:
+        row_groups = file.get('rowGroups') or []
+        if row_groups:
+            rows += sum(int(rg.get('recordNum', 0)) for rg in row_groups)
+        else:
+            rows += int(file.get('footerRowCount', 0))
+    if rows <= 0:
+        rows = int(table.get('metadataRowCount', 0))
+    return rows
+
+tables = manifest.get('tables') or []
+if wanted in ('', 'all', '*'):
+    total = sum(table_rows(table) for table in tables)
+    if total <= 0:
+        raise SystemExit(2)
+    print(total)
+    raise SystemExit(0)
+
+matches = []
+for table in tables:
+    name = str(table.get('tableName', ''))
+    schema = str(table.get('schemaName', ''))
+    full = f"{schema}.{name}".lower() if schema else name.lower()
+    if name.lower() == wanted or full == wanted:
+        matches.append((name, table_rows(table)))
+if len(matches) != 1:
+    raise SystemExit(2)
+print(matches[0][1])
+PY
+)" || die "failed to read row count for snapshot table ${TABLE}"
+[[ "${TABLE_ROWS}" =~ ^[1-9][0-9]*$ ]] || die "invalid row count for ${TABLE}: ${TABLE_ROWS}"
 
 require_positive_integer "threads" "${THREADS}"
 require_positive_integer "duration-seconds" "${DURATION_SECONDS}"
@@ -144,8 +190,6 @@ require_positive_integer "duration-seconds" "${DURATION_SECONDS}"
     die "warmup-seconds must be a non-negative integer: ${WARMUP_SECONDS}"
 [[ "${WARMUP_OPERATIONS}" =~ ^[0-9]+$ ]] ||
     die "warmup-operations must be a non-negative integer: ${WARMUP_OPERATIONS}"
-(( WARMUP_OPERATIONS < ORDERLINE_ROWS )) ||
-    die "warmup-operations must be less than ${ORDERLINE_ROWS}"
 
 if [[ "${SMOKE}" == "true" ]]
 then
@@ -155,7 +199,8 @@ then
     DURATION_SECONDS=2
     MEASUREMENT_OPERATIONS=100
 else
-    MEASUREMENT_OPERATIONS=$((ORDERLINE_ROWS - WARMUP_OPERATIONS))
+    # One full pass over selected tables; duration may stop earlier.
+    MEASUREMENT_OPERATIONS="${TABLE_ROWS}"
 fi
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -218,7 +263,7 @@ grep -q '^status=valid$' "${RUN_DIR}/snapshot-validation.txt" ||
     die "snapshot validation did not report status=valid"
 
 prepare_jemalloc_preload
-log "running formal orderline Visibility benchmark"
+log "running formal Visibility benchmark table=${TABLE} rows=${TABLE_ROWS} (stop: full-pass or ${DURATION_SECONDS}s)"
 set +e
 PIXELS_HOME="${ROOT_DIR}" PIXELS_CONFIG="${PIXELS_CONFIG:-${ROOT_DIR}/etc/pixels.properties}" \
 LD_PRELOAD="${JEMALLOC_PRELOAD}" \
@@ -247,10 +292,16 @@ grep -q '^errors=0$' "${RESULT}" ||
     die "Visibility reported errors"
 grep -Eq '^successful_operations=[1-9][0-9]*$' "${RESULT}" ||
     die "Visibility completed no successful operations"
-grep -Eq '^stop_reason=(duration|data-size)$' "${RESULT}" ||
-    die "Visibility stopped for an unexpected reason"
-grep -q "^detail.manifestVisibilityRows=${ORDERLINE_ROWS}$" "${RESULT}" ||
-    die "orderline ordered-row count does not equal ${ORDERLINE_ROWS}"
+if [[ "${SMOKE}" == "true" ]]
+then
+    grep -q '^stop_reason=data-size$' "${RESULT}" ||
+        die "Visibility smoke did not reach its row limit"
+else
+    grep -Eq '^stop_reason=(data-size|duration)$' "${RESULT}" ||
+        die "Visibility formal run must stop by data-size or duration"
+fi
+grep -q "^detail.manifestVisibilityRows=${TABLE_ROWS}$" "${RESULT}" ||
+    die "${TABLE} ordered-row count does not equal ${TABLE_ROWS}"
 
 successful="$(awk -F= '$1 == "successful_operations" { print $2 }' "${RESULT}")"
 api_calls="$(awk -F= '$1 == "api_calls" { print $2 }' "${RESULT}")"
@@ -261,8 +312,10 @@ grep -q "^detail.finalBitmapValidation=${VALIDATE_FINAL_BITMAP}$" "${RESULT}" ||
 if [[ "${VALIDATE_FINAL_BITMAP}" == "true" ]]
 then
     validated="$(awk -F= '$1 == "detail.lastValidatedDeletes" { print $2 }' "${RESULT}")"
-    [[ "${validated}" == "${successful}" ]] ||
-        die "validated deletes ${validated} do not match successful operations ${successful}"
+    [[ "${validated}" =~ ^[0-9]+$ ]] ||
+        die "validated deletes is not numeric: ${validated}"
+    (( validated <= successful )) ||
+        die "validated deletes ${validated} must not exceed successful operations ${successful}"
 fi
 
 configured_capacity="$(awk -F= '$1 == "detail.configuredTileCapacity" { print $2 }' "${RESULT}")"

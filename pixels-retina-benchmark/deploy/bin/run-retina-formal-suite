@@ -32,6 +32,8 @@ SMOKE=false
 DRY_RUN=false
 SKIP_BOOTSTRAP=false
 SKIP_UPLOAD=false
+SKIP_INDEX=false
+HYBENCH_INDEX_SNAPSHOT_ROOT=""
 
 RUN_ID=""
 FORMAL_RESULTS=""
@@ -51,6 +53,9 @@ Runs the formal Retina benchmark matrix sequentially:
 Options:
   --smoke                        Run smoke-sized parameters in every module
   --dry-run                      Print the resolved plan without running benchmarks
+  --skip-index                   Skip Index stage (run other modules only)
+  --hybench-index-snapshot-root DIR
+                                 Use HyBench sf1/sf10/sf100 Index suite root
   --skip-bootstrap               Do not invoke install/bootstrap.sh
   --skip-upload                  Keep results local; do not sync to RESULTS_S3_ROOT
   --results-dir DIR              Override RESULTS_ROOT parent for this run
@@ -84,6 +89,9 @@ do
     case "$1" in
         --smoke) SMOKE=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --skip-index) SKIP_INDEX=true; shift ;;
+        --hybench-index-snapshot-root)
+            require_value "$1" "${2:-}"; HYBENCH_INDEX_SNAPSHOT_ROOT="$2"; shift 2 ;;
         --skip-bootstrap) SKIP_BOOTSTRAP=true; shift ;;
         --skip-upload) SKIP_UPLOAD=true; shift ;;
         --results-dir) require_value "$1" "${2:-}"; RESULTS_ROOT="$2"; shift 2 ;;
@@ -95,8 +103,6 @@ do
     esac
 done
 
-[[ -x "${ROOT_DIR}/bin/run-index-formal-suite" ]] ||
-    die "run-index-formal-suite not found under ${ROOT_DIR}/bin"
 [[ -x "${ROOT_DIR}/bin/run-visibility-suite" ]] ||
     die "run-visibility-suite not found under ${ROOT_DIR}/bin"
 [[ -x "${ROOT_DIR}/bin/run-transaction-suite" ]] ||
@@ -106,6 +112,19 @@ done
 [[ -f "${PIXELS_CONFIG}" ]] || die "pixels.properties not found: ${PIXELS_CONFIG}"
 [[ -x "${ETCD_BIN}" ]] || die "etcd binary not found: ${ETCD_BIN}"
 [[ -x "${ETCDCTL_BIN}" ]] || die "etcdctl binary not found: ${ETCDCTL_BIN}"
+if [[ "${SKIP_INDEX}" == "false" ]]
+then
+    if [[ -n "${HYBENCH_INDEX_SNAPSHOT_ROOT}" ]]
+    then
+        [[ -x "${ROOT_DIR}/bin/run-hybench-index-formal-suite" ]] ||
+            die "run-hybench-index-formal-suite not found under ${ROOT_DIR}/bin"
+        [[ -d "${HYBENCH_INDEX_SNAPSHOT_ROOT}" ]] ||
+            die "hybench index snapshot root not found: ${HYBENCH_INDEX_SNAPSHOT_ROOT}"
+    else
+        [[ -x "${ROOT_DIR}/bin/run-index-formal-suite" ]] ||
+            die "run-index-formal-suite not found under ${ROOT_DIR}/bin"
+    fi
+fi
 
 RUN_ID="formal-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 FORMAL_RESULTS="${RESULTS_ROOT%/}/${RUN_ID}"
@@ -276,25 +295,32 @@ then
     printf 'bundle_root=%s\n' "${BUNDLE_ROOT}"
     printf 'runtime_dir=%s\n' "${ROOT_DIR}"
     printf 'snapshot_dir=%s\n' "${SNAPSHOT_DIR}"
+    printf 'hybench_index_snapshot_root=%s\n' "${HYBENCH_INDEX_SNAPSHOT_ROOT:-none}"
     printf 'results_dir=%s\n' "${FORMAL_RESULTS}"
     printf 'results_s3_uri=%s\n' "${RESULTS_S3_URI}"
     printf 's3_root=%s\n' "${S3_ROOT}"
     printf 'etcd_bin=%s\n' "${ETCD_BIN}"
     printf 'java_opts=%s\n' "${FORMAL_JAVA_OPTS}"
-    printf 'smoke=%s skip_bootstrap=%s skip_upload=%s\n' \
-        "${SMOKE}" "${SKIP_BOOTSTRAP}" "${SKIP_UPLOAD}"
+    printf 'smoke=%s skip_bootstrap=%s skip_upload=%s skip_index=%s\n' \
+        "${SMOKE}" "${SKIP_BOOTSTRAP}" "${SKIP_UPLOAD}" "${SKIP_INDEX}"
     trap - EXIT
     exit 0
 fi
 
 STARTED_AT="$(date -u --iso-8601=seconds)"
-mkdir -p "${FORMAL_RESULTS}"/{index,visibility,transaction,write-buffer}
+if [[ "${SKIP_INDEX}" == "true" ]]
+then
+    mkdir -p "${FORMAL_RESULTS}"/{visibility,transaction,write-buffer}
+else
+    mkdir -p "${FORMAL_RESULTS}"/{index,visibility,transaction,write-buffer}
+fi
 
 {
     printf 'run_id=%q\n' "${RUN_ID}"
     printf 'bundle_root=%q\n' "${BUNDLE_ROOT}"
     printf 'runtime_dir=%q\n' "${ROOT_DIR}"
     printf 'snapshot_dir=%q\n' "${SNAPSHOT_DIR}"
+    printf 'hybench_index_snapshot_root=%q\n' "${HYBENCH_INDEX_SNAPSHOT_ROOT}"
     printf 'results_dir=%q\n' "${FORMAL_RESULTS}"
     printf 'results_s3_uri=%q\n' "${RESULTS_S3_URI}"
     printf 's3_root=%q\n' "${S3_ROOT}"
@@ -302,6 +328,7 @@ mkdir -p "${FORMAL_RESULTS}"/{index,visibility,transaction,write-buffer}
     printf 'state_root=%q\n' "${STATE_ROOT}"
     printf 'java_opts=%q\n' "${FORMAL_JAVA_OPTS}"
     printf 'smoke=%q\n' "${SMOKE}"
+    printf 'skip_index=%q\n' "${SKIP_INDEX}"
 } > "${FORMAL_RESULTS}/parameters.env"
 
 if [[ "${SKIP_BOOTSTRAP}" == "false" && -x "${BUNDLE_ROOT}/install/bootstrap.sh" ]]
@@ -329,15 +356,31 @@ then
     smoke_flags=(--smoke)
 fi
 
-run_stage index env "${common_env[@]}" \
-    INDEX_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \
-    "${ROOT_DIR}/bin/run-index-formal-suite" \
-        --snapshot-dir "${SNAPSHOT_DIR}" \
-        --results-dir "${FORMAL_RESULTS}/index" \
-        --work-dir-root "${WORK_ROOT}/index" \
-        --config "${PIXELS_CONFIG}" \
-        --java-opts "${FORMAL_JAVA_OPTS}" \
-        "${smoke_flags[@]}"
+if [[ "${SKIP_INDEX}" == "true" ]]
+then
+    log "skipping index stage (--skip-index)"
+elif [[ -n "${HYBENCH_INDEX_SNAPSHOT_ROOT}" ]]
+then
+    run_stage index env "${common_env[@]}" \
+        INDEX_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \
+        "${ROOT_DIR}/bin/run-hybench-index-formal-suite" \
+            --snapshot-root "${HYBENCH_INDEX_SNAPSHOT_ROOT}" \
+            --results-dir "${FORMAL_RESULTS}/index" \
+            --work-dir-root "${WORK_ROOT}/hybench-index" \
+            --config "${PIXELS_CONFIG}" \
+            --java-opts "${FORMAL_JAVA_OPTS}" \
+            "${smoke_flags[@]}"
+else
+    run_stage index env "${common_env[@]}" \
+        INDEX_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \
+        "${ROOT_DIR}/bin/run-index-formal-suite" \
+            --snapshot-dir "${SNAPSHOT_DIR}" \
+            --results-dir "${FORMAL_RESULTS}/index" \
+            --work-dir-root "${WORK_ROOT}/index" \
+            --config "${PIXELS_CONFIG}" \
+            --java-opts "${FORMAL_JAVA_OPTS}" \
+            "${smoke_flags[@]}"
+fi
 
 run_stage visibility env "${common_env[@]}" \
     VISIBILITY_JAVA_OPTS="${FORMAL_JAVA_OPTS}" \

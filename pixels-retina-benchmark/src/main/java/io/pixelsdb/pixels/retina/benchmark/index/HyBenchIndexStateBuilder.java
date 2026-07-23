@@ -455,7 +455,17 @@ public final class HyBenchIndexStateBuilder
         manifest.createdAtUtc = Instant.now().toString();
         manifest.sourceHost = "hybench-index-only";
         manifest.sourceVnodeIds = new ArrayList<>(source.sourceVnodeIds);
-        manifest.sourceIndexBucketIds = new ArrayList<>(source.sourceIndexBucketIds);
+        /*
+         * Only advertise buckets that IndexUtils hashing can produce for this package.
+         * Copying the parent snapshot's wider sourceIndexBucketIds list would make
+         * consumers open empty buckets and/or rewrite index.bucket.num incorrectly.
+         */
+        int bucketCount = semanticInt(source, "index.bucket.num");
+        manifest.sourceIndexBucketIds = new ArrayList<>(bucketCount);
+        for (int bucket = 0; bucket < bucketCount; bucket++)
+        {
+            manifest.sourceIndexBucketIds.add(bucket);
+        }
         manifest.sourceQuiesced = true;
         manifest.consistencyNote = "HyBench real primary keys; Pixels payload files intentionally omitted; "
                 + "row locations follow the configured pixel.stride and explicit rows-per-file layout.";

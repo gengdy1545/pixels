@@ -79,12 +79,18 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
     private IndexService indexService;
     private IndexOption[] indexOptions;
     private int[] usableBuckets;
+    private int configuredBucketCount;
     private int bucketCount;
     private int rowsPerRowGroup;
     private long snapshotTimestamp;
     private SyntheticRowLayout rowLayout;
     private MainIndexState mainIndexState;
     private int syntheticKeyBytes;
+    private ExistingPrimaryKeyPool existingKeyPool;
+    private boolean useExistingSnapshotKeys;
+    private long effectiveWarmupOperations;
+    private long effectiveMeasurementOperations;
+    private long snapshotRowCount;
 
     public PhysicalIndexBenchmarkScenario(IndexOperation operation)
     {
@@ -110,7 +116,7 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
         }
         this.config = benchmarkConfig;
         this.mainIndexState = MainIndexState.parse(
-                benchmarkConfig.get("main-index-state", MainIndexState.WARM_CACHE.optionValue()));
+                benchmarkConfig.get("main-index-state", MainIndexState.NATURAL.optionValue()));
         /* Both options are deliberately required for every physical Index command. */
         benchmarkConfig.require("snapshot-dir");
         String requestedTable = benchmarkConfig.require("snapshot-table");
@@ -128,7 +134,13 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
         runtime.prepareIndexState(table);
         registerSnapshotIndexKeyLengths();
 
-        this.bucketCount = positiveConfig("index.bucket.num");
+        this.configuredBucketCount = positiveConfig("index.bucket.num");
+        /*
+         * Keep IndexUtils hashing on semanticConfig index.bucket.num. HyBench packages
+         * may copy a parent sourceIndexBucketIds list that is wider than the hash space
+         * used when keys were written; rewriting bucket.num would make lookups miss.
+         */
+        this.bucketCount = configuredBucketCount;
         this.usableBuckets = usableBuckets();
         this.indexOptions = new IndexOption[bucketCount];
         for (int bucket = 0; bucket < bucketCount; bucket++)
@@ -158,6 +170,30 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
             throw new IllegalStateException("physical index benchmark requires SQLite MainIndex");
         }
         this.indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.local);
+
+        this.snapshotRowCount = snapshotOrderedRowCount(table);
+        this.useExistingSnapshotKeys = mainIndexState == MainIndexState.NATURAL
+                && operation.isPrimary()
+                && operation.requiresExistingKey()
+                && primaryIndex.canonicalKeyBytes == Integer.BYTES;
+        this.effectiveWarmupOperations = benchmarkConfig.warmupOperations();
+        this.effectiveMeasurementOperations = benchmarkConfig.dataSize();
+        if (useExistingSnapshotKeys)
+        {
+            prepareExistingSnapshotKeyPool();
+        }
+    }
+
+    @Override
+    public long warmupOperations(BenchmarkConfig ignored)
+    {
+        return effectiveWarmupOperations;
+    }
+
+    @Override
+    public long measurementOperations(BenchmarkConfig ignored)
+    {
+        return effectiveMeasurementOperations;
     }
 
     @Override
@@ -165,7 +201,7 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
     {
         ensureReady();
         long expected = phase == BenchmarkPhase.WARMUP
-                ? config.warmupOperations() : config.dataSize();
+                ? effectiveWarmupOperations : effectiveMeasurementOperations;
         if (totalOperations != expected)
         {
             throw new IllegalArgumentException("unexpected " + phase + " operation count: "
@@ -177,7 +213,9 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
     public void completePreparation(BenchmarkPhase phase) throws Exception
     {
         ensureReady();
-        if (!usesTimedMainIndexFixture() || mainIndexState == MainIndexState.HOT_BUFFER)
+        if (!usesTimedMainIndexFixture()
+                || mainIndexState == MainIndexState.HOT_BUFFER
+                || mainIndexState == MainIndexState.NATURAL)
         {
             return;
         }
@@ -258,15 +296,38 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
         details.put("mainIndex", "restored SQLite working copy");
         details.put("mainIndexState", mainIndexState == null ? "not-initialized"
                 : mainIndexState.optionValue());
-        details.put("effectiveMainIndexState", usesTimedMainIndexFixture()
-                ? mainIndexState.optionValue() : "not-applicable");
-        details.put("syntheticRowIdLayout", "contiguous old/new domains; disjoint warmup/measurement");
+        details.put("effectiveMainIndexState", operation.isPrimary() && operation.requiresExistingKey()
+                ? (mainIndexState == null ? "not-initialized" : mainIndexState.optionValue())
+                : "not-applicable");
+        details.put("keySource", useExistingSnapshotKeys
+                ? "snapshot-existing-hybench-int-keys"
+                : "synthetic-absent-keys");
+        details.put("snapshotRowCount", Long.toString(snapshotRowCount));
+        if (existingKeyPool != null)
+        {
+            details.put("existingKeyRange",
+                    "[" + existingKeyPool.firstKey() + "," + existingKeyPool.lastKey() + "]");
+            details.put("existingKeyPoolSize", Long.toString(existingKeyPool.totalKeys()));
+        }
+        else
+        {
+            details.put("existingKeyRange", "n/a");
+            details.put("existingKeyPoolSize", "0");
+        }
+        details.put("effectiveWarmupOperations", Long.toString(effectiveWarmupOperations));
+        details.put("effectiveMeasurementOperations", Long.toString(effectiveMeasurementOperations));
+        details.put("syntheticRowIdLayout", useExistingSnapshotKeys
+                ? "new domains only for update targets; existing snapshot keys for lookups"
+                : "contiguous old/new domains; disjoint warmup/measurement");
         details.put("syntheticRowLocationLayout", "distinct old/new and warmup/measurement file IDs");
         details.put("persistedFixtureRanges", Long.toString(persistedFixtureRanges.get()));
         details.put("warmedFixtureRanges", Long.toString(warmedFixtureRanges.get()));
         details.put("workingCopy", runtime == null ? "not-initialized"
                 : runtime.workDirectory().toString());
+        details.put("configuredBucketCount", Integer.toString(configuredBucketCount));
         details.put("bucketCount", Integer.toString(bucketCount));
+        details.put("bucketCountAdjustedBySourceState",
+                Boolean.toString(bucketCount != configuredBucketCount));
         details.put("usableBuckets", bucketList());
         details.put("bucketFunction", "IndexUtils.getBucketIdFromByteBuffer (SHA-256)");
         details.put("batching", "one same-bucket LocalIndexService batch API call per execute group");
@@ -481,27 +542,37 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
     {
         if (manifest.sourceIndexBucketIds == null || manifest.sourceIndexBucketIds.isEmpty())
         {
-            int[] all = new int[bucketCount];
-            for (int i = 0; i < all.length; i++)
-            {
-                all[i] = i;
-            }
-            return all;
+            return configuredBucketRange();
         }
-        List<Integer> buckets = new ArrayList<>(manifest.sourceIndexBucketIds);
+        List<Integer> buckets = new ArrayList<>();
+        for (int bucket : manifest.sourceIndexBucketIds)
+        {
+            if (bucket >= 0 && bucket < configuredBucketCount && !buckets.contains(bucket))
+            {
+                buckets.add(bucket);
+            }
+        }
         Collections.sort(buckets);
+        if (buckets.isEmpty())
+        {
+            return configuredBucketRange();
+        }
         int[] result = new int[buckets.size()];
         for (int i = 0; i < buckets.size(); i++)
         {
-            int bucket = buckets.get(i);
-            if (bucket < 0 || bucket >= bucketCount)
-            {
-                throw new IllegalArgumentException("snapshot source Index bucket " + bucket
-                        + " is outside index.bucket.num=" + bucketCount);
-            }
-            result[i] = bucket;
+            result[i] = buckets.get(i);
         }
         return result;
+    }
+
+    private int[] configuredBucketRange()
+    {
+        int[] all = new int[configuredBucketCount];
+        for (int i = 0; i < all.length; i++)
+        {
+            all[i] = i;
+        }
+        return all;
     }
 
     private long maximumFileId()
@@ -607,7 +678,9 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
                 : variableSyntheticKeyBytes(index);
         for (int salt = 0; salt < MAX_KEY_ATTEMPTS; salt++)
         {
-            ByteString candidate = syntheticKey(length, index.indexId, identity, salt);
+            ByteString candidate = length == Integer.BYTES
+                    ? hybenchCompatibleAbsentIntKey(index.indexId, identity, salt)
+                    : syntheticKey(length, index.indexId, identity, salt);
             if (IndexUtils.getBucketIdFromByteBuffer(candidate) != bucket || !reserved.add(candidate))
             {
                 continue;
@@ -623,6 +696,69 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
         }
         throw new IllegalArgumentException("unable to synthesize a unique absent "
                 + length + "-byte key in bucket " + bucket + " for index " + index.indexId);
+    }
+
+    private ByteString hybenchCompatibleAbsentIntKey(long indexId, long identity, int salt)
+    {
+        // Stay in the same 4-byte int encoding space as HyBench CSV primary keys.
+        long[] range = hybenchPrimaryKeyRange();
+        long base = range[1] + 1L;
+        long mixed = mix64(identity ^ Long.rotateLeft(indexId, 17)
+                ^ ((long) salt * 0x9e3779b97f4a7c15L));
+        long value = base + Math.floorMod(mixed, Integer.MAX_VALUE - 1L);
+        if (value > Integer.MAX_VALUE)
+        {
+            value = Integer.MAX_VALUE - Math.floorMod(mixed, 1_000_000L);
+        }
+        return ExistingPrimaryKeyPool.intKey((int) value);
+    }
+
+    /**
+     * Closed HyBench primary-key interval for the selected table.
+     * Most tables use {@code [1, rowCount]}; company continues after customer.
+     */
+    private long[] hybenchPrimaryKeyRange()
+    {
+        if (snapshotRowCount <= 0)
+        {
+            throw new IllegalArgumentException("snapshot table has no ordered rows: " + table.tableName);
+        }
+        if (!"company".equalsIgnoreCase(table.tableName))
+        {
+            return new long[] {1L, snapshotRowCount};
+        }
+        long customerRows = tableMetadataRowCount("customer");
+        if (customerRows <= 0 && snapshotRowCount % 2000L == 0L)
+        {
+            // HyBench SF formula: company = 2000 * SF, customer = 300000 * SF.
+            customerRows = 300000L * (snapshotRowCount / 2000L);
+        }
+        if (customerRows <= 0)
+        {
+            throw new IllegalStateException("cannot derive HyBench company key base; "
+                    + "customer metadataRowCount is missing and company rowCount="
+                    + snapshotRowCount + " is not a multiple of 2000");
+        }
+        long firstKey = customerRows + 1L;
+        long lastKey = Math.addExact(customerRows, snapshotRowCount);
+        return new long[] {firstKey, lastKey};
+    }
+
+    private long tableMetadataRowCount(String tableName)
+    {
+        if (manifest.tables == null)
+        {
+            return 0L;
+        }
+        for (SnapshotManifest.TableState candidate : manifest.tables)
+        {
+            if (candidate != null && tableName.equalsIgnoreCase(candidate.tableName))
+            {
+                long ordered = snapshotOrderedRowCount(candidate);
+                return ordered > 0 ? ordered : Math.max(0L, candidate.metadataRowCount);
+            }
+        }
+        return 0L;
     }
 
     private int variableSyntheticKeyBytes(SnapshotManifest.IndexState index)
@@ -716,13 +852,24 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
     }
 
     private PreparedInvocation prepareInvocation(BenchmarkPhase phase, long firstOperation,
-                                                 int count, int bucket) throws Exception
+                                                 int count, int bucket, int workerId,
+                                                 boolean prepareFixtures,
+                                                 boolean prepareTimedPayloads,
+                                                 ByteString[] preparedKeys,
+                                                 int keyOffset,
+                                                 boolean recordPreparedKeys) throws Exception
     {
         ensureIndexOpen(primaryIndex, bucket);
         ensureIndexOpen(targetIndex, bucket);
-        PreparedInvocation invocation = new PreparedInvocation(firstOperation, count, bucket);
-        List<IndexProto.PrimaryIndexEntry> primaryFixtures = new ArrayList<>();
-        List<IndexProto.SecondaryIndexEntry> secondaryFixtures = new ArrayList<>();
+        if (preparedKeys == null || keyOffset < 0 || keyOffset + count > preparedKeys.length)
+        {
+            throw new IllegalArgumentException("invalid prepared key window for invocation");
+        }
+        PreparedInvocation invocation = new PreparedInvocation(bucket);
+        List<IndexProto.PrimaryIndexEntry> primaryFixtures = prepareFixtures
+                ? new ArrayList<>() : null;
+        List<IndexProto.SecondaryIndexEntry> secondaryFixtures = prepareFixtures
+                ? new ArrayList<>() : null;
 
         for (int i = 0; i < count; i++)
         {
@@ -730,8 +877,32 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
             long global = globalOperation(phase, operationId);
             long fixtureTs = fixtureTimestamp(global);
             long timedTs = timedTimestamp(global);
-            ByteString targetKey = newAbsentKey(targetIndex, bucket,
-                    keyIdentity(global, 1), timedTs);
+            ByteString targetKey;
+            if (recordPreparedKeys)
+            {
+                if (useExistingSnapshotKeys)
+                {
+                    // Delete claims unique keys. Update samples a worker-exclusive stripe so
+                    // concurrent threads cannot race on the same primary key / MainIndex row id.
+                    targetKey = operation == IndexOperation.DELETE_PRIMARY
+                            ? existingKeyPool.claim(bucket)
+                            : existingKeyPool.sampleForWorker(bucket, workerId, config.threads());
+                }
+                else
+                {
+                    targetKey = newAbsentKey(targetIndex, bucket, keyIdentity(global, 1), timedTs);
+                }
+                preparedKeys[keyOffset + i] = targetKey;
+            }
+            else
+            {
+                targetKey = preparedKeys[keyOffset + i];
+                if (targetKey == null)
+                {
+                    throw new IllegalStateException("prepared Index key is missing at offset "
+                            + (keyOffset + i));
+                }
+            }
 
             if (operation.isPrimary())
             {
@@ -741,22 +912,28 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
                         phase, operationId, SyntheticRowLayout.Role.OLD);
                 if (operation.requiresExistingKey())
                 {
-                    primaryFixtures.add(primaryEntry(targetKey, fixtureTs, oldRowId, oldLocation));
-                    invocation.expectedPreviousLocations.add(oldLocation);
+                    if (prepareFixtures)
+                    {
+                        primaryFixtures.add(primaryEntry(targetKey, fixtureTs, oldRowId, oldLocation));
+                    }
+                    if (!useExistingSnapshotKeys)
+                    {
+                        invocation.expectedPreviousLocations.add(oldLocation);
+                    }
                 }
-                if (operation == IndexOperation.PUT_PRIMARY)
+                if (prepareTimedPayloads && operation == IndexOperation.PUT_PRIMARY)
                 {
                     invocation.primaryEntries.add(primaryEntry(targetKey, timedTs,
                             rowLayout.rowId(phase, operationId, SyntheticRowLayout.Role.NEW),
                             rowLayout.location(phase, operationId, SyntheticRowLayout.Role.NEW)));
                 }
-                else if (operation == IndexOperation.UPDATE_PRIMARY)
+                else if (prepareTimedPayloads && operation == IndexOperation.UPDATE_PRIMARY)
                 {
                     invocation.primaryEntries.add(primaryEntry(targetKey, timedTs,
                             rowLayout.rowId(phase, operationId, SyntheticRowLayout.Role.NEW),
                             rowLayout.location(phase, operationId, SyntheticRowLayout.Role.NEW)));
                 }
-                else
+                else if (prepareTimedPayloads)
                 {
                     invocation.keys.add(indexKey(primaryIndex, targetKey, timedTs));
                 }
@@ -770,34 +947,40 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
                         : oldRowId;
                 ByteString oldPrimaryKey = newAbsentKey(primaryIndex, bucket,
                         keyIdentity(global, 2), fixtureTs);
-                primaryFixtures.add(primaryEntry(oldPrimaryKey, fixtureTs,
-                        oldRowId, rowLayout.location(
-                                phase, operationId, SyntheticRowLayout.Role.OLD)));
-                if (newRowId != oldRowId)
+                if (prepareFixtures)
                 {
-                    ByteString newPrimaryKey = newAbsentKey(primaryIndex, bucket,
-                            keyIdentity(global, 3), timedTs);
-                    primaryFixtures.add(primaryEntry(newPrimaryKey, fixtureTs,
-                            newRowId, rowLayout.location(
-                                    phase, operationId, SyntheticRowLayout.Role.NEW)));
+                    primaryFixtures.add(primaryEntry(oldPrimaryKey, fixtureTs,
+                            oldRowId, rowLayout.location(
+                                    phase, operationId, SyntheticRowLayout.Role.OLD)));
+                    if (newRowId != oldRowId)
+                    {
+                        ByteString newPrimaryKey = newAbsentKey(primaryIndex, bucket,
+                                keyIdentity(global, 3), timedTs);
+                        primaryFixtures.add(primaryEntry(newPrimaryKey, fixtureTs,
+                                newRowId, rowLayout.location(
+                                        phase, operationId, SyntheticRowLayout.Role.NEW)));
+                    }
                 }
                 if (operation.requiresExistingKey())
                 {
-                    secondaryFixtures.add(secondaryEntry(targetKey, fixtureTs, oldRowId));
+                    if (prepareFixtures)
+                    {
+                        secondaryFixtures.add(secondaryEntry(targetKey, fixtureTs, oldRowId));
+                    }
                     invocation.expectedPreviousRowIds.add(oldRowId);
                 }
-                if (operation == IndexOperation.DELETE_SECONDARY)
+                if (prepareTimedPayloads && operation == IndexOperation.DELETE_SECONDARY)
                 {
                     invocation.keys.add(indexKey(targetIndex, targetKey, timedTs));
                 }
-                else
+                else if (prepareTimedPayloads)
                 {
                     invocation.secondaryEntries.add(secondaryEntry(targetKey, timedTs, newRowId));
                 }
             }
         }
 
-        if (!primaryFixtures.isEmpty())
+        if (prepareFixtures && !primaryFixtures.isEmpty())
         {
             boolean put = indexService.putPrimaryIndexEntries(table.tableId, primaryIndex.indexId,
                     primaryFixtures, indexOptions[bucket]);
@@ -806,7 +989,7 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
                 throw new IllegalStateException("failed to prepare primary fixture in bucket " + bucket);
             }
         }
-        if (!secondaryFixtures.isEmpty())
+        if (prepareFixtures && !secondaryFixtures.isEmpty())
         {
             boolean put = indexService.putSecondaryIndexEntries(table.tableId, targetIndex.indexId,
                     secondaryFixtures, indexOptions[bucket]);
@@ -820,13 +1003,15 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
 
     private void verifySample(PreparedInvocation invocation) throws Exception
     {
-        if (invocation.returnedLocations != null
+        if (!useExistingSnapshotKeys
+                && invocation.returnedLocations != null
                 && !invocation.expectedPreviousLocations.equals(invocation.returnedLocations))
         {
             throw new IllegalStateException("sampled previous RowLocation mismatch: expected="
                     + invocation.expectedPreviousLocations + ", actual=" + invocation.returnedLocations);
         }
-        if (invocation.returnedRowIds != null
+        if (!useExistingSnapshotKeys
+                && invocation.returnedRowIds != null
                 && !invocation.expectedPreviousRowIds.equals(invocation.returnedRowIds))
         {
             throw new IllegalStateException("sampled previous row-id mismatch: expected="
@@ -938,6 +1123,11 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
     {
         if (operation.isPrimary())
         {
+            if (useExistingSnapshotKeys)
+            {
+                return "existing HyBench snapshot primary keys; MainIndex "
+                        + mainIndexState.optionValue() + " (no fixture prefill/warm)";
+            }
             return operation.requiresExistingKey()
                     ? "real putPrimaryIndexEntries prefill outside timing; MainIndex "
                     + mainIndexState.optionValue()
@@ -950,7 +1140,240 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
 
     private boolean usesTimedMainIndexFixture()
     {
-        return operation.isPrimary() && operation.requiresExistingKey();
+        return operation.isPrimary()
+                && operation.requiresExistingKey()
+                && mainIndexState != MainIndexState.NATURAL;
+    }
+
+    private void prepareExistingSnapshotKeyPool() throws Exception
+    {
+        if (snapshotRowCount <= 0)
+        {
+            throw new IllegalArgumentException("snapshot table has no ordered rows for existing-key mode: "
+                    + table.tableName);
+        }
+        boolean uniqueDelete = operation == IndexOperation.DELETE_PRIMARY;
+        long requested = Math.addExact(config.warmupOperations(), config.dataSize());
+        long[] keyRange = hybenchPrimaryKeyRange();
+        long keySpaceSize = keyRange[1] - keyRange[0] + 1L;
+        long keysNeeded = uniqueDelete
+                ? requested
+                : Math.min(requested, Math.max(100_000L, Math.min(keySpaceSize, 1_000_000L)));
+        this.existingKeyPool = ExistingPrimaryKeyPool.build(
+                keyRange[0], keyRange[1], usableBuckets, bucketCount, keysNeeded);
+
+        if (operation == IndexOperation.UPDATE_PRIMARY)
+        {
+            validateNaturalUpdateKeyStripes(keyRange);
+        }
+
+        if (uniqueDelete)
+        {
+            long available = maxNaturalDeleteBudget();
+            if (available <= 0)
+            {
+                throw new IllegalStateException("existing key pool cannot schedule any natural delete; table="
+                        + table.tableName + " totalKeys=" + existingKeyPool.totalKeys()
+                        + " threads=" + config.threads() + " batchSize=" + config.batchSize());
+            }
+            long warmup = Math.min(config.warmupOperations(), available);
+            long remaining = available - warmup;
+            if (remaining <= 0)
+            {
+                warmup = 0L;
+                remaining = available;
+            }
+            this.effectiveWarmupOperations = warmup;
+            this.effectiveMeasurementOperations = Math.min(config.dataSize(), remaining);
+            if (effectiveMeasurementOperations <= 0)
+            {
+                throw new IllegalStateException("not enough existing keys for delete measurement; available="
+                        + available + " totalKeys=" + existingKeyPool.totalKeys());
+            }
+            if (!naturalDeleteDemandFits(effectiveWarmupOperations, effectiveMeasurementOperations))
+            {
+                throw new IllegalStateException("natural delete schedule exceeds per-bucket key pools; warmup="
+                        + effectiveWarmupOperations + " measurement=" + effectiveMeasurementOperations);
+            }
+        }
+
+        // Spot-check that materialized keys are actually present in the restored index.
+        int probes = Math.min(32, usableBuckets.length * 2);
+        for (int i = 0; i < probes; i++)
+        {
+            int bucket = usableBuckets[i % usableBuckets.length];
+            ByteString key = existingKeyPool.sample(bucket);
+            ensureIndexOpen(primaryIndex, bucket);
+            IndexProto.RowLocation location = indexService.lookupUniqueIndex(
+                    indexKey(primaryIndex, key, snapshotTimestamp + 1L), indexOptions[bucket]);
+            if (location == null)
+            {
+                throw new IllegalStateException("existing-key probe missed for table="
+                        + table.tableName + " bucket=" + bucket
+                        + "; HyBench key space [" + keyRange[0] + "," + keyRange[1]
+                        + "] may not match this package");
+            }
+        }
+    }
+
+    /**
+     * Worker-striped update sampling needs every worker that can be scheduled onto a
+     * bucket to own at least one pool index in that bucket ({@code index % threads == workerId}).
+     */
+    private void validateNaturalUpdateKeyStripes(long[] keyRange)
+    {
+        int threads = config.threads();
+        for (int bucket : usableBuckets)
+        {
+            int keys = existingKeyPool.availableInBucket(bucket);
+            for (int workerId = 0; workerId < threads; workerId++)
+            {
+                if (!workerCanUseBucket(workerId, bucket))
+                {
+                    continue;
+                }
+                // For workerId < threads, stripe membership requires workerId < keys.
+                if (workerId >= keys)
+                {
+                    throw new IllegalStateException("existing key pool too small for natural update: bucket="
+                            + bucket + " keys=" + keys + " worker=" + workerId
+                            + " threads=" + threads + " table=" + table.tableName
+                            + " keyRange=[" + keyRange[0] + "," + keyRange[1] + "]");
+                }
+            }
+        }
+    }
+
+    /**
+     * Whether the round-robin bucket schedule can assign {@code workerId} to {@code bucket}
+     * for some batch ordinal. When {@code threads % usableBuckets == 0}, workers are pinned.
+     */
+    private boolean workerCanUseBucket(int workerId, int bucket)
+    {
+        int bucketCount = usableBuckets.length;
+        if (bucketCount <= 0)
+        {
+            return false;
+        }
+        int slot = -1;
+        for (int i = 0; i < bucketCount; i++)
+        {
+            if (usableBuckets[i] == bucket)
+            {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0)
+        {
+            return false;
+        }
+        if (config.threads() % bucketCount == 0)
+        {
+            return Math.floorMod(workerId, bucketCount) == slot;
+        }
+        // Otherwise ordinal * threads eventually hits every residue class mod bucketCount.
+        return true;
+    }
+
+    /**
+     * Largest natural-delete budget such that the warmup/measurement split fits the
+     * exact per-bucket claim schedule used by {@link PhysicalIndexWorker#prepare}.
+     */
+    private long maxNaturalDeleteBudget()
+    {
+        long lo = 0L;
+        long hi = existingKeyPool.totalKeys();
+        while (lo < hi)
+        {
+            long mid = (lo + hi + 1L) >>> 1;
+            long warmup = Math.min(config.warmupOperations(), mid);
+            long remaining = mid - warmup;
+            if (remaining <= 0L)
+            {
+                warmup = 0L;
+                remaining = mid;
+            }
+            long measurement = Math.min(config.dataSize(), remaining);
+            if (naturalDeleteDemandFits(warmup, measurement))
+            {
+                lo = mid;
+            }
+            else
+            {
+                hi = mid - 1L;
+            }
+        }
+        return lo;
+    }
+
+    private boolean naturalDeleteDemandFits(long warmupOps, long measurementOps)
+    {
+        long[] demand = new long[usableBuckets.length];
+        addNaturalDeleteDemand(demand, warmupOps);
+        addNaturalDeleteDemand(demand, measurementOps);
+        for (int slot = 0; slot < usableBuckets.length; slot++)
+        {
+            int available = existingKeyPool.availableInBucket(usableBuckets[slot]);
+            if (demand[slot] > available)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void addNaturalDeleteDemand(long[] demand, long totalOps)
+    {
+        if (totalOps <= 0L)
+        {
+            return;
+        }
+        int threads = config.threads();
+        int batchSize = config.batchSize();
+        int bucketCount = usableBuckets.length;
+        for (int workerId = 0; workerId < threads; workerId++)
+        {
+            long length = OperationRange.partition(totalOps, threads, workerId).size();
+            long ordinal = 0L;
+            long left = length;
+            while (left > 0L)
+            {
+                int count = (int) Math.min((long) batchSize, left);
+                int bucketSlot = (int) Math.floorMod(
+                        workerId + ordinal * (long) threads, bucketCount);
+                demand[bucketSlot] += count;
+                left -= count;
+                ordinal++;
+            }
+        }
+    }
+
+    private static long snapshotOrderedRowCount(SnapshotManifest.TableState tableState)
+    {
+        long rows = 0L;
+        if (tableState.files != null)
+        {
+            for (SnapshotManifest.FileState file : tableState.files)
+            {
+                if (file.rowGroups != null && !file.rowGroups.isEmpty())
+                {
+                    for (SnapshotManifest.RowGroupState rowGroup : file.rowGroups)
+                    {
+                        rows = Math.addExact(rows, Math.max(0, rowGroup.recordNum));
+                    }
+                }
+                else
+                {
+                    rows = Math.addExact(rows, Math.max(0L, file.footerRowCount));
+                }
+            }
+        }
+        if (rows <= 0 && tableState.metadataRowCount > 0)
+        {
+            rows = tableState.metadataRowCount;
+        }
+        return rows;
     }
 
     private String bucketList()
@@ -1013,10 +1436,11 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
     {
         private final BenchmarkPhase phase;
         private final int workerId;
-        private List<PreparedInvocation> invocations;
         private long preparedFirst;
         private long preparedCount;
         private int preparedBatchSize;
+        private long nextOperation;
+        private ByteString[] preparedKeys;
         private PreparedInvocation sampled;
 
         private PhysicalIndexWorker(BenchmarkPhase phase, int workerId)
@@ -1028,19 +1452,19 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
         @Override
         public void prepare(long firstOperation, long operationCount, int batchSize) throws Exception
         {
-            if (invocations != null)
+            if (preparedBatchSize != 0)
             {
                 throw new IllegalStateException("physical index worker was prepared twice");
-            }
-            long batchCount = (operationCount + batchSize - 1L) / batchSize;
-            if (batchCount > Integer.MAX_VALUE)
-            {
-                throw new IllegalArgumentException("too many prepared Index batches for one worker");
             }
             this.preparedFirst = firstOperation;
             this.preparedCount = operationCount;
             this.preparedBatchSize = batchSize;
-            this.invocations = new ArrayList<>((int) batchCount);
+            this.nextOperation = firstOperation;
+            if (operationCount > Integer.MAX_VALUE)
+            {
+                throw new IllegalArgumentException("too many Index operations to materialize keys");
+            }
+            this.preparedKeys = new ByteString[(int) operationCount];
 
             long cursor = firstOperation;
             long end = Math.addExact(firstOperation, operationCount);
@@ -1051,7 +1475,10 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
                 int bucketSlot = (int) Math.floorMod(
                         workerId + ordinal * (long) config.threads(), usableBuckets.length);
                 int bucket = usableBuckets[bucketSlot];
-                invocations.add(prepareInvocation(phase, cursor, count, bucket));
+                int keyOffset = Math.toIntExact(cursor - preparedFirst);
+                boolean prepareFixtures = operation.requiresExistingKey() && !useExistingSnapshotKeys;
+                prepareInvocation(phase, cursor, count, bucket, workerId,
+                        prepareFixtures, false, preparedKeys, keyOffset, true);
                 cursor += count;
                 ordinal++;
             }
@@ -1060,13 +1487,21 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
         @Override
         public OperationResult execute(long firstOperation, int logicalOperationCount)
         {
-            PreparedInvocation invocation = invocation(firstOperation, logicalOperationCount);
-            if (!invocation.executed.compareAndSet(false, true))
+            if (firstOperation != nextOperation || logicalOperationCount <= 0
+                    || firstOperation + logicalOperationCount > preparedFirst + preparedCount)
             {
-                return OperationResult.failure(logicalOperationCount, 0L);
+                throw new IllegalArgumentException("unexpected Index operation range "
+                        + firstOperation + "+" + logicalOperationCount
+                        + ", expected next=" + nextOperation);
             }
+            int bucket = invocationBucket(firstOperation, logicalOperationCount);
+            PreparedInvocation invocation;
+            nextOperation += logicalOperationCount;
             try
             {
+                int keyOffset = Math.toIntExact(firstOperation - preparedFirst);
+                invocation = prepareInvocation(phase, firstOperation, logicalOperationCount,
+                        bucket, workerId, false, true, preparedKeys, keyOffset, false);
                 boolean success;
                 List<IndexProto.RowLocation> returnedLocations = null;
                 List<Long> returnedRowIds = null;
@@ -1132,9 +1567,9 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
             }
         }
 
-        private PreparedInvocation invocation(long firstOperation, int logicalOperationCount)
+        private int invocationBucket(long firstOperation, int logicalOperationCount)
         {
-            if (invocations == null)
+            if (preparedBatchSize <= 0)
             {
                 throw new IllegalStateException("physical index worker has not been prepared");
             }
@@ -1143,18 +1578,22 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
             {
                 throw new IllegalArgumentException("unexpected Index operation offset " + firstOperation);
             }
-            PreparedInvocation invocation = invocations.get((int) (relative / preparedBatchSize));
-            if (invocation.firstOperation != firstOperation
-                    || invocation.logicalCount != logicalOperationCount)
+            long ordinal = relative / preparedBatchSize;
+            int expected = (int) Math.min((long) preparedBatchSize,
+                    preparedFirst + preparedCount - firstOperation);
+            if (logicalOperationCount != expected)
             {
                 throw new IllegalArgumentException("execute range does not match prepared Index batch");
             }
-            return invocation;
+            int bucketSlot = (int) Math.floorMod(
+                    workerId + ordinal * (long) config.threads(), usableBuckets.length);
+            return usableBuckets[bucketSlot];
         }
 
         @Override
         public void close() throws Exception
         {
+            preparedKeys = null;
             if (sampled == null)
             {
                 return;
@@ -1174,22 +1613,17 @@ public final class PhysicalIndexBenchmarkScenario implements BenchmarkScenario
 
     private static final class PreparedInvocation
     {
-        private final long firstOperation;
-        private final int logicalCount;
         private final int bucket;
         private final List<IndexProto.PrimaryIndexEntry> primaryEntries = new ArrayList<>();
         private final List<IndexProto.SecondaryIndexEntry> secondaryEntries = new ArrayList<>();
         private final List<IndexProto.IndexKey> keys = new ArrayList<>();
         private final List<IndexProto.RowLocation> expectedPreviousLocations = new ArrayList<>();
         private final List<Long> expectedPreviousRowIds = new ArrayList<>();
-        private final AtomicBoolean executed = new AtomicBoolean(false);
         private List<IndexProto.RowLocation> returnedLocations;
         private List<Long> returnedRowIds;
 
-        private PreparedInvocation(long firstOperation, int logicalCount, int bucket)
+        private PreparedInvocation(int bucket)
         {
-            this.firstOperation = firstOperation;
-            this.logicalCount = logicalCount;
             this.bucket = bucket;
         }
     }

@@ -78,14 +78,16 @@ public final class SnapshotValidator
     private static List<SnapshotManifest.TableState> selectTables(SnapshotManifest manifest,
                                                                    String tableName)
     {
-        if (tableName.trim().isEmpty())
+        String token = tableName == null ? "" : tableName.trim();
+        if (token.isEmpty() || "*".equals(token) || "all".equalsIgnoreCase(token))
         {
             return manifest.tables;
         }
         List<SnapshotManifest.TableState> selected = new ArrayList<>();
         for (SnapshotManifest.TableState table : manifest.tables)
         {
-            if (table.tableName.equals(tableName))
+            if (table.tableName.equalsIgnoreCase(token)
+                    || (table.schemaName + "." + table.tableName).equalsIgnoreCase(token))
             {
                 selected.add(table);
             }

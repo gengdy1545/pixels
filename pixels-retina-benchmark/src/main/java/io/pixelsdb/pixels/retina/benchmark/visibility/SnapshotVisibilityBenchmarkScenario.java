@@ -23,6 +23,7 @@ import io.pixelsdb.pixels.retina.benchmark.common.BenchmarkWorker;
 import io.pixelsdb.pixels.retina.benchmark.common.OperationRange;
 import io.pixelsdb.pixels.retina.benchmark.common.OperationResult;
 import io.pixelsdb.pixels.retina.benchmark.runtime.NativeRuntime;
+import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotIO;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotManifest;
 import io.pixelsdb.pixels.retina.benchmark.snapshot.SnapshotRuntime;
 
@@ -66,8 +67,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@code productionSelectedByRetina=true}; compact, secondary and projection
  * paths are excluded from this benchmark.
  * Baseline construction, request construction, verification and native-object cleanup all
- * run outside the measured interval.  Warmup and measurement use disjoint
- * physical rows and each phase starts from a fresh clean baseline.</p>
+ * run outside the measured interval. Measurement is capped at one full pass over the
+ * selected manifest row pool ({@code min(data-size, manifest rows)}); duration may stop
+ * the run earlier. Warmup may still cyclic-reuse the same pool. Each phase starts from a
+ * fresh clean baseline.</p>
  */
 public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScenario
 {
@@ -80,7 +83,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
     private BenchmarkConfig config;
     private SnapshotRuntime snapshotRuntime;
     private SnapshotManifest manifest;
-    private SnapshotManifest.TableState table;
+    private List<SnapshotManifest.TableState> tables;
     private RetinaResourceManager resourceManager;
     private int tileCapacity;
     private int nativeTileCapacity;
@@ -92,8 +95,12 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
     private boolean validateFinalBitmap;
 
     private List<RowGroupSpec> rowGroups;
-    private PreparedDelete[] warmupDeletes;
-    private PreparedDelete[] measurementDeletes;
+    private long[] rowGroupEndExclusiveRows;
+    private long measurementOperations;
+    private long warmupOperations;
+    private long measurementOffset;
+    private long warmupOffset;
+    private boolean phaseRowsDisjoint;
     private PhaseExecution activePhase;
 
     @Override
@@ -114,7 +121,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
                 "visibility-validate-final-bitmap", false);
         this.snapshotRuntime = SnapshotRuntime.open(config);
         this.manifest = snapshotRuntime.manifest();
-        this.table = snapshotRuntime.requireTable(config.require("snapshot-table"));
+        this.tables = selectTables(manifest, config.get("snapshot-table", "all"));
 
         validatePlatformAndTimestamp();
         configureRuntime();
@@ -151,14 +158,14 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         {
             throw new IllegalStateException("previous visibility phase was not completed");
         }
-        PreparedDelete[] operations = operations(phase);
-        if (totalOperations != operations.length)
+        long expected = operationCount(phase);
+        if (totalOperations != expected)
         {
             throw new IllegalArgumentException("unexpected " + phase + " operation count: "
-                    + totalOperations + ", expected " + operations.length);
+                    + totalOperations + ", expected " + expected);
         }
 
-        PhaseExecution execution = new PhaseExecution(phase, operations);
+        PhaseExecution execution = new PhaseExecution(phase, operationCount(phase));
         Exception failure = null;
         try
         {
@@ -196,12 +203,11 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         {
             throw new IllegalArgumentException("invalid local visibility client shard: " + clientId);
         }
-        if (range.endExclusive() > execution.operations.length)
+        if (range.endExclusive() > execution.operationCount)
         {
             throw new IllegalArgumentException("worker range exceeds prepared snapshot rows");
         }
-        SnapshotVisibilityWorker worker = new SnapshotVisibilityWorker(
-                execution, workerId, clientId, range);
+        SnapshotVisibilityWorker worker = new SnapshotVisibilityWorker(execution, range);
         execution.workers.add(worker);
         return worker;
     }
@@ -251,8 +257,10 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         Map<String, String> details = new LinkedHashMap<>();
         details.put("call", "RetinaResourceManager.deleteRecord(RowLocation,timestamp) (local JNI)");
         details.put("callChain", "RetinaResourceManager.deleteRecord -> RGVisibility.deleteRecord -> JNI");
-        details.put("snapshotTable", table == null ? "not-initialized"
-                : table.schemaName + "." + table.tableName);
+        details.put("snapshotTable", tables == null || tables.isEmpty() ? "not-initialized"
+                : formatSelectedTables(tables));
+        details.put("snapshotTableCount", tables == null ? "0"
+                : Integer.toString(tables.size()));
         details.put("snapshotSourceHost", manifest == null ? "not-initialized" : manifest.sourceHost);
         details.put("snapshotSourceQuiesced", manifest == null ? "false"
                 : Boolean.toString(manifest.sourceQuiesced));
@@ -272,9 +280,14 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
                 + "productionSelectedByRetina; compact, projection and secondary paths excluded");
         details.put("baseline",
                 "manifest file/RG recordNum -> addVisibility(fileId,rgId,recordNum,0,null,false)");
-        details.put("deleteTargets", "distinct rows from manifest file/RG recordNum");
-        details.put("warmupMeasurementRows", "disjoint; each phase rebuilds the same clean baseline");
-        details.put("logicalOperation", "one unique physical-row deletion; one local API/JNI call");
+        details.put("deleteTargets",
+                "one full pass over selected manifest file/RG recordNum rows; "
+                        + "measurement capped at manifest row count");
+        details.put("stopPolicy", "min(full selected tables, duration-seconds)");
+        details.put("warmupMeasurementRows", phaseRowsDisjoint
+                ? "disjoint until row-pool exhaustion; each phase rebuilds the same clean baseline"
+                : "warmup may cyclic-reuse; measurement capped at one full pass");
+        details.put("logicalOperation", "one physical-row deletion call");
         details.put("transactionTimestamp", "one constant real timestamp per clean phase");
         details.put("gc", "retina.gc.interval=0, retina.storage.gc.enabled=false");
         details.put("postRunValidation", validateFinalBitmap
@@ -324,8 +337,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
                 else first.addSuppressed(e);
             }
         }
-        warmupDeletes = null;
-        measurementDeletes = null;
+        rowGroupEndExclusiveRows = null;
         if (first != null)
         {
             throw first;
@@ -355,12 +367,6 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
 
         this.warmupOperationCount = config.warmupSeconds() > 0 && config.warmupOperations() > 0
                 ? config.warmupOperations() : 0L;
-        long combined = Math.addExact(warmupOperationCount, config.dataSize());
-        if (combined > Integer.MAX_VALUE)
-        {
-            throw new IllegalArgumentException("snapshot visibility benchmark supports at most "
-                    + Integer.MAX_VALUE + " warmup + measurement physical rows");
-        }
     }
 
     private void configureRuntime()
@@ -411,174 +417,212 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
 
     private void buildRowGroupTopology()
     {
-        Set<Long> readableLayouts = new HashSet<>();
-        Map<LayoutPathKey, String> productionPaths = new HashMap<>();
-        for (SnapshotManifest.LayoutState layout : table.layouts)
-        {
-            if (layout.readable)
-            {
-                readableLayouts.add(layout.layoutId);
-                for (SnapshotManifest.PathState path : layout.paths)
-                {
-                    if (!path.productionSelectedByRetina)
-                    {
-                        continue;
-                    }
-                    if (path.pathId <= 0)
-                    {
-                        throw new IllegalArgumentException("invalid production-selected Retina path "
-                                + "for layoutId=" + layout.layoutId + ", pathId=" + path.pathId
-                                + ", role=" + path.role);
-                    }
-                    if ("compact".equalsIgnoreCase(path.role))
-                    {
-                        continue;
-                    }
-                    if (!"ordered".equalsIgnoreCase(path.role))
-                    {
-                        throw new IllegalArgumentException("unexpected production-selected Retina path role "
-                                + "for layoutId=" + layout.layoutId + ", pathId=" + path.pathId
-                                + ", role=" + path.role);
-                    }
-                    LayoutPathKey key = new LayoutPathKey(layout.layoutId, path.pathId);
-                    if (productionPaths.put(key, path.role) != null)
-                    {
-                        throw new IllegalArgumentException("duplicate production-selected Retina path: "
-                                + key);
-                    }
-                }
-            }
-        }
-        if (readableLayouts.isEmpty())
-        {
-            throw new IllegalArgumentException("snapshot table has no readable layout: " + table.tableName);
-        }
-        if (productionPaths.isEmpty())
-        {
-            throw new IllegalArgumentException("snapshot table has no production-selected "
-                    + "ordered path in a readable layout: " + table.tableName);
-        }
-        this.productionSelectedPathCount = productionPaths.size();
-
         List<RowGroupSpec> selected = new ArrayList<>();
         Map<RowGroupKey, RowGroupSpec> byKey = new HashMap<>();
         long rows = 0L;
-        for (SnapshotManifest.FileState file : table.files)
+        int productionPaths = 0;
+        for (SnapshotManifest.TableState table : tables)
         {
-            if (!readableLayouts.contains(file.layoutId))
+            Set<Long> readableLayouts = new HashSet<>();
+            Map<LayoutPathKey, String> productionPathRoles = new HashMap<>();
+            for (SnapshotManifest.LayoutState layout : table.layouts)
             {
-                continue;
-            }
-            String selectedRole = productionPaths.get(new LayoutPathKey(file.layoutId, file.pathId));
-            if (selectedRole == null)
-            {
-                continue;
-            }
-            if (!selectedRole.equalsIgnoreCase(file.layoutRole))
-            {
-                throw new IllegalArgumentException("manifest file role does not match its "
-                        + "production-selected Retina path for fileId=" + file.fileId
-                        + ": " + file.layoutRole + " != " + selectedRole);
-            }
-            if (file.fileId <= 0 || file.rowGroups == null
-                    || file.footerRowGroupCount != file.rowGroups.size()
-                    || file.metadataNumRowGroups != file.footerRowGroupCount)
-            {
-                throw new IllegalArgumentException("invalid manifest file/RG topology for fileId="
-                        + file.fileId);
-            }
-            long fileRows = 0L;
-            for (int rowGroupOrdinal = 0; rowGroupOrdinal < file.rowGroups.size(); rowGroupOrdinal++)
-            {
-                SnapshotManifest.RowGroupState rowGroup = file.rowGroups.get(rowGroupOrdinal);
-                if (rowGroup.rgId != rowGroupOrdinal || rowGroup.recordNum < 0)
+                if (layout.readable)
                 {
-                    throw new IllegalArgumentException("invalid manifest row group for fileId="
-                            + file.fileId + ", rgId=" + rowGroup.rgId);
+                    readableLayouts.add(layout.layoutId);
+                    for (SnapshotManifest.PathState path : layout.paths)
+                    {
+                        if (!path.productionSelectedByRetina)
+                        {
+                            continue;
+                        }
+                        if (path.pathId <= 0)
+                        {
+                            throw new IllegalArgumentException("invalid production-selected Retina path "
+                                    + "for table=" + table.tableName
+                                    + ", layoutId=" + layout.layoutId + ", pathId=" + path.pathId
+                                    + ", role=" + path.role);
+                        }
+                        if ("compact".equalsIgnoreCase(path.role))
+                        {
+                            continue;
+                        }
+                        if (!"ordered".equalsIgnoreCase(path.role))
+                        {
+                            throw new IllegalArgumentException("unexpected production-selected Retina path role "
+                                    + "for table=" + table.tableName
+                                    + ", layoutId=" + layout.layoutId + ", pathId=" + path.pathId
+                                    + ", role=" + path.role);
+                        }
+                        LayoutPathKey key = new LayoutPathKey(layout.layoutId, path.pathId);
+                        if (productionPathRoles.put(key, path.role) != null)
+                        {
+                            throw new IllegalArgumentException("duplicate production-selected Retina path: "
+                                    + key + " table=" + table.tableName);
+                        }
+                    }
                 }
-                RowGroupKey key = new RowGroupKey(file.fileId, rowGroup.rgId);
-                RowGroupSpec spec = new RowGroupSpec(key, rowGroup.recordNum);
-                if (byKey.put(key, spec) != null)
-                {
-                    throw new IllegalArgumentException("duplicate manifest row group: " + key);
-                }
-                selected.add(spec);
-                fileRows = Math.addExact(fileRows, rowGroup.recordNum);
             }
-            if (fileRows != file.footerRowCount)
+            if (readableLayouts.isEmpty())
             {
-                throw new IllegalArgumentException("manifest footer row count mismatch for fileId="
-                        + file.fileId + ": " + fileRows + " != " + file.footerRowCount);
+                throw new IllegalArgumentException("snapshot table has no readable layout: "
+                        + table.tableName);
             }
-            rows = Math.addExact(rows, fileRows);
+            if (productionPathRoles.isEmpty())
+            {
+                throw new IllegalArgumentException("snapshot table has no production-selected "
+                        + "ordered path in a readable layout: " + table.tableName);
+            }
+            productionPaths = Math.addExact(productionPaths, productionPathRoles.size());
+
+            for (SnapshotManifest.FileState file : table.files)
+            {
+                if (!readableLayouts.contains(file.layoutId))
+                {
+                    continue;
+                }
+                String selectedRole = productionPathRoles.get(
+                        new LayoutPathKey(file.layoutId, file.pathId));
+                if (selectedRole == null)
+                {
+                    continue;
+                }
+                if (!selectedRole.equalsIgnoreCase(file.layoutRole))
+                {
+                    throw new IllegalArgumentException("manifest file role does not match its "
+                            + "production-selected Retina path for table=" + table.tableName
+                            + ", fileId=" + file.fileId
+                            + ": " + file.layoutRole + " != " + selectedRole);
+                }
+                if (file.fileId <= 0 || file.rowGroups == null
+                        || file.footerRowGroupCount != file.rowGroups.size()
+                        || file.metadataNumRowGroups != file.footerRowGroupCount)
+                {
+                    throw new IllegalArgumentException("invalid manifest file/RG topology for table="
+                            + table.tableName + ", fileId=" + file.fileId);
+                }
+                long fileRows = 0L;
+                for (int rowGroupOrdinal = 0; rowGroupOrdinal < file.rowGroups.size(); rowGroupOrdinal++)
+                {
+                    SnapshotManifest.RowGroupState rowGroup = file.rowGroups.get(rowGroupOrdinal);
+                    if (rowGroup.rgId != rowGroupOrdinal || rowGroup.recordNum < 0)
+                    {
+                        throw new IllegalArgumentException("invalid manifest row group for table="
+                                + table.tableName + ", fileId=" + file.fileId
+                                + ", rgId=" + rowGroup.rgId);
+                    }
+                    if (rowGroup.recordNum == 0)
+                    {
+                        continue;
+                    }
+                    RowGroupKey key = new RowGroupKey(file.fileId, rowGroup.rgId);
+                    RowGroupSpec spec = new RowGroupSpec(key, rowGroup.recordNum);
+                    if (byKey.put(key, spec) != null)
+                    {
+                        throw new IllegalArgumentException("duplicate manifest row group: " + key
+                                + " table=" + table.tableName);
+                    }
+                    selected.add(spec);
+                    fileRows = Math.addExact(fileRows, rowGroup.recordNum);
+                }
+                if (fileRows != file.footerRowCount)
+                {
+                    throw new IllegalArgumentException("manifest footer row count mismatch for table="
+                            + table.tableName + ", fileId=" + file.fileId + ": "
+                            + fileRows + " != " + file.footerRowCount);
+                }
+                rows = Math.addExact(rows, fileRows);
+            }
         }
         if (selected.isEmpty() || rows <= 0)
         {
-            throw new IllegalArgumentException("snapshot table has no rows on the "
+            throw new IllegalArgumentException("selected snapshot tables have no rows on the "
                     + "production-selected ordered paths of readable layouts");
         }
         selected.sort(Comparator.comparingLong((RowGroupSpec value) -> value.key.fileId)
                 .thenComparingInt(value -> value.key.rgId));
         this.rowGroups = Collections.unmodifiableList(selected);
         this.manifestRowCount = rows;
+        this.productionSelectedPathCount = productionPaths;
     }
 
     private void prepareOperationData() throws Exception
     {
-        int measurementRequired = Math.toIntExact(config.dataSize());
-        int warmupRequired = Math.toIntExact(warmupOperationCount);
-        List<PreparedDelete> measurement = new ArrayList<>(measurementRequired);
-        List<PreparedDelete> warmup = new ArrayList<>(warmupRequired);
-        Set<LocationKey> reserved = new HashSet<>(initialHashCapacity(
-                Math.addExact(measurementRequired, warmupRequired)));
-
-        fillFromManifest(measurement, measurementRequired, reserved);
-        fillFromManifest(warmup, warmupRequired, reserved);
-        if (measurement.size() != measurementRequired || warmup.size() != warmupRequired)
+        if (manifestRowCount <= 0)
         {
-            throw new IllegalArgumentException("snapshot has only "
-                    + (measurement.size() + warmup.size())
-                    + " distinct rows visible at snapshotTimestamp, but benchmark requires "
-                    + (measurementRequired + warmupRequired));
+            throw new IllegalArgumentException("snapshot manifest row count must be positive");
         }
 
-        this.measurementDeletes = measurement.toArray(new PreparedDelete[measurement.size()]);
-        this.warmupDeletes = warmup.toArray(new PreparedDelete[warmup.size()]);
+        /* Formal Visibility upper bound: at most one full pass over selected tables. */
+        if (config.dataSize() > manifestRowCount)
+        {
+            throw new IllegalArgumentException("visibility data-size " + config.dataSize()
+                    + " exceeds selected manifest rows " + manifestRowCount
+                    + "; formal Visibility allows at most one full pass (or duration)");
+        }
+        this.measurementOperations = config.dataSize();
+        this.warmupOperations = warmupOperationCount;
+        this.measurementOffset = 0L;
+        this.warmupOffset = Math.floorMod(measurementOperations, manifestRowCount);
+        this.phaseRowsDisjoint = Math.addExact(measurementOperations, warmupOperations)
+                <= manifestRowCount;
+
+        long[] prefix = new long[rowGroups.size()];
+        long cumulative = 0L;
+        for (int i = 0; i < rowGroups.size(); i++)
+        {
+            cumulative = Math.addExact(cumulative, rowGroups.get(i).recordNum);
+            prefix[i] = cumulative;
+        }
+        if (cumulative != manifestRowCount)
+        {
+            throw new IllegalStateException("manifest row topology mismatch: prefixRows="
+                    + cumulative + ", manifestRows=" + manifestRowCount);
+        }
+        this.rowGroupEndExclusiveRows = prefix;
     }
 
-    /** Round-robin RG traversal avoids creating an artificial single-RG hot spot. */
-    private void fillFromManifest(List<PreparedDelete> target, int required,
-                                  Set<LocationKey> reserved)
+    private long operationOffset(BenchmarkPhase phase)
     {
-        if (target.size() >= required)
+        return phase == BenchmarkPhase.WARMUP ? warmupOffset : measurementOffset;
+    }
+
+    private long operationCount(BenchmarkPhase phase)
+    {
+        return phase == BenchmarkPhase.WARMUP ? warmupOperations : measurementOperations;
+    }
+
+    private long phaseRowOrdinal(BenchmarkPhase phase, long phaseOperation)
+    {
+        return Math.floorMod(operationOffset(phase) + phaseOperation, manifestRowCount);
+    }
+
+    private int rowGroupIndexByOrdinal(long rowOrdinal)
+    {
+        int low = 0;
+        int high = rowGroupEndExclusiveRows.length - 1;
+        while (low < high)
         {
-            return;
-        }
-        int maximumRecords = 0;
-        for (RowGroupSpec spec : rowGroups)
-        {
-            maximumRecords = Math.max(maximumRecords, spec.recordNum);
-        }
-        for (int offset = 0; offset < maximumRecords; offset++)
-        {
-            for (RowGroupSpec spec : rowGroups)
+            int middle = (low + high) >>> 1;
+            if (rowOrdinal < rowGroupEndExclusiveRows[middle])
             {
-                if (offset >= spec.recordNum)
-                {
-                    continue;
-                }
-                LocationKey location = new LocationKey(spec.key.fileId, spec.key.rgId, offset);
-                if (!reserved.add(location))
-                {
-                    continue;
-                }
-                target.add(preparedDelete(spec, offset));
-                if (target.size() == required)
-                {
-                    return;
-                }
+                high = middle;
+            }
+            else
+            {
+                low = middle + 1;
             }
         }
+        return low;
+    }
+
+    private static IndexProto.RowLocation location(long fileId, int rgId, int offset)
+    {
+        return IndexProto.RowLocation.newBuilder()
+                .setFileId(fileId)
+                .setRgId(rgId)
+                .setRgRowOffset(offset)
+                .build();
     }
 
     private void initializeCleanBaseline()
@@ -601,20 +645,13 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         for (SnapshotVisibilityWorker worker : execution.workers)
         {
             trackedAttempted += worker.attempted;
-            trackedErrors += worker.failures.cardinality();
+            trackedErrors += worker.failedOperations;
             if (validateFinalBitmap)
             {
-                for (int relative = 0; relative < worker.attempted; relative++)
+                for (Map.Entry<RowGroupKey, BitSet> entry : worker.successfulDeletes.entrySet())
                 {
-                    if (worker.failures.get(relative))
-                    {
-                        continue;
-                    }
-                    int operation = Math.toIntExact(worker.range.startInclusive() + relative);
-                    PreparedDelete delete = execution.operations[operation];
-                    expectedDeleted.computeIfAbsent(delete.rowGroup,
-                            ignored -> new BitSet())
-                            .set(delete.offset);
+                    expectedDeleted.computeIfAbsent(entry.getKey(), ignored -> new BitSet())
+                            .or(entry.getValue());
                 }
             }
         }
@@ -636,9 +673,11 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         }
 
         long validated = 0L;
+        long expectedUniqueDeletes = 0L;
         for (Map.Entry<RowGroupKey, BitSet> entry : expectedDeleted.entrySet())
         {
             RowGroupKey key = entry.getKey();
+            expectedUniqueDeletes += entry.getValue().cardinality();
             long[] bitmap = resourceManager.queryVisibility(
                     key.fileId, key.rgId, deleteTimestamp);
             for (int offset = entry.getValue().nextSetBit(0);
@@ -658,10 +697,10 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
                 }
             }
         }
-        if (validated != trackedSuccessful)
+        if (validated != expectedUniqueDeletes)
         {
             throw new IllegalStateException("validated " + validated + " deletes, expected "
-                    + trackedSuccessful);
+                    + expectedUniqueDeletes);
         }
         this.lastValidatedDeletes = validated;
     }
@@ -691,11 +730,6 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         }
     }
 
-    private PreparedDelete[] operations(BenchmarkPhase phase)
-    {
-        return phase == BenchmarkPhase.WARMUP ? warmupDeletes : measurementDeletes;
-    }
-
     private PhaseExecution requireActivePhase(BenchmarkPhase phase)
     {
         PhaseExecution execution = activePhase;
@@ -718,45 +752,61 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         }
     }
 
-    private static PreparedDelete preparedDelete(RowGroupSpec spec, int offset)
+    private static List<SnapshotManifest.TableState> selectTables(SnapshotManifest manifest,
+                                                                   String requested)
     {
-        IndexProto.RowLocation location = IndexProto.RowLocation.newBuilder()
-                .setFileId(spec.key.fileId)
-                .setRgId(spec.key.rgId)
-                .setRgRowOffset(offset)
-                .build();
-        return new PreparedDelete(spec.key, offset, location);
+        String token = requested == null ? "" : requested.trim();
+        if (token.isEmpty() || "*".equals(token) || "all".equalsIgnoreCase(token))
+        {
+            if (manifest.tables == null || manifest.tables.isEmpty())
+            {
+                throw new IllegalArgumentException("snapshot contains no tables");
+            }
+            return Collections.unmodifiableList(new ArrayList<>(manifest.tables));
+        }
+        return Collections.singletonList(SnapshotIO.requireTable(manifest, token));
     }
 
-    private static int initialHashCapacity(int elements)
+    private static String formatSelectedTables(List<SnapshotManifest.TableState> selected)
     {
-        if (elements < 3)
+        if (selected.size() == 1)
         {
-            return 4;
+            SnapshotManifest.TableState table = selected.get(0);
+            return table.schemaName + "." + table.tableName;
         }
-        return elements >= (1 << 29) ? Integer.MAX_VALUE : (int) (elements / 0.75F) + 1;
+        StringBuilder builder = new StringBuilder("ALL(");
+        for (int i = 0; i < selected.size(); i++)
+        {
+            if (i > 0)
+            {
+                builder.append(',');
+            }
+            SnapshotManifest.TableState table = selected.get(i);
+            builder.append(table.schemaName).append('.').append(table.tableName);
+        }
+        builder.append(')');
+        return builder.toString();
     }
 
     private final class SnapshotVisibilityWorker implements BenchmarkWorker
     {
         private final PhaseExecution execution;
-        private final int workerId;
-        private final int clientId;
         private final OperationRange range;
         private final AtomicBoolean workerClosed = new AtomicBoolean(false);
-        private final BitSet failures;
+        private final Map<RowGroupKey, BitSet> successfulDeletes;
         private boolean prepared;
         private long nextOperation;
-        private int attempted;
+        private long attempted;
+        private long failedOperations;
+        private int currentGroupIndex;
+        private int currentOffset;
 
-        private SnapshotVisibilityWorker(PhaseExecution execution, int workerId, int clientId,
-                                         OperationRange range)
+        private SnapshotVisibilityWorker(PhaseExecution execution, OperationRange range)
         {
             this.execution = execution;
-            this.workerId = workerId;
-            this.clientId = clientId;
             this.range = range;
-            this.failures = new BitSet(Math.toIntExact(range.size()));
+            this.successfulDeletes = validateFinalBitmap
+                    ? new LinkedHashMap<>() : Collections.emptyMap();
         }
 
         @Override
@@ -772,6 +822,7 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
                 throw new IllegalArgumentException("unexpected snapshot visibility worker range");
             }
             this.nextOperation = firstOperation;
+            initializeRowCursor(firstOperation);
             this.prepared = true;
         }
 
@@ -790,26 +841,32 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
 
             long successful = 0L;
             long errors = 0L;
-            int batchStart = Math.toIntExact(firstOperation);
-            int relativeStart = Math.toIntExact(firstOperation - range.startInclusive());
             for (int i = 0; i < logicalOperationCount; i++)
             {
-                PreparedDelete delete = execution.operations[batchStart + i];
+                RowGroupSpec rowGroup = rowGroups.get(currentGroupIndex);
+                IndexProto.RowLocation deleteLocation =
+                        location(rowGroup.key.fileId, rowGroup.key.rgId, currentOffset);
                 try
                 {
                     /* The entire measured target: real local update/JNI call. */
-                    resourceManager.deleteRecord(delete.location, deleteTimestamp);
+                    resourceManager.deleteRecord(deleteLocation, deleteTimestamp);
+                    if (validateFinalBitmap)
+                    {
+                        successfulDeletes.computeIfAbsent(rowGroup.key,
+                                ignored -> new BitSet()).set(currentOffset);
+                    }
                     successful++;
                 }
                 catch (Exception e)
                 {
-                    failures.set(relativeStart + i);
                     firstDeleteError.compareAndSet(null, e.getClass().getName() + ": "
                             + String.valueOf(e.getMessage()));
                     errors++;
                 }
+                advanceRowCursor();
             }
             attempted += logicalOperationCount;
+            failedOperations += errors;
             nextOperation += logicalOperationCount;
             return new OperationResult(logicalOperationCount, successful, errors,
                     logicalOperationCount);
@@ -826,18 +883,42 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         {
             workerClosed.set(true);
         }
+
+        private void initializeRowCursor(long phaseOperation)
+        {
+            long rowOrdinal = phaseRowOrdinal(execution.phase, phaseOperation);
+            currentGroupIndex = rowGroupIndexByOrdinal(rowOrdinal);
+            long groupStart = currentGroupIndex == 0
+                    ? 0L : rowGroupEndExclusiveRows[currentGroupIndex - 1];
+            currentOffset = (int) (rowOrdinal - groupStart);
+        }
+
+        private void advanceRowCursor()
+        {
+            RowGroupSpec current = rowGroups.get(currentGroupIndex);
+            currentOffset++;
+            if (currentOffset >= current.recordNum)
+            {
+                currentGroupIndex++;
+                if (currentGroupIndex >= rowGroups.size())
+                {
+                    currentGroupIndex = 0;
+                }
+                currentOffset = 0;
+            }
+        }
     }
 
     private static final class PhaseExecution
     {
         private final BenchmarkPhase phase;
-        private final PreparedDelete[] operations;
+        private final long operationCount;
         private final List<SnapshotVisibilityWorker> workers = new ArrayList<>();
 
-        private PhaseExecution(BenchmarkPhase phase, PreparedDelete[] operations)
+        private PhaseExecution(BenchmarkPhase phase, long operationCount)
         {
             this.phase = phase;
-            this.operations = operations;
+            this.operationCount = operationCount;
         }
     }
 
@@ -916,52 +997,6 @@ public final class SnapshotVisibilityBenchmarkScenario implements BenchmarkScena
         public String toString()
         {
             return "fileId=" + fileId + ",rgId=" + rgId;
-        }
-    }
-
-    private static final class LocationKey
-    {
-        private final long fileId;
-        private final int rgId;
-        private final int offset;
-
-        private LocationKey(long fileId, int rgId, int offset)
-        {
-            this.fileId = fileId;
-            this.rgId = rgId;
-            this.offset = offset;
-        }
-
-        @Override
-        public boolean equals(Object other)
-        {
-            if (this == other) return true;
-            if (!(other instanceof LocationKey)) return false;
-            LocationKey that = (LocationKey) other;
-            return fileId == that.fileId && rgId == that.rgId && offset == that.offset;
-        }
-
-        @Override
-        public int hashCode()
-        {
-            int result = Long.hashCode(fileId);
-            result = 31 * result + rgId;
-            return 31 * result + offset;
-        }
-    }
-
-    private static final class PreparedDelete
-    {
-        private final RowGroupKey rowGroup;
-        private final int offset;
-        private final IndexProto.RowLocation location;
-
-        private PreparedDelete(RowGroupKey rowGroup, int offset,
-                               IndexProto.RowLocation location)
-        {
-            this.rowGroup = rowGroup;
-            this.offset = offset;
-            this.location = location;
         }
     }
 

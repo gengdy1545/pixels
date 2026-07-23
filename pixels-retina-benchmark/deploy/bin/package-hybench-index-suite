@@ -73,7 +73,9 @@ do
 done
 
 mkdir -p "$(dirname "${OUTPUT_ARCHIVE}")"
-tar -czf "${OUTPUT_ARCHIVE}" -C "${INDEX_ROOT}" "${SCALES[@]}"
+# Follow symlinks so mixed layouts (e.g. sf100 linked to an existing snapshot)
+# still produce a self-contained archive for AWS transfer.
+tar -h -czf "${OUTPUT_ARCHIVE}" -C "${INDEX_ROOT}" "${SCALES[@]}"
 printf 'archive=%s\n' "${OUTPUT_ARCHIVE}"
 printf 'scales=%s\n' "${SCALES[*]}"
 printf 'contents=index-only\n'

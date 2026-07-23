@@ -64,7 +64,10 @@ fi
 if [[ "${SKIP_MAVEN}" == "false" ]]
 then
     log "building pixels-retina-benchmark runtime"
-    mvn -f "${REPO_ROOT}/pom.xml" -pl pixels-retina-benchmark -am package -DskipTests
+    # -Dmaven.test.skip=true skips both test compile and test run.
+    # -DskipTests alone still compiles tests and can fail the packager.
+    mvn -f "${REPO_ROOT}/pom.xml" -pl pixels-retina-benchmark -am package \
+        -Dmaven.test.skip=true
 fi
 
 JAR_PATH="${MODULE_DIR}/target/pixels-retina-benchmark-*-full.jar"
