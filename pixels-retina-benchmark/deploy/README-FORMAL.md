@@ -39,8 +39,12 @@ The bundle does **not** include:
 ```bash
 tar -xzf retina-formal-bundle-linux-amd64.tar.gz -C /opt
 cd /opt/formal-bundle
-sudo ./install/bootstrap.sh
+./install/bootstrap.sh
 ```
+
+Run the bootstrap as the benchmark user. It invokes `sudo` only for directory
+creation, package installation, and MySQL administration; running the entire
+script as root would leave benchmark directories owned by root.
 
 `bootstrap.sh` is idempotent:
 
