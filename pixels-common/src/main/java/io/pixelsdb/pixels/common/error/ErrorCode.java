@@ -170,4 +170,5 @@ public class ErrorCode
     public static final int RETINA_MARK_READY_FAILED = ERROR_RETINA_SERVER + 2;
     public static final int RETINA_UPDATE_FAILED = ERROR_RETINA_SERVER + 3;
     public static final int RETINA_VISIBILITY_FAILED = ERROR_RETINA_SERVER + 4;
+    public static final int RETINA_SNAPSHOT_EXPIRED = ERROR_RETINA_SERVER + 5;
 }

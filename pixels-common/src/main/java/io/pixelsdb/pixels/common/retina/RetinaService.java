@@ -338,23 +338,40 @@ public class RetinaService
 
     public static final class VisibilityResult
     {
+        private final RetinaProto.ReadSource readSource;
         private final long[][] bitmaps;
         private final String checkpointPath;
 
-        private VisibilityResult(long[][] bitmaps, String checkpointPath)
+        private VisibilityResult(RetinaProto.ReadSource readSource, long[][] bitmaps, String checkpointPath)
         {
+            this.readSource = readSource;
             this.bitmaps = bitmaps;
             this.checkpointPath = checkpointPath;
         }
 
         public static VisibilityResult fromBitmaps(long[][] bitmaps)
         {
-            return new VisibilityResult(bitmaps, null);
+            return new VisibilityResult(RetinaProto.ReadSource.FILE, bitmaps, null);
         }
 
         public static VisibilityResult fromCheckpointPath(String path)
         {
-            return new VisibilityResult(null, path);
+            return new VisibilityResult(RetinaProto.ReadSource.FILE, null, path);
+        }
+
+        public static VisibilityResult fromBuffer()
+        {
+            return new VisibilityResult(RetinaProto.ReadSource.BUFFER, null, null);
+        }
+
+        public RetinaProto.ReadSource getReadSource()
+        {
+            return readSource;
+        }
+
+        public boolean isBufferSource()
+        {
+            return readSource == RetinaProto.ReadSource.BUFFER;
         }
 
         public boolean isOffloaded()
@@ -377,31 +394,38 @@ public class RetinaService
         }
     }
 
-    public VisibilityResult queryVisibility(long fileId, int[] rgIds, long timestamp) throws RetinaException
-    {
-        return queryVisibility(fileId, rgIds, timestamp, -1);
-    }
-
     public VisibilityResult queryVisibility(long fileId, int[] rgIds, long timestamp, long transId) throws RetinaException
     {
         String token = UUID.randomUUID().toString();
-        RetinaProto.QueryVisibilityRequest.Builder requestBuilder = RetinaProto.QueryVisibilityRequest.newBuilder()
+        RetinaProto.QueryVisibilityRequest request = RetinaProto.QueryVisibilityRequest.newBuilder()
                 .setHeader(RetinaProto.RequestHeader.newBuilder().setToken(token).build())
                 .setFileId(fileId)
                 .addAllRgIds(Arrays.stream(rgIds).boxed().collect(Collectors.toList()))
-                .setTimestamp(timestamp);
-        if (transId != -1)
-        {
-            requestBuilder.setTransId(transId);
-        }
-        RetinaProto.QueryVisibilityResponse response = this.stub.queryVisibility(requestBuilder.build());
+                .setTimestamp(timestamp)
+                .setTransId(transId)
+                .build();
+        RetinaProto.QueryVisibilityResponse response = this.stub.queryVisibility(request);
         checkHeader("query visibility", token, response.getHeader());
+
+        RetinaProto.ReadSource readSource = response.getReadSource();
+        if (readSource == RetinaProto.ReadSource.READ_SOURCE_UNSPECIFIED)
+        {
+            throw new RetinaException("Query visibility response is missing read source");
+        }
+        if (readSource == RetinaProto.ReadSource.BUFFER)
+        {
+            return VisibilityResult.fromBuffer();
+        }
 
         if (response.getCheckpointPath() != null && !response.getCheckpointPath().isEmpty())
         {
             return VisibilityResult.fromCheckpointPath(response.getCheckpointPath());
         }
 
+        if (response.getBitmapsCount() != rgIds.length)
+        {
+            throw new RetinaException("Query visibility bitmap count does not match requested row groups");
+        }
         long[][] visibilityBitmaps = new long[rgIds.length][];
         for (int i = 0; i < response.getBitmapsCount(); i++)
         {
@@ -425,7 +449,9 @@ public class RetinaService
         return true;
     }
 
-    public RetinaProto.GetWriteBufferResponse getWriteBuffer(String schemaName, String tableName, int virtualNodeId, long timeStamp) throws RetinaException
+    public RetinaProto.GetWriteBufferResponse getWriteBuffer(
+            String schemaName, String tableName, int virtualNodeId, long timestamp, long transId)
+            throws RetinaException
     {
         String token = UUID.randomUUID().toString();
         RetinaProto.GetWriteBufferRequest request = RetinaProto.GetWriteBufferRequest.newBuilder()
@@ -433,7 +459,8 @@ public class RetinaService
                 .setSchemaName(schemaName)
                 .setTableName(tableName)
                 .setVirtualNodeId(virtualNodeId)
-                .setTimestamp(timeStamp)
+                .setTimestamp(timestamp)
+                .setTransId(transId)
                 .build();
         RetinaProto.GetWriteBufferResponse response = this.stub.getWriteBuffer(request);
         checkHeader("get write buffer for schema " + schemaName + ", table " + tableName,

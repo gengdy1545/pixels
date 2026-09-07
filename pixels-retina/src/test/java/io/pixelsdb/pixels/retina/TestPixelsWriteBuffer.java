@@ -76,7 +76,7 @@ public class TestPixelsWriteBuffer
             }
             // table id get from mysql `TBLS` table
             buffer = new PixelsWriteBuffer(0L, schema, orderMapping, targetOrderDirPath,
-                    targetCompactDirPath, "localhost", 0);
+                    targetCompactDirPath, "localhost", 0, RetinaResourceManager.Instance());
         } catch (Exception e)
         {
             System.out.println("setup error: " + e);

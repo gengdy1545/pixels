@@ -43,6 +43,8 @@ service TransService {
     rpc GetTransConcurrency (GetTransConcurrencyRequest) returns (GetTransConcurrencyResponse);
     rpc BindExternalTraceId (BindExternalTraceIdRequest) returns (BindExternalTraceIdResponse);
     rpc DumpTrans (DumpTransRequest) returns (DumpTransResponse);
+    rpc AllocatePlacementFence (AllocatePlacementFenceRequest) returns (AllocatePlacementFenceResponse);
+    rpc GetPlacementSafeBoundary (GetPlacementSafeBoundaryRequest) returns (GetPlacementSafeBoundaryResponse);
     rpc GetSafeVisibilityFoldingTimestamp(GetSafeVisibilityFoldingTimestampRequest)
         returns (GetSafeVisibilityFoldingTimestampResponse);
     rpc MarkTransOffloaded (MarkTransOffloadedRequest) returns (MarkTransOffloadedResponse);
@@ -216,6 +218,23 @@ message DumpTransRequest {
 
 message DumpTransResponse {
     int32 errorCode = 1;
+}
+
+message AllocatePlacementFenceRequest {
+}
+
+message AllocatePlacementFenceResponse {
+    int32 errorCode = 1;
+    uint64 placementFence = 2;
+}
+
+message GetPlacementSafeBoundaryRequest {
+}
+
+message GetPlacementSafeBoundaryResponse {
+    int32 errorCode = 1;
+    uint64 safeBoundary = 2;
+    string serviceIncarnation = 3;
 }
 
 message GetSafeVisibilityFoldingTimestampRequest {

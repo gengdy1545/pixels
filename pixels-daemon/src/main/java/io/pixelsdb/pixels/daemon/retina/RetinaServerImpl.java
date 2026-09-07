@@ -105,6 +105,7 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         {
             RecoveryContext recoveryContext = prepareRecoveryContext();
             RecoveryResult recoveryResult = recoverRetinaState(recoveryContext);
+            this.retinaResourceManager.recoverPlacementState();
             initializeRecoveredResources();
             publishStartupLifecycle(recoveryContext, recoveryResult);
             startRetinaMetricsLogThread();
@@ -1154,11 +1155,21 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
             long fileId = request.getFileId();
             int[] rgIds = request.getRgIdsList().stream().mapToInt(Integer::intValue).toArray();
             long timestamp = request.getTimestamp();
-            long transId = request.hasTransId() ? request.getTransId() : -1;
+            long transId = request.getTransId();
 
             RetinaProto.QueryVisibilityResponse.Builder responseBuilder = RetinaProto.QueryVisibilityResponse
                     .newBuilder()
                     .setHeader(headerBuilder.build());
+
+            RetinaProto.ReadSource readSource =
+                    this.retinaResourceManager.resolveReadSource(fileId, transId);
+            responseBuilder.setReadSource(readSource);
+            if (readSource == RetinaProto.ReadSource.BUFFER)
+            {
+                responseObserver.onNext(responseBuilder.build());
+                responseObserver.onCompleted();
+                return;
+            }
 
             String checkpointPath = this.retinaResourceManager.getOffloadCheckpointPath(timestamp);
             if (checkpointPath != null)
@@ -1169,7 +1180,8 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
             {
                 for (int rgId : rgIds)
                 {
-                    long[] visibilityBitmap = this.retinaResourceManager.queryVisibility(fileId, rgId, timestamp, transId);
+                    long[] visibilityBitmap =
+                            this.retinaResourceManager.queryVisibility(fileId, rgId, timestamp);
                     RetinaProto.VisibilityBitmap bitmap = RetinaProto.VisibilityBitmap.newBuilder()
                             .addAllBitmap(Arrays.stream(visibilityBitmap).boxed().collect(Collectors.toList()))
                             .build();
@@ -1177,6 +1189,14 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
                 }
             }
             responseObserver.onNext(responseBuilder.build());
+            responseObserver.onCompleted();
+        }
+        catch (RetinaResourceManager.SnapshotExpiredException e)
+        {
+            headerBuilder.setErrorCode(ErrorCode.RETINA_SNAPSHOT_EXPIRED).setErrorMsg(e.getMessage());
+            responseObserver.onNext(RetinaProto.QueryVisibilityResponse.newBuilder()
+                    .setHeader(headerBuilder.build())
+                    .build());
             responseObserver.onCompleted();
         }
         catch (RetinaException e)
@@ -1256,10 +1276,19 @@ public class RetinaServerImpl extends RetinaWorkerServiceGrpc.RetinaWorkerServic
         try
         {
             RetinaProto.GetWriteBufferResponse.Builder response = this.retinaResourceManager.getWriteBuffer(
-                    request.getSchemaName(), request.getTableName(), request.getTimestamp(), request.getVirtualNodeId());
+                    request.getSchemaName(), request.getTableName(), request.getTimestamp(),
+                    request.getVirtualNodeId(), request.getTransId());
             response.setHeader(headerBuilder);
 
             responseObserver.onNext(response.build());
+            responseObserver.onCompleted();
+        }
+        catch (RetinaResourceManager.SnapshotExpiredException e)
+        {
+            headerBuilder.setErrorCode(ErrorCode.RETINA_SNAPSHOT_EXPIRED).setErrorMsg(e.getMessage());
+            responseObserver.onNext(RetinaProto.GetWriteBufferResponse.newBuilder()
+                    .setHeader(headerBuilder.build())
+                    .build());
             responseObserver.onCompleted();
         }
         catch (RetinaException e)

@@ -480,44 +480,37 @@ public class PixelsRecordReaderImpl implements PixelsRecordReader
             }
         }
 
-        if (!needReadHiddenColumn && includedColumnNum == 0)
-        {
-            /**
-             * Issue #105:
-             * project nothing, must be count(*).
-             * includedColumnNum should only be set in checkBeforeRead().
-             */
-            qualifiedRowNum = includedRowNum;
-            endOfFile = true;
-            // init the following members as null or 0.
-            targetRGs = null;
-            targetRGNum = 0;
-            rowGroupFooters = null;
-
-            everPrepared = true;
-            return true;
-        }
-
-        targetRGs = new int[includedRGs.length];
+        int[] candidateRGs = new int[includedRGs.length];
         int targetRGIdx = 0;
         for (int i = 0; i < RGLen; i++)
         {
             if (includedRGs[i])
             {
-                targetRGs[targetRGIdx] = i + RGStart;
+                candidateRGs[targetRGIdx] = i + RGStart;
                 targetRGIdx++;
             }
         }
+        targetRGs = Arrays.copyOf(candidateRGs, targetRGIdx);
         targetRGNum = targetRGIdx;
 
-        // query visibility bitmap of target row groups
-        if (this.option.hasValidTransTimestamp() && retinaService.isEnabled())
+        // Resolve the physical source before any row-group footer or column-chunk I/O.
+        if (targetRGNum > 0 && this.option.hasValidTransTimestamp() && retinaService.isEnabled())
         {
             try
             {
                 MetadataService metadataService = MetadataService.Instance();
                 long fileId = metadataService.getFileId(physicalReader.getPathUri());
                 RetinaService.VisibilityResult result = retinaService.queryVisibility(fileId, targetRGs, option.getTransTimestamp(), option.getTransId());
+                if (result.isBufferSource())
+                {
+                    qualifiedRowNum = 0;
+                    targetRGs = null;
+                    targetRGNum = 0;
+                    rowGroupFooters = null;
+                    endOfFile = true;
+                    everPrepared = true;
+                    return true;
+                }
                 if (result.isOffloaded())
                 {
                     String checkpointPath = result.getCheckpointPath();
@@ -545,6 +538,23 @@ public class PixelsRecordReaderImpl implements PixelsRecordReader
                 logger.error("Failed to query visibility bitmap for file " + physicalReader.getPathUri(), e);
                 throw new IOException("Failed to query visibility bitmap for file " + physicalReader.getPathUri(), e);
             }
+        }
+
+        if (!needReadHiddenColumn && includedColumnNum == 0)
+        {
+            /**
+             * Issue #105:
+             * project nothing, must be count(*).
+             * includedColumnNum should only be set in checkBeforeRead().
+             */
+            qualifiedRowNum = includedRowNum;
+            endOfFile = true;
+            targetRGs = null;
+            targetRGNum = 0;
+            rowGroupFooters = null;
+
+            everPrepared = true;
+            return true;
         }
 
         if (targetRGNum == 0)

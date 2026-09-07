@@ -498,6 +498,35 @@ public class TransService
     }
 
     /**
+     * Allocate an exclusive placement fence from the transaction id sequence.
+     */
+    public long allocatePlacementFence() throws TransException
+    {
+        TransProto.AllocatePlacementFenceResponse response =
+                this.stub.allocatePlacementFence(TransProto.AllocatePlacementFenceRequest.getDefaultInstance());
+        if (response.getErrorCode() != ErrorCode.SUCCESS)
+        {
+            throw new TransException("failed to allocate placement fence, error code=" + response.getErrorCode());
+        }
+        return response.getPlacementFence();
+    }
+
+    /**
+     * Get the transaction-id boundary below which every scan has terminated, paired with the transaction service
+     * incarnation that produced it.
+     */
+    public PlacementSafeBoundary getPlacementSafeBoundary() throws TransException
+    {
+        TransProto.GetPlacementSafeBoundaryResponse response =
+                this.stub.getPlacementSafeBoundary(TransProto.GetPlacementSafeBoundaryRequest.getDefaultInstance());
+        if (response.getErrorCode() != ErrorCode.SUCCESS)
+        {
+            throw new TransException("failed to get placement safe boundary, error code=" + response.getErrorCode());
+        }
+        return new PlacementSafeBoundary(response.getSafeBoundary(), response.getServiceIncarnation());
+    }
+
+    /**
      * Get the safe upper bound (inclusive) for folding DELETE timestamps into
      * the visibility base bitmap.
      *
@@ -536,5 +565,27 @@ public class TransService
             throw new TransException("failed to mark transaction as offloaded, error code=" + response.getErrorCode());
         }
         return true;
+    }
+
+    public static final class PlacementSafeBoundary
+    {
+        private final long safeBoundary;
+        private final String serviceIncarnation;
+
+        private PlacementSafeBoundary(long safeBoundary, String serviceIncarnation)
+        {
+            this.safeBoundary = safeBoundary;
+            this.serviceIncarnation = serviceIncarnation;
+        }
+
+        public long getSafeBoundary()
+        {
+            return safeBoundary;
+        }
+
+        public String getServiceIncarnation()
+        {
+            return serviceIncarnation;
+        }
     }
 }

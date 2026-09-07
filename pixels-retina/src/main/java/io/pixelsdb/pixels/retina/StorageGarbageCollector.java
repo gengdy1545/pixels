@@ -289,16 +289,21 @@ public class StorageGarbageCollector
      *                          per-RG aggregation loop in candidate selection.
      * @param gcSnapshotBitmaps per-RG snapshot bitmaps (mutated in-place: non-candidate
      *                          entries removed to reduce memory pressure)
+     * @param protectedHandoffFileIds files whose buffer objects are still owned by
+     *                                a publication handoff
      */
     void runStorageGC(long safeGcTs, Map<Long, long[]> fileStats,
-                      Map<String, long[]> gcSnapshotBitmaps)
+                      Map<String, long[]> gcSnapshotBitmaps,
+                      Set<Long> protectedHandoffFileIds)
     {
         // Pre-compute candidate file IDs from file-level stats (O(1) per file).
         Set<Long> candidateFileIds = new HashSet<>();
         for (Map.Entry<Long, long[]> entry : fileStats.entrySet())
         {
             long[] stats = entry.getValue();
-            if (stats[0] > 0 && (double) stats[1] / stats[0] > gcThreshold)
+            if (!protectedHandoffFileIds.contains(entry.getKey())
+                    && stats[0] > 0
+                    && (double) stats[1] / stats[0] > gcThreshold)
             {
                 candidateFileIds.add(entry.getKey());
             }

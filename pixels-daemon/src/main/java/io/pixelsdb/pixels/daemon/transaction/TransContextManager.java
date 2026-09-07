@@ -73,6 +73,15 @@ public class TransContextManager
      */
     private final Set<TransContext> runningWriteTrans = new ConcurrentSkipListSet<>();
     /**
+     * Active read-only scans ordered by transaction id. Unlike {@link #runningReadOnlyTrans}, offloaded scans remain
+     * in this set until commit or rollback because they can still read Retina buffer objects.
+     */
+    private final NavigableSet<Long> activeScanTransIds = new ConcurrentSkipListSet<>();
+    /**
+     * The exclusive upper bound of transaction ids observed by this service incarnation.
+     */
+    private final AtomicLong placementAllocationBoundary = new AtomicLong(0L);
+    /**
      * The max timestamp of terminated non-readonly transactions.
      */
     private final AtomicLong maxTermedWriteTransTs = new AtomicLong(-1L);
@@ -87,7 +96,7 @@ public class TransContextManager
 
     private final ReadWriteLock contextLock = new ReentrantReadWriteLock();
 
-    private TransContextManager() { }
+    TransContextManager() { }
 
     /**
      * Add a trans context when a new transaction begins.
@@ -104,10 +113,12 @@ public class TransContextManager
             {
                 this.readOnlyConcurrency.incrementAndGet();
                 this.runningReadOnlyTrans.add(context);
+                this.activeScanTransIds.add(context.getTransId());
             } else
             {
                 this.runningWriteTrans.add(context);
             }
+            advancePlacementAllocationBoundary(context.getTransId() + 1);
         }
         finally
         {
@@ -132,10 +143,12 @@ public class TransContextManager
                 {
                     this.readOnlyConcurrency.incrementAndGet();
                     this.runningReadOnlyTrans.add(context);
+                    this.activeScanTransIds.add(context.getTransId());
                 } else
                 {
                     this.runningWriteTrans.add(context);
                 }
+                advancePlacementAllocationBoundary(context.getTransId() + 1);
             }
         }
         finally
@@ -343,6 +356,7 @@ public class TransContextManager
                 context.setStatus(status);
                 this.readOnlyConcurrency.decrementAndGet();
                 this.runningReadOnlyTrans.remove(context);
+                this.activeScanTransIds.remove(context.getTransId());
                 // Issue #1245: update max terminated transaction timestamp after termination
                 long maxTermedTransTs = this.maxTermedReadonlyTransTs.get();
                 final long currTransTs = context.getTimestamp();
@@ -559,8 +573,41 @@ public class TransContextManager
     }
 
     /**
+     * Record a placement fence consumed from the transaction id sequence.
+     * The caller serializes this operation with transaction begin and placement boundary reads.
+     */
+    void recordPlacementFence(long placementFence)
+    {
+        advancePlacementAllocationBoundary(placementFence + 1);
+    }
+
+    /**
+     * Return the first active scan id, or the next id after all allocations observed by this service incarnation when
+     * no scan is active. Every scan id below the returned value has terminated.
+     */
+    long getPlacementSafeBoundary()
+    {
+        Iterator<Long> iterator = this.activeScanTransIds.iterator();
+        if (iterator.hasNext())
+        {
+            return iterator.next();
+        }
+        return this.placementAllocationBoundary.get();
+    }
+
+    private void advancePlacementAllocationBoundary(long boundary)
+    {
+        long current = this.placementAllocationBoundary.get();
+        while (boundary > current && !this.placementAllocationBoundary.compareAndSet(current, boundary))
+        {
+            current = this.placementAllocationBoundary.get();
+        }
+    }
+
+    /**
      * Mark a transaction as offloaded. This allows the transaction context manager to
-     * skip it when calculating the minimum running transaction timestamp.
+     * skip it when calculating the minimum running transaction timestamp. The transaction remains in the active scan
+     * id set until commit or rollback.
      * 
      * @param transId the transaction id
      * @return true if the transaction exists and was marked as offloaded, false otherwise

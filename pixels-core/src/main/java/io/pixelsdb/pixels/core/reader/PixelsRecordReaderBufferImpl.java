@@ -48,7 +48,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
     private static final Logger LOGGER = LoggerFactory.getLogger(PixelsRecordReaderBufferImpl.class);
     private static final Long POLL_INTERVAL_MILLS = 200L;
     private static final int DEFAULT_QUEUE_CAPACITY = 16;
-    private final byte[] activeMemtableData;
+    private byte[] activeMemtableData;
     private final String retinaHost;
     private final List<Long> fileIds;
     private final PixelsReaderOption option;
@@ -60,16 +60,21 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
     private final int colNum;
     private final int vectorLayout;
     private static ExecutorService prefetchExecutor; // Thread pool for I/O and deserialization
-    private final BlockingQueue<VectorizedRowBatch> prefetchQueue; // Queue for completed batches
-    private final AtomicInteger pendingTasks = new AtomicInteger(0); // Counter for submitted but unfinished tasks
-    private final AtomicBoolean initialMemtableSubmitted = new AtomicBoolean(false); // Flag for active memtable
+    private final BlockingQueue<PrefetchedBatch> prefetchQueue;
+    private final List<Future<?>> prefetchTasks = new ArrayList<>();
+    private final AtomicBoolean prefetchStarted = new AtomicBoolean(false);
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final AtomicInteger remainingBatches;
+    private final AtomicInteger readRequests = new AtomicInteger(0);
+    private final Object lifecycleLock = new Object();
+    private final Object readLock = new Object();
     private static int maxPrefetchTasks;
     private static final int prefetchQueueCapacity = DEFAULT_QUEUE_CAPACITY; // Queue capacity
     private final boolean shouldReadHiddenColumn;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private final List<RetinaProto.VisibilityBitmap> visibilityBitmap;
     private final List<PixelsProto.Type> includedColumnTypes;
     private final AtomicLong memoryUsage = new AtomicLong(0L);
+    private final AtomicLong dataReadBytes = new AtomicLong(0L);
     /**
      * Columns included by reader option; if included, set true
      */
@@ -89,17 +94,35 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
      * but they are all the index of the columns in the file schema.
      */
     private int[] targetColumns;
-    private int fileIdIndex = 0;
     private int includedColumnNum = 0;
     private long readTimeNanos = 0L;
     private boolean checkValid = false;
     private boolean activeMemtableDataEverRead = false;
-    private boolean everRead;
-    private boolean endOfFile = false;
+    private volatile boolean endOfFile = false;
     private TypeDescription resultSchema = null;
-    private long dataReadBytes = 0L;
     private long dataReadRow = 0L;
     private int vNodeId;
+
+    private static final class PrefetchedBatch
+    {
+        private final int bitmapIndex;
+        private final VectorizedRowBatch batch;
+        private final Throwable failure;
+
+        private PrefetchedBatch(int bitmapIndex, VectorizedRowBatch batch, Throwable failure)
+        {
+            this.bitmapIndex = bitmapIndex;
+            this.batch = batch;
+            this.failure = failure;
+        }
+    }
+
+    @FunctionalInterface
+    private interface PrefetchOperation
+    {
+        VectorizedRowBatch load() throws Exception;
+    }
+
     public PixelsRecordReaderBufferImpl(PixelsReaderOption option,
                                         String retinaHost,
                                         byte[] activeMemtableData, List<Long> fileIds,  // read version
@@ -129,9 +152,10 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
         this.shouldReadHiddenColumn = option.hasValidTransTimestamp();
         this.visibilityBitmap = visibilityBitmap;
         this.includedColumnTypes = new ArrayList<>();
-        this.everRead = false;
         this.vNodeId = vNodeId;
         this.prefetchQueue = new LinkedBlockingQueue<>(prefetchQueueCapacity);
+        this.remainingBatches = new AtomicInteger(fileIds.size() +
+                (activeMemtableData != null && activeMemtableData.length != 0 ? 1 : 0));
         initInternalExecutor();
         checkBeforeRead();
     }
@@ -162,78 +186,148 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
 
     private void startPrefetching()
     {
-        // Submit Active Memtable Task (executed only once)
-        if (activeMemtableData != null && activeMemtableData.length != 0 && initialMemtableSubmitted.compareAndSet(false, true))
+        if (!prefetchStarted.compareAndSet(false, true) || closed.get())
         {
-            pendingTasks.incrementAndGet();
-            prefetchExecutor.submit(() ->
-            {
-                try
-                {
-                    memoryUsage.addAndGet(activeMemtableData.length);
-                    ByteBuffer buffer = ByteBuffer.wrap(activeMemtableData);
-                    VectorizedRowBatch batch = VectorizedRowBatch.deserialize(buffer, vectorLayout);
-                    memoryUsage.addAndGet(batch.getMemoryUsage());
-                    prefetchQueue.put(batch);
-                } catch (Exception e)
-                {
-                    LOGGER.error("Failed to deserialize active memtable data", e);
-                } finally
-                {
-                    pendingTasks.decrementAndGet();
-                }
-            });
+            return;
         }
 
-        // Submit File ID Tasks (while under max concurrency and not EOF)
-        // This task will continue to run in the background, submitting more tasks
-        // as the pendingTasks count drops.
-        prefetchExecutor.submit(() ->
+        byte[] memtableData;
+        synchronized (lifecycleLock)
         {
-            while (fileIdIndex < fileIds.size())
+            if (closed.get())
             {
-                if (pendingTasks.get() >= maxPrefetchTasks)
+                return;
+            }
+            memtableData = activeMemtableData;
+            activeMemtableData = null;
+        }
+
+        if (memtableData != null && memtableData.length != 0)
+        {
+            submitPrefetch(0, () -> VectorizedRowBatch.deserialize(
+                    ByteBuffer.wrap(memtableData), vectorLayout));
+        }
+
+        for (int i = 0; i < fileIds.size(); ++i)
+        {
+            final int bitmapIndex = i + 1;
+            final long fileId = fileIds.get(i);
+            submitPrefetch(bitmapIndex, () ->
+            {
+                readRequests.incrementAndGet();
+                ByteBuffer buffer = getMemtableDataFromStorage(fileId);
+                return VectorizedRowBatch.deserialize(buffer, vectorLayout);
+            });
+        }
+    }
+
+    private void submitPrefetch(int bitmapIndex, PrefetchOperation operation)
+    {
+        if (closed.get())
+        {
+            return;
+        }
+
+        Future<?> task;
+        try
+        {
+            task = prefetchExecutor.submit(() -> runPrefetch(bitmapIndex, operation));
+        }
+        catch (RuntimeException e)
+        {
+            enqueuePrefetchedBatch(new PrefetchedBatch(bitmapIndex, null, e));
+            return;
+        }
+
+        synchronized (lifecycleLock)
+        {
+            if (closed.get())
+            {
+                task.cancel(true);
+            }
+            else
+            {
+                prefetchTasks.add(task);
+            }
+        }
+    }
+
+    private void runPrefetch(int bitmapIndex, PrefetchOperation operation)
+    {
+        VectorizedRowBatch batch = null;
+        try
+        {
+            if (closed.get())
+            {
+                return;
+            }
+
+            batch = operation.load();
+            if (enqueuePrefetchedBatch(new PrefetchedBatch(bitmapIndex, batch, null)))
+            {
+                batch = null;
+            }
+        }
+        catch (Throwable failure)
+        {
+            if (!closed.get())
+            {
+                enqueuePrefetchedBatch(new PrefetchedBatch(bitmapIndex, null, failure));
+            }
+        }
+        finally
+        {
+            if (batch != null)
+            {
+                batch.close();
+            }
+        }
+    }
+
+    private boolean enqueuePrefetchedBatch(PrefetchedBatch prefetchedBatch)
+    {
+        boolean interrupted = false;
+        try
+        {
+            while (true)
+            {
+                synchronized (lifecycleLock)
                 {
-                    // Backpressure: Wait if the thread pool is full
-                    try
+                    if (closed.get())
                     {
-                        Thread.sleep(POLL_INTERVAL_MILLS);
-                    } catch (InterruptedException e)
-                    {
-                        Thread.currentThread().interrupt();
-                        break;
+                        return false;
                     }
-                    continue;
+                    if (prefetchQueue.offer(prefetchedBatch))
+                    {
+                        if (prefetchedBatch.batch != null)
+                        {
+                            memoryUsage.addAndGet(prefetchedBatch.batch.getMemoryUsage());
+                        }
+                        return true;
+                    }
                 }
 
-                pendingTasks.incrementAndGet();
-                final int currentIndex = fileIdIndex++;
-                final long fileId = fileIds.get(currentIndex);
-
-                prefetchExecutor.submit(() ->
+                try
                 {
-                    ByteBuffer buffer = null;
-                    try
+                    Thread.sleep(POLL_INTERVAL_MILLS);
+                }
+                catch (InterruptedException e)
+                {
+                    interrupted = true;
+                    if (closed.get())
                     {
-                        // I/O Blocking Operation
-                        String path = getRetinaBufferStoragePathFromId(fileId, vNodeId);
-                        buffer = getMemtableDataFromStorage(path);
-
-                        // CPU Intensive Operation
-                        VectorizedRowBatch batch = VectorizedRowBatch.deserialize(buffer, vectorLayout);
-                        memoryUsage.addAndGet(batch.getMemoryUsage());
-                        // Put result into the queue (blocks if queue is full)
-                        prefetchQueue.put(batch);
-                    } catch (Exception e)
-                    {
-                        LOGGER.error("Failed to prefetch and deserialize file ID: " + fileId, e);
-                    } finally
-                    {
-                        pendingTasks.decrementAndGet();
+                        return false;
                     }
-                });
+                }
             }
-        });
+        }
+        finally
+        {
+            if (interrupted)
+            {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private void checkBeforeRead() throws IOException
@@ -302,17 +396,17 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
      */
     private boolean read() throws IOException
     {
-        if (!everRead)
+        startPrefetching();
+        if (closed.get())
         {
-            startPrefetching();
-            everRead = true;
+            endOfFile = true;
+            return false;
         }
-        if (fileIdIndex >= fileIds.size() && pendingTasks.get() == 0)
+        if (remainingBatches.get() == 0)
         {
             endOfFile = true;
         }
         return checkValid;
-        // Always return true to signal the loop to check the prefetch queue
     }
 
     @Override
@@ -341,51 +435,84 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
     @Override
     public VectorizedRowBatch readBatch() throws IOException
     {
-        long start = System.nanoTime();
-        if (!read())
+        synchronized (readLock)
         {
-            return createEmptyRowBatch(0);
-        }
-
-        VectorizedRowBatch curRowBatch = null;
-        try
-        {
-            // Block and wait for the next batch to be available
-            curRowBatch = prefetchQueue.poll(POLL_INTERVAL_MILLS, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e)
-        {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while waiting for prefetched batch.", e);
-        }
-
-        // Check for EOF condition
-        if (curRowBatch == null)
-        {
-            return createEmptyRowBatch(0);
-        }
-        memoryUsage.addAndGet(-curRowBatch.getMemoryUsage());
-
-        LongColumnVector hiddenTimestampVector = (LongColumnVector) curRowBatch.cols[this.colNum - 1];
-        /**
-         * construct the selected rows bitmap, size is curBatchSize
-         * the i-th bit presents the curRowInRG + i row in chunkBuffers is selected or not.
-         */
-        int curBatchSize = curRowBatch.size;
-        Bitmap selectedRows = new Bitmap(curBatchSize, false);
-        int addedRows = 0;
-        for (int i = 0; i < curBatchSize; i++)
-        {
-            if ((hiddenTimestampVector == null || hiddenTimestampVector.vector[i] <= this.option.getTransTimestamp())
-                    && (!retinaEnabled || visibilityBitmap == null || !checkBit(visibilityBitmap.get(fileIdIndex), i)))
+            long start = System.nanoTime();
+            if (!read())
             {
-                selectedRows.set(i);
-                addedRows++;
+                return createEmptyRowBatch(0);
             }
+
+            if (remainingBatches.get() == 0)
+            {
+                endOfFile = true;
+                return createEmptyRowBatch(0);
+            }
+
+            PrefetchedBatch prefetchedBatch;
+            while (true)
+            {
+                synchronized (lifecycleLock)
+                {
+                    if (closed.get())
+                    {
+                        endOfFile = true;
+                        return createEmptyRowBatch(0);
+                    }
+                    prefetchedBatch = prefetchQueue.poll();
+                    if (prefetchedBatch != null && prefetchedBatch.batch != null)
+                    {
+                        memoryUsage.addAndGet(-prefetchedBatch.batch.getMemoryUsage());
+                    }
+                }
+
+                if (prefetchedBatch != null)
+                {
+                    break;
+                }
+
+                try
+                {
+                    Thread.sleep(POLL_INTERVAL_MILLS);
+                }
+                catch (InterruptedException e)
+                {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while waiting for prefetched batch.", e);
+                }
+            }
+
+            remainingBatches.decrementAndGet();
+            if (prefetchedBatch.failure != null)
+            {
+                close();
+                throw new IOException("Failed to prefetch buffer batch with bitmap index " +
+                        prefetchedBatch.bitmapIndex + ".", prefetchedBatch.failure);
+            }
+
+            VectorizedRowBatch curRowBatch = prefetchedBatch.batch;
+
+            LongColumnVector hiddenTimestampVector = (LongColumnVector) curRowBatch.cols[this.colNum - 1];
+            /**
+             * construct the selected rows bitmap, size is curBatchSize
+             * the i-th bit presents the curRowInRG + i row in chunkBuffers is selected or not.
+             */
+            int curBatchSize = curRowBatch.size;
+            Bitmap selectedRows = new Bitmap(curBatchSize, false);
+            for (int i = 0; i < curBatchSize; i++)
+            {
+                if ((hiddenTimestampVector == null || hiddenTimestampVector.vector[i] <= this.option.getTransTimestamp())
+                        && (!retinaEnabled || visibilityBitmap == null ||
+                        !checkBit(visibilityBitmap.get(prefetchedBatch.bitmapIndex), i)))
+                {
+                    selectedRows.set(i);
+                }
+            }
+            curRowBatch.applyFilter(selectedRows);
+            dataReadRow += curRowBatch.size;
+            readTimeNanos += System.nanoTime() - start;
+            return curRowBatch;
         }
-        curRowBatch.applyFilter(selectedRows);
-        dataReadRow += curRowBatch.size;
-        readTimeNanos += System.nanoTime() - start;
-        return curRowBatch;
     }
 
     @Override
@@ -428,13 +555,13 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
     @Override
     public long getCompletedBytes()
     {
-        return dataReadBytes;
+        return dataReadBytes.get();
     }
 
     @Override
     public int getNumReadRequests()
     {
-        return fileIdIndex;
+        return readRequests.get();
     }
 
     @Override
@@ -452,11 +579,31 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
     @Override
     public void close() throws IOException
     {
-        List<VectorizedRowBatch> remaining = new ArrayList<>();
-        prefetchQueue.drainTo(remaining);
-        for (VectorizedRowBatch b : remaining)
+        List<PrefetchedBatch> remaining = new ArrayList<>();
+        synchronized (lifecycleLock)
         {
-            memoryUsage.addAndGet(-b.getMemoryUsage());
+            if (!closed.compareAndSet(false, true))
+            {
+                return;
+            }
+
+            endOfFile = true;
+            activeMemtableData = null;
+            for (Future<?> task : prefetchTasks)
+            {
+                task.cancel(true);
+            }
+            prefetchTasks.clear();
+            prefetchQueue.drainTo(remaining);
+        }
+
+        for (PrefetchedBatch prefetchedBatch : remaining)
+        {
+            if (prefetchedBatch.batch != null)
+            {
+                memoryUsage.addAndGet(-prefetchedBatch.batch.getMemoryUsage());
+                prefetchedBatch.batch.close();
+            }
         }
     }
 
@@ -474,11 +621,16 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
         return this.retinaBufferStorageFolder + String.format("%d/%d/%s_%d", tableId, virtualId, retinaHost, entryId);
     }
 
+    ByteBuffer getMemtableDataFromStorage(long fileId) throws IOException
+    {
+        String path = getRetinaBufferStoragePathFromId(fileId, vNodeId);
+        return getMemtableDataFromStorage(path);
+    }
+
     private ByteBuffer getMemtableDataFromStorage(String path) throws IOException
     {
         // Polling loop for file existence runs inside the prefetchExecutor's worker thread.
-        // This loop will continue indefinitely until the file is successfully read.
-        while (true)
+        while (!closed.get())
         {
 
             if (storage.exists(path))
@@ -486,8 +638,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
                 try (PhysicalReader reader = PhysicalReaderUtil.newPhysicalReader(storage, path))
                 {
                     int length = (int) reader.getFileLength();
-                    dataReadBytes += length;
-                    memoryUsage.addAndGet(length);
+                    dataReadBytes.addAndGet(length);
                     return reader.readFully(length);
                 }
             }
@@ -501,6 +652,7 @@ public class PixelsRecordReaderBufferImpl implements PixelsRecordReader
                 throw new RuntimeException("Interrupted while waiting for file existence: " + path, e);
             }
         }
+        throw new IOException("Buffer reader closed while waiting for file: " + path);
     }
 
 

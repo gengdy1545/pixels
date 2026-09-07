@@ -68,11 +68,20 @@ import org.apache.logging.log4j.Logger;
 public class RetinaResourceManager
 {
     private static final Logger logger = LogManager.getLogger(RetinaResourceManager.class);
+    private static final long HANDOFF_WAIT_TIMEOUT_MS = 30_000L;
 
     private final MetadataService metadataService;
     private final IndexService indexService;
     private final Map<String, RGVisibility> rgVisibilityMap;
     private final Map<String, Map<Integer, PixelsWriteBuffer>> pixelsWriteBufferMap;
+    private final Map<Long, PublishedHandoff> handoffByFileId = new ConcurrentHashMap<>();
+    private final ReadWriteLock handoffStateLock = new ReentrantReadWriteLock();
+    private final ConcurrentLinkedQueue<ObjectDeleteTask> objectDeleteQueue = new ConcurrentLinkedQueue<>();
+    private final PlacementCoordinator placementCoordinator;
+    private final ObjectBlockDeleter objectBlockDeleter;
+    private volatile PlacementState placementState = PlacementState.INITIALIZING;
+    private volatile long startupFence = -1L;
+    private volatile String placementServiceIncarnation;
     private String retinaHostName;
 
     // GC related fields
@@ -158,8 +167,120 @@ public class RetinaResourceManager
         }
     }
 
+    public enum PlacementState
+    {
+        INITIALIZING,
+        READY,
+        RECOVERY_REQUIRED
+    }
+
+    public static final class SnapshotExpiredException extends RetinaException
+    {
+        SnapshotExpiredException(String message)
+        {
+            super(message);
+        }
+    }
+
+    interface PlacementCoordinator
+    {
+        long allocatePlacementFence() throws RetinaException;
+
+        PlacementBoundary getPlacementSafeBoundary() throws RetinaException;
+    }
+
+    static final class PlacementBoundary
+    {
+        final long safeBoundary;
+        final String serviceIncarnation;
+
+        PlacementBoundary(long safeBoundary, String serviceIncarnation)
+        {
+            this.safeBoundary = safeBoundary;
+            this.serviceIncarnation = serviceIncarnation;
+        }
+    }
+
+    interface ObjectBlockDeleter
+    {
+        void delete(long tableId, int virtualNodeId, long objectId) throws RetinaException;
+    }
+
+    interface HandoffBlockMover
+    {
+        void move(PublishedHandoff handoff) throws RetinaException;
+    }
+
+    private static final class ObjectDeleteTask
+    {
+        final PublishedHandoff handoff;
+        final ObjectEntry objectEntry;
+
+        private ObjectDeleteTask(PublishedHandoff handoff, ObjectEntry objectEntry)
+        {
+            this.handoff = handoff;
+            this.objectEntry = objectEntry;
+        }
+    }
+
+    private static final class BufferPlacementSnapshot
+    {
+        final SuperVersion superVersion;
+        final List<ObjectEntry> retainedEntries;
+
+        private BufferPlacementSnapshot(SuperVersion superVersion, List<ObjectEntry> retainedEntries)
+        {
+            this.superVersion = superVersion;
+            this.retainedEntries = retainedEntries;
+        }
+    }
+
+    private static final class DefaultPlacementCoordinator implements PlacementCoordinator
+    {
+        @Override
+        public long allocatePlacementFence() throws RetinaException
+        {
+            try
+            {
+                return TransService.Instance().allocatePlacementFence();
+            }
+            catch (TransException e)
+            {
+                throw new RetinaException("Failed to allocate placement fence", e);
+            }
+        }
+
+        @Override
+        public PlacementBoundary getPlacementSafeBoundary() throws RetinaException
+        {
+            try
+            {
+                TransService.PlacementSafeBoundary boundary =
+                        TransService.Instance().getPlacementSafeBoundary();
+                return new PlacementBoundary(
+                        boundary.getSafeBoundary(), boundary.getServiceIncarnation());
+            }
+            catch (TransException e)
+            {
+                throw new RetinaException("Failed to get placement safe boundary", e);
+            }
+        }
+    }
+
     private RetinaResourceManager()
     {
+        this(new DefaultPlacementCoordinator(),
+                (tableId, virtualNodeId, objectId) ->
+                        ObjectStorageManager.Instance().delete(tableId, virtualNodeId, objectId));
+    }
+
+    RetinaResourceManager(PlacementCoordinator placementCoordinator,
+                          ObjectBlockDeleter objectBlockDeleter)
+    {
+        this.placementCoordinator = Objects.requireNonNull(
+                placementCoordinator, "placementCoordinator is null");
+        this.objectBlockDeleter = Objects.requireNonNull(
+                objectBlockDeleter, "objectBlockDeleter is null");
         this.metadataService = MetadataService.Instance();
         this.indexService = IndexServiceProvider.getService(IndexServiceProvider.ServiceMode.local);
         this.rgVisibilityMap = new ConcurrentHashMap<>();
@@ -229,6 +350,397 @@ public class RetinaResourceManager
     public static RetinaResourceManager Instance()
     {
         return InstanceHolder.instance;
+    }
+
+    public PlacementState getPlacementState()
+    {
+        return placementState;
+    }
+
+    long getStartupFence()
+    {
+        return startupFence;
+    }
+
+    /**
+     * Establishes a new service-incarnation boundary before Retina accepts reads.
+     * Existing handoffs remain retained; queries older than the new startup fence
+     * are rejected instead of being routed against a reconstructed buffer view.
+     */
+    public void recoverPlacementState() throws RetinaException
+    {
+        long recoveredStartupFence = placementCoordinator.allocatePlacementFence();
+        PlacementBoundary boundary = placementCoordinator.getPlacementSafeBoundary();
+        if (boundary.serviceIncarnation == null || boundary.serviceIncarnation.isEmpty())
+        {
+            throw new RetinaException("Transaction service returned an empty incarnation");
+        }
+
+        handoffStateLock.writeLock().lock();
+        try
+        {
+            this.startupFence = recoveredStartupFence;
+            this.placementServiceIncarnation = boundary.serviceIncarnation;
+            this.placementState = PlacementState.READY;
+        }
+        finally
+        {
+            handoffStateLock.writeLock().unlock();
+        }
+        logger.info("Retina placement routing ready at startupFence={}, incarnation={}",
+                recoveredStartupFence, boundary.serviceIncarnation);
+    }
+
+    PublishedHandoff registerPreparingHandoff(
+            long fileId, long tableId, int virtualNodeId,
+            long firstBlockId, long lastBlockId) throws RetinaException
+    {
+        requirePlacementReady();
+        handoffStateLock.writeLock().lock();
+        try
+        {
+            PublishedHandoff handoff = handoffByFileId.get(fileId);
+            if (handoff == null)
+            {
+                handoff = new PublishedHandoff(
+                        fileId, tableId, virtualNodeId, firstBlockId, lastBlockId);
+                handoffByFileId.put(fileId, handoff);
+                return handoff;
+            }
+            handoff.verifyIdentity(tableId, virtualNodeId, firstBlockId, lastBlockId);
+            handoff.prepareRetry();
+            return handoff;
+        }
+        finally
+        {
+            handoffStateLock.writeLock().unlock();
+        }
+    }
+
+    void markHandoffMetadataPublished(PublishedHandoff handoff) throws RetinaException
+    {
+        handoffStateLock.writeLock().lock();
+        try
+        {
+            requireRegisteredHandoff(handoff);
+            handoff.markMetadataPublished();
+        }
+        finally
+        {
+            handoffStateLock.writeLock().unlock();
+        }
+    }
+
+    void cancelPreparingHandoff(PublishedHandoff handoff) throws RetinaException
+    {
+        handoffStateLock.writeLock().lock();
+        try
+        {
+            requireRegisteredHandoff(handoff);
+            handoff.cancel();
+        }
+        finally
+        {
+            handoffStateLock.writeLock().unlock();
+        }
+    }
+
+    void fenceAndPublishHandoff(PublishedHandoff handoff, HandoffBlockMover blockMover)
+            throws RetinaException
+    {
+        requirePlacementReady();
+        if (handoff.getState() == PublishedHandoff.State.FENCED
+                || handoff.getState() == PublishedHandoff.State.RETIRING)
+        {
+            return;
+        }
+
+        synchronized (handoff)
+        {
+            if (handoff.getFence() == PublishedHandoff.UNASSIGNED_FENCE)
+            {
+                handoff.assignFence(placementCoordinator.allocatePlacementFence());
+            }
+        }
+
+        handoffStateLock.writeLock().lock();
+        try
+        {
+            requireRegisteredHandoff(handoff);
+            if (handoff.getState() == PublishedHandoff.State.FENCED
+                    || handoff.getState() == PublishedHandoff.State.RETIRING)
+            {
+                return;
+            }
+            if (!handoff.hasRetainedEntries())
+            {
+                blockMover.move(handoff);
+            }
+            handoff.publishFenced();
+        }
+        finally
+        {
+            handoffStateLock.writeLock().unlock();
+        }
+    }
+
+    PublishedHandoff getPublishedHandoff(long fileId)
+    {
+        return handoffByFileId.get(fileId);
+    }
+
+    public RetinaProto.ReadSource resolveReadSource(long fileId, long transId) throws RetinaException
+    {
+        validatePlacementQuery(transId);
+        while (true)
+        {
+            PublishedHandoff preparing = null;
+            handoffStateLock.readLock().lock();
+            try
+            {
+                PublishedHandoff handoff = handoffByFileId.get(fileId);
+                if (handoff == null)
+                {
+                    return isCurrentBufferFile(fileId)
+                            ? RetinaProto.ReadSource.BUFFER
+                            : RetinaProto.ReadSource.FILE;
+                }
+                if (handoff.getState() == PublishedHandoff.State.PREPARING)
+                {
+                    preparing = handoff;
+                }
+                else
+                {
+                    return handoff.resolveSource(transId);
+                }
+            }
+            finally
+            {
+                handoffStateLock.readLock().unlock();
+            }
+            preparing.awaitStableState(HANDOFF_WAIT_TIMEOUT_MS);
+            validatePlacementQuery(transId);
+        }
+    }
+
+    Set<Long> getProtectedHandoffFileIds()
+    {
+        handoffStateLock.readLock().lock();
+        try
+        {
+            Set<Long> protectedFileIds = new HashSet<>();
+            for (PublishedHandoff handoff : handoffByFileId.values())
+            {
+                PublishedHandoff.State state = handoff.getState();
+                if (state == PublishedHandoff.State.PREPARING
+                        || state == PublishedHandoff.State.FENCED
+                        || state == PublishedHandoff.State.RETIRING
+                        || state == PublishedHandoff.State.CANCELLED)
+                {
+                    protectedFileIds.add(handoff.getFileId());
+                }
+            }
+            return protectedFileIds;
+        }
+        finally
+        {
+            handoffStateLock.readLock().unlock();
+        }
+    }
+
+    void reclaimPublishedHandoffs()
+    {
+        if (placementState == PlacementState.INITIALIZING)
+        {
+            return;
+        }
+        if (placementState == PlacementState.RECOVERY_REQUIRED)
+        {
+            try
+            {
+                recoverPlacementState();
+            }
+            catch (RetinaException e)
+            {
+                logger.warn("Failed to recover Retina placement state", e);
+            }
+            return;
+        }
+
+        PlacementBoundary boundary;
+        try
+        {
+            boundary = placementCoordinator.getPlacementSafeBoundary();
+        }
+        catch (RetinaException e)
+        {
+            logger.warn("Failed to read placement safe boundary", e);
+            return;
+        }
+
+        if (!Objects.equals(placementServiceIncarnation, boundary.serviceIncarnation))
+        {
+            handoffStateLock.writeLock().lock();
+            try
+            {
+                placementState = PlacementState.RECOVERY_REQUIRED;
+            }
+            finally
+            {
+                handoffStateLock.writeLock().unlock();
+            }
+            logger.warn("Transaction service incarnation changed from {} to {}; "
+                            + "Retina placement recovery is required",
+                    placementServiceIncarnation, boundary.serviceIncarnation);
+            return;
+        }
+
+        handoffStateLock.writeLock().lock();
+        try
+        {
+            for (PublishedHandoff handoff : handoffByFileId.values())
+            {
+                if (handoff.getState() != PublishedHandoff.State.FENCED
+                        || boundary.safeBoundary <= handoff.getFence())
+                {
+                    continue;
+                }
+                List<ObjectEntry> retiringEntries = handoff.beginRetiring();
+                if (retiringEntries.isEmpty())
+                {
+                    handoffByFileId.remove(handoff.getFileId(), handoff);
+                    continue;
+                }
+                for (ObjectEntry objectEntry : retiringEntries)
+                {
+                    objectEntry.unref();
+                    objectDeleteQueue.add(new ObjectDeleteTask(handoff, objectEntry));
+                }
+            }
+        }
+        catch (RetinaException e)
+        {
+            logger.error("Failed to transition published handoff to RETIRING", e);
+        }
+        finally
+        {
+            handoffStateLock.writeLock().unlock();
+        }
+
+        processObjectDeleteQueue();
+    }
+
+    private void processObjectDeleteQueue()
+    {
+        int taskCount = objectDeleteQueue.size();
+        for (int i = 0; i < taskCount; i++)
+        {
+            ObjectDeleteTask task = objectDeleteQueue.poll();
+            if (task == null)
+            {
+                return;
+            }
+            if (task.objectEntry.getRefCount() != 0)
+            {
+                objectDeleteQueue.add(task);
+                continue;
+            }
+            try
+            {
+                objectBlockDeleter.delete(
+                        task.handoff.getTableId(),
+                        task.handoff.getVirtualNodeId(),
+                        task.objectEntry.getId());
+                boolean completed = task.handoff.markObjectDeleted();
+                if (completed)
+                {
+                    handoffStateLock.writeLock().lock();
+                    try
+                    {
+                        handoffByFileId.remove(task.handoff.getFileId(), task.handoff);
+                    }
+                    finally
+                    {
+                        handoffStateLock.writeLock().unlock();
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                objectDeleteQueue.add(task);
+                logger.warn("Failed to delete retired Retina object tableId={}, vNodeId={}, objectId={}; "
+                                + "will retry",
+                        task.handoff.getTableId(), task.handoff.getVirtualNodeId(),
+                        task.objectEntry.getId(), e);
+            }
+        }
+    }
+
+    private void requireRegisteredHandoff(PublishedHandoff handoff) throws RetinaException
+    {
+        if (handoffByFileId.get(handoff.getFileId()) != handoff)
+        {
+            throw new RetinaException("Handoff is not authoritative for fileId=" + handoff.getFileId());
+        }
+    }
+
+    private void requirePlacementReady() throws RetinaException
+    {
+        if (placementState != PlacementState.READY)
+        {
+            throw new RetinaException("Retina placement state is " + placementState);
+        }
+    }
+
+    private void validatePlacementQuery(long transId) throws RetinaException
+    {
+        requirePlacementReady();
+        if (transId < 0)
+        {
+            throw new RetinaException("Missing query transaction id");
+        }
+        if (transId < startupFence)
+        {
+            throw new SnapshotExpiredException("Query transaction " + transId
+                    + " predates Retina startup fence " + startupFence);
+        }
+    }
+
+    private boolean isCurrentBufferFile(long fileId)
+    {
+        for (Map<Integer, PixelsWriteBuffer> nodeBuffers : pixelsWriteBufferMap.values())
+        {
+            for (PixelsWriteBuffer writeBuffer : nodeBuffers.values())
+            {
+                SuperVersion superVersion = writeBuffer.getCurrentVersion();
+                try
+                {
+                    if (superVersion.getActiveMemTable().getFileId() == fileId)
+                    {
+                        return true;
+                    }
+                    for (MemTable memTable : superVersion.getImmutableMemTables())
+                    {
+                        if (memTable.getFileId() == fileId)
+                        {
+                            return true;
+                        }
+                    }
+                    for (ObjectEntry objectEntry : superVersion.getObjectEntries())
+                    {
+                        if (objectEntry.getFileId() == fileId)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                finally
+                {
+                    superVersion.unref();
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -367,7 +879,7 @@ public class RetinaResourceManager
         });
     }
 
-    public long[] queryVisibility(long fileId, int rgId, long timestamp, long transId) throws RetinaException
+    public long[] queryVisibility(long fileId, int rgId, long timestamp) throws RetinaException
     {
         // read from memory
         RGVisibility rgVisibility = checkRGVisibility(fileId, rgId, false);
@@ -377,12 +889,6 @@ public class RetinaResourceManager
             throw new RetinaException(String.format("Failed to get visibility for fileId: %d, rgId: %d", fileId, rgId));
         }
         return visibilityBitmap;
-    }
-
-
-    public long[] queryVisibility(long fileId, int rgId, long timestamp) throws RetinaException
-    {
-        return queryVisibility(fileId, rgId, timestamp, -1);
     }
 
     public void reclaimVisibility(long fileId, int rgId, long timestamp) throws RetinaException
@@ -711,7 +1217,8 @@ public class RetinaResourceManager
             for (int i = 0; i < totalVirtualNodeNum; i++)
             {
                 PixelsWriteBuffer pixelsWriteBuffer = new PixelsWriteBuffer(latestLayout.getTableId(),
-                        schema, orderMapping, orderedPaths.get(0), compactPaths.get(0), retinaHostName, i);
+                        schema, orderMapping, orderedPaths.get(0), compactPaths.get(0),
+                        retinaHostName, i, this);
                 nodeBuffers.put(i, pixelsWriteBuffer);
             }
         } catch (Exception e)
@@ -756,88 +1263,137 @@ public class RetinaResourceManager
                 .build();
     }
 
-    public RetinaProto.GetWriteBufferResponse.Builder getWriteBuffer(String schemaName, String tableName, long timestamp, int vNodeId) throws RetinaException
+    public RetinaProto.GetWriteBufferResponse.Builder getWriteBuffer(
+            String schemaName, String tableName, long timestamp, int vNodeId, long transId)
+            throws RetinaException
     {
         RetinaProto.GetWriteBufferResponse.Builder responseBuilder = RetinaProto.GetWriteBufferResponse.newBuilder();
 
-        // get super version
         PixelsWriteBuffer writeBuffer = checkPixelsWriteBuffer(schemaName, tableName, vNodeId);
-        SuperVersion superVersion = writeBuffer.getCurrentVersion();
-        MemTable activeMemtable = superVersion.getActiveMemTable();
-        List<MemTable> immutableMemTables = superVersion.getImmutableMemTables();
-        List<ObjectEntry> objectEntries = superVersion.getObjectEntries();
-
-        Set<Long> fileIds = new HashSet<>();
-
-        // Active memTable returns its full appended rows; visibility is masked
-        // downstream by the RGVisibility bitmap slice below.
-        int activeSize = activeMemtable.getSize();
-        if (activeSize > 0)
+        BufferPlacementSnapshot placementSnapshot =
+                captureBufferPlacementSnapshot(writeBuffer, transId);
+        SuperVersion superVersion = placementSnapshot.superVersion;
+        try
         {
-            ByteString data = ByteString.copyFrom(activeMemtable.serialize());
-            responseBuilder.setData(data);
-        } else
-        {
-            responseBuilder.setData(ByteString.EMPTY);
-        }
+            MemTable activeMemtable = superVersion.getActiveMemTable();
+            List<MemTable> immutableMemTables = superVersion.getImmutableMemTables();
+            List<ObjectEntry> objectEntries = new ArrayList<>(superVersion.getObjectEntries());
+            objectEntries.addAll(placementSnapshot.retainedEntries);
 
-        // statistics on id and fileId
-        List<Long> ids = new ArrayList<>();
-        fileIds.add(activeMemtable.getFileId());
-        for (MemTable immutableMemtable : immutableMemTables)
-        {
-            if (!immutableMemtable.isEmpty())
+            Set<Long> fileIds = new HashSet<>();
+
+            // Active memTable returns its full appended rows; visibility is masked
+            // downstream by the RGVisibility bitmap slice below.
+            int activeSize = activeMemtable.getSize();
+            if (activeSize > 0)
             {
-                fileIds.add(immutableMemtable.getFileId());
-                ids.add(immutableMemtable.getId());
+                ByteString data = ByteString.copyFrom(activeMemtable.serialize());
+                responseBuilder.setData(data);
             }
-        }
-        for (ObjectEntry objectEntry : objectEntries)
-        {
-            fileIds.add(objectEntry.getFileId());
-            ids.add(objectEntry.getId());
-        }
-        responseBuilder.addAllIds(ids);
+            else
+            {
+                responseBuilder.setData(ByteString.EMPTY);
+            }
 
-        // get the visibility bitmap of fileIds
-        Map<Long, long[]> fileIdToVisibility = new HashMap<>();
-        for (Long fileId : fileIds)
-        {
-            long[] visibility = queryVisibility(fileId, 0, timestamp);
-            fileIdToVisibility.put(fileId, visibility);
-        }
+            List<Long> ids = new ArrayList<>();
+            fileIds.add(activeMemtable.getFileId());
+            for (MemTable immutableMemtable : immutableMemTables)
+            {
+                if (!immutableMemtable.isEmpty())
+                {
+                    fileIds.add(immutableMemtable.getFileId());
+                    ids.add(immutableMemtable.getId());
+                }
+            }
+            for (ObjectEntry objectEntry : objectEntries)
+            {
+                fileIds.add(objectEntry.getFileId());
+                ids.add(objectEntry.getId());
+            }
+            responseBuilder.addAllIds(ids);
 
-        // only return the corresponding visible part of bitmap
-        if (activeSize > 0)
-        {
-            responseBuilder.addBitmaps(getVisibilityBitmapSlice(
-                    fileIdToVisibility.get(activeMemtable.getFileId()),
-                    activeMemtable.getStartIndex(), activeSize));
-        } else
-        {
-            responseBuilder.addBitmaps(RetinaProto.VisibilityBitmap.newBuilder());
-        }
-        for (MemTable immutableMemtable : immutableMemTables)
-        {
-            int immutableSize = immutableMemtable.getSize();
-            if (immutableSize > 0)
+            Map<Long, long[]> fileIdToVisibility = new HashMap<>();
+            for (Long fileId : fileIds)
+            {
+                fileIdToVisibility.put(fileId, queryVisibility(fileId, 0, timestamp));
+            }
+
+            if (activeSize > 0)
             {
                 responseBuilder.addBitmaps(getVisibilityBitmapSlice(
-                        fileIdToVisibility.get(immutableMemtable.getFileId()),
-                        immutableMemtable.getStartIndex(), immutableSize));
+                        fileIdToVisibility.get(activeMemtable.getFileId()),
+                        activeMemtable.getStartIndex(), activeSize));
             }
+            else
+            {
+                responseBuilder.addBitmaps(RetinaProto.VisibilityBitmap.newBuilder());
+            }
+            for (MemTable immutableMemtable : immutableMemTables)
+            {
+                int immutableSize = immutableMemtable.getSize();
+                if (immutableSize > 0)
+                {
+                    responseBuilder.addBitmaps(getVisibilityBitmapSlice(
+                            fileIdToVisibility.get(immutableMemtable.getFileId()),
+                            immutableMemtable.getStartIndex(), immutableSize));
+                }
+            }
+            for (ObjectEntry objectEntry : objectEntries)
+            {
+                responseBuilder.addBitmaps(getVisibilityBitmapSlice(
+                        fileIdToVisibility.get(objectEntry.getFileId()),
+                        objectEntry.getStartIndex(), objectEntry.getLength()));
+            }
+            return responseBuilder;
         }
-        for (ObjectEntry objectEntry : objectEntries)
+        finally
         {
-            responseBuilder.addBitmaps(getVisibilityBitmapSlice(
-                    fileIdToVisibility.get(objectEntry.getFileId()),
-                    objectEntry.getStartIndex(), objectEntry.getLength()));
+            superVersion.unref();
         }
+    }
 
-        // unref super version
-        superVersion.unref();
-
-        return responseBuilder;
+    private BufferPlacementSnapshot captureBufferPlacementSnapshot(
+            PixelsWriteBuffer writeBuffer, long transId) throws RetinaException
+    {
+        validatePlacementQuery(transId);
+        while (true)
+        {
+            PublishedHandoff preparing = null;
+            handoffStateLock.readLock().lock();
+            try
+            {
+                List<ObjectEntry> retainedEntries = new ArrayList<>();
+                for (PublishedHandoff handoff : handoffByFileId.values())
+                {
+                    if (handoff.getTableId() != writeBuffer.getTableId()
+                            || handoff.getVirtualNodeId() != writeBuffer.getVirtualNodeId())
+                    {
+                        continue;
+                    }
+                    if (handoff.getState() == PublishedHandoff.State.PREPARING)
+                    {
+                        preparing = handoff;
+                        break;
+                    }
+                    if (handoff.resolveSource(transId) == RetinaProto.ReadSource.BUFFER)
+                    {
+                        retainedEntries.addAll(handoff.getRetainedEntries());
+                    }
+                }
+                if (preparing == null)
+                {
+                    retainedEntries.sort(Comparator.comparingLong(ObjectEntry::getId));
+                    return new BufferPlacementSnapshot(
+                            writeBuffer.getCurrentVersion(), retainedEntries);
+                }
+            }
+            finally
+            {
+                handoffStateLock.readLock().unlock();
+            }
+            preparing.awaitStableState(HANDOFF_WAIT_TIMEOUT_MS);
+            validatePlacementQuery(transId);
+        }
     }
 
     /**
@@ -932,6 +1488,7 @@ public class RetinaResourceManager
     private void runGC()
     {
         processRetiredFiles();
+        reclaimPublishedHandoffs();
 
         long timestamp = 0;
         try
@@ -999,7 +1556,8 @@ public class RetinaResourceManager
             {
                 try
                 {
-                    storageGarbageCollector.runStorageGC(timestamp, fileStats, gcSnapshotBitmaps);
+                    storageGarbageCollector.runStorageGC(
+                            timestamp, fileStats, gcSnapshotBitmaps, getProtectedHandoffFileIds());
                 }
                 catch (Exception e)
                 {

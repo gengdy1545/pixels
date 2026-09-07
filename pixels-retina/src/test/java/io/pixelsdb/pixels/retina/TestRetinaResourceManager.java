@@ -256,7 +256,7 @@ public class TestRetinaResourceManager
                     0, "haggle. carefully final deposits detect slyly agai");
             retinaResourceManager.insertRecord(schemaName, tableName, colValues, 5, 0);
             RetinaProto.GetWriteBufferResponse response =
-                    retinaResourceManager.getWriteBuffer(schemaName, tableName, 0, 0).build();
+                    retinaResourceManager.getWriteBuffer(schemaName, tableName, 0, 0, 0).build();
             System.out.println(response.getData().isEmpty() ? "empty"  :
                     VectorizedRowBatch.deserialize(response.getData().toByteArray()));
             System.out.println(response.getBitmaps(0).getBitmapCount());

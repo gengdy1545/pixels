@@ -44,7 +44,6 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.stream.Collectors;
 
 import static com.google.common.base.Preconditions.checkArgument;
 
@@ -117,6 +116,7 @@ public class PixelsWriteBuffer
     private final Queue<FileWriterManager> fileWriterManagers;
     private FileWriterManager currentFileWriterManager;
     private IngestFilePublisher ingestFilePublisher;
+    private final RetinaResourceManager handoffController;
 
     /**
      * Issue #1254: Multi-threaded flush
@@ -135,12 +135,15 @@ public class PixelsWriteBuffer
 
     public PixelsWriteBuffer(long tableId, TypeDescription schema, int[] orderMapping,
                              Path targetOrderedDirPath, Path targetCompactDirPath,
-                             String retinaHostName, int virtualNode) throws RetinaException
+                             String retinaHostName, int virtualNode,
+                             RetinaResourceManager handoffController) throws RetinaException
     {
         this.tableId = tableId;
         this.schema = schema;
         this.orderMapping = orderMapping;
         this.virtualNodeId = virtualNode;
+        this.handoffController = Objects.requireNonNull(
+                handoffController, "handoffController is null");
         this.indexOption = IndexOption.builder()
                 .vNodeId(virtualNodeId)
                 .build();
@@ -333,25 +336,8 @@ public class PixelsWriteBuffer
                         flushMemTable.getStartIndex(), flushMemTable.getSize(), capturedMinCommitTs);
                 objectEntry.ref();
 
-                // update watermark
-                synchronized (flushLock)
-                {
-                    long nextId = continuousFlushedId.get() + 1;
-                    if (id == nextId)
-                    {
-                        continuousFlushedId.incrementAndGet();
-                        while (!outOfOrderFlushedIds.isEmpty() && outOfOrderFlushedIds.peek() == continuousFlushedId.get() + 1)
-                        {
-                            outOfOrderFlushedIds.poll();
-                            continuousFlushedId.incrementAndGet();
-                        }
-                    } else
-                    {
-                        outOfOrderFlushedIds.add(id);
-                    }
-                }
-
-                // update SuperVersion
+                // Publish the ObjectEntry into the authoritative view before
+                // advancing the continuous flush watermark.
                 versionLock.writeLock().lock();
                 try
                 {
@@ -366,6 +352,25 @@ public class PixelsWriteBuffer
                 } finally
                 {
                     versionLock.writeLock().unlock();
+                }
+
+                synchronized (flushLock)
+                {
+                    long nextId = continuousFlushedId.get() + 1;
+                    if (id == nextId)
+                    {
+                        continuousFlushedId.incrementAndGet();
+                        while (!outOfOrderFlushedIds.isEmpty()
+                                && outOfOrderFlushedIds.peek() == continuousFlushedId.get() + 1)
+                        {
+                            outOfOrderFlushedIds.poll();
+                            continuousFlushedId.incrementAndGet();
+                        }
+                    }
+                    else
+                    {
+                        outOfOrderFlushedIds.add(id);
+                    }
                 }
 
                 // unref in the end
@@ -481,41 +486,75 @@ public class PixelsWriteBuffer
 
     private void publishPreparedFile(FileWriterManager fileWriterManager) throws RetinaException
     {
-        try
+        if (!fileWriterManager.isPhysicalClosed())
         {
-            if (!fileWriterManager.isPhysicalClosed())
-            {
-                throw new RetinaException("Cannot publish ingest file before physical close: fileId="
-                        + fileWriterManager.getFileId());
-            }
-            if (!fileWriterManager.isIndexFlushed())
-            {
-                throw new RetinaException("Cannot publish ingest file before main index flush: fileId="
-                        + fileWriterManager.getFileId());
-            }
-            if (!fileWriterManager.hasRowIds())
-            {
-                throw new RetinaException("Cannot publish ingest file without row-id hull: fileId="
-                        + fileWriterManager.getFileId());
-            }
+            throw new RetinaException("Cannot publish ingest file before physical close: fileId="
+                    + fileWriterManager.getFileId());
+        }
+        if (!fileWriterManager.isIndexFlushed())
+        {
+            throw new RetinaException("Cannot publish ingest file before main index flush: fileId="
+                    + fileWriterManager.getFileId());
+        }
+        if (!fileWriterManager.hasRowIds())
+        {
+            throw new RetinaException("Cannot publish ingest file without row-id hull: fileId="
+                    + fileWriterManager.getFileId());
+        }
+
+        PublishedHandoff handoff = this.handoffController.registerPreparingHandoff(
+                fileWriterManager.getFileId(), this.tableId, this.virtualNodeId,
+                fileWriterManager.getFirstBlockId(), fileWriterManager.getLastBlockId());
+        if (handoff.getState() == PublishedHandoff.State.FENCED
+                || handoff.getState() == PublishedHandoff.State.RETIRING)
+        {
+            return;
+        }
+
+        if (!handoff.isMetadataPublished())
+        {
             File regularFile = fileWriterManager.getFileSnapshot();
             regularFile.setType(File.Type.REGULAR);
-            if (!MetadataService.Instance().updateFile(regularFile))
+            boolean updated;
+            try
             {
-                throw new RetinaException("Failed to publish ingest file "
-                        + fileWriterManager.getFileId() + " as REGULAR");
+                updated = MetadataService.Instance().updateFile(regularFile);
             }
-        } catch (MetadataException e)
+            catch (MetadataException e)
+            {
+                cancelAfterMetadataFailure(handoff, e);
+                throw new RetinaException("Failed to publish ingest file "
+                        + fileWriterManager.getFileId() + " as REGULAR", e);
+            }
+            if (!updated)
+            {
+                RetinaException failure = new RetinaException("Failed to publish ingest file "
+                        + fileWriterManager.getFileId() + " as REGULAR");
+                cancelAfterMetadataFailure(handoff, failure);
+                throw failure;
+            }
+            this.handoffController.markHandoffMetadataPublished(handoff);
+        }
+
+        this.handoffController.fenceAndPublishHandoff(handoff, this::moveBlocksToHandoff);
+    }
+
+    private void cancelAfterMetadataFailure(PublishedHandoff handoff, Exception failure)
+    {
+        try
         {
-            throw new RetinaException("Failed to publish ingest file "
-                    + fileWriterManager.getFileId() + " as REGULAR", e);
+            this.handoffController.cancelPreparingHandoff(handoff);
+        }
+        catch (RetinaException cancelFailure)
+        {
+            failure.addSuppressed(cancelFailure);
         }
     }
 
     /**
      * Determine whether the last data block managed by fileWriterManager has
-     * been written to Object. If it has been written, execute the file write
-     * operation and delete the corresponding ObjectEntry in the unified view.
+     * been written to Object. If it has, publish the file and atomically move
+     * its ObjectEntries into the retained handoff view.
      */
     private void startFlushObjectToFileScheduler(long intervalSeconds)
     {
@@ -534,7 +573,6 @@ public class PixelsWriteBuffer
                     for (FileWriterManager publishedFile : publishedFiles)
                     {
                         this.fileWriterManagers.remove(publishedFile);
-                        cleanupPublishedObjects(publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
                     }
                 }
             } catch (Exception e)
@@ -544,37 +582,46 @@ public class PixelsWriteBuffer
         }, 0, intervalSeconds, TimeUnit.SECONDS);
     }
 
-    private void cleanupPublishedObjects(long firstBlockId, long lastBlockId) throws RetinaException
+    private void moveBlocksToHandoff(PublishedHandoff handoff) throws RetinaException
     {
-        if (lastBlockId < firstBlockId)
-        {
-            return;
-        }
-
-        List<ObjectEntry> toRemove;
         this.versionLock.writeLock().lock();
         try
         {
-            toRemove = this.objectEntries.stream()
-                    .filter(objectEntry -> objectEntry.getId() >= firstBlockId && objectEntry.getId() <= lastBlockId)
-                    .collect(Collectors.toList());
-            this.objectEntries.removeAll(toRemove);
+            if (handoff.hasRetainedEntries())
+            {
+                return;
+            }
+
+            List<ObjectEntry> retainedEntries = new ArrayList<>();
+            List<ObjectEntry> remainingEntries = new ArrayList<>();
+            for (ObjectEntry objectEntry : this.objectEntries)
+            {
+                if (objectEntry.getFileId() == handoff.getFileId()
+                        && objectEntry.getId() >= handoff.getFirstBlockId()
+                        && objectEntry.getId() <= handoff.getLastBlockId())
+                {
+                    retainedEntries.add(objectEntry);
+                }
+                else
+                {
+                    remainingEntries.add(objectEntry);
+                }
+            }
+            handoff.validateRetainedEntries(retainedEntries);
+
+            SuperVersion newVersion = new SuperVersion(
+                    this.activeMemTable, this.immutableMemTables, remainingEntries);
 
             SuperVersion oldVersion = this.currentVersion;
-            this.currentVersion = new SuperVersion(
-                    this.activeMemTable, this.immutableMemTables, this.objectEntries);
+            this.objectEntries.clear();
+            this.objectEntries.addAll(remainingEntries);
+            this.currentVersion = newVersion;
+            handoff.attachRetainedEntries(retainedEntries);
             oldVersion.unref();
-        } finally
+        }
+        finally
         {
             this.versionLock.writeLock().unlock();
-        }
-
-        for (ObjectEntry objectEntry : toRemove)
-        {
-            if (objectEntry.unref())
-            {
-                this.objectStorageManager.delete(this.tableId, virtualNodeId, objectEntry.getId());
-            }
         }
     }
 
@@ -678,7 +725,6 @@ public class PixelsWriteBuffer
                 for (FileWriterManager publishedFile : published)
                 {
                     this.fileWriterManagers.remove(publishedFile);
-                    cleanupPublishedObjects(publishedFile.getFirstBlockId(), publishedFile.getLastBlockId());
                 }
             }
         }

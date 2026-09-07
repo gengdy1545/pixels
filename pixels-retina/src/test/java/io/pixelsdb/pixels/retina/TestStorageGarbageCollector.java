@@ -723,7 +723,7 @@ public class TestStorageGarbageCollector
 
         TrackingRunStorageGC trackingGc = new TrackingRunStorageGC(Collections.emptyList());
 
-        trackingGc.runStorageGC(301L, fileStats, bitmaps);
+        trackingGc.runStorageGC(301L, fileStats, bitmaps, Collections.emptySet());
 
         assertFalse("no candidate means metadata scan must not run", trackingGc.scanCalled);
         assertFalse("no candidate means process phase must not run", trackingGc.processCalled);
@@ -764,7 +764,7 @@ public class TestStorageGarbageCollector
 
         TrackingRunStorageGC trackingGc = new TrackingRunStorageGC(Collections.emptyList());
 
-        trackingGc.runStorageGC(302L, fileStats, bitmaps);
+        trackingGc.runStorageGC(302L, fileStats, bitmaps, Collections.emptySet());
 
         assertTrue("candidate scan must run when at least one file qualifies", trackingGc.scanCalled);
         assertEquals(new HashSet<>(Arrays.asList(candidateA, candidateB)), trackingGc.capturedCandidateFileIds);
@@ -805,7 +805,7 @@ public class TestStorageGarbageCollector
         bitmaps.put(RetinaUtils.buildRgKey(candidateFileId, 1), makeBitmap(100, 60));
         bitmaps.put(RetinaUtils.buildRgKey(otherFileId, 0), makeBitmap(100, 10));
 
-        trackingGc.runStorageGC(safeGcTs, fileStats, bitmaps);
+        trackingGc.runStorageGC(safeGcTs, fileStats, bitmaps, Collections.emptySet());
 
         assertTrue("process phase must run for non-empty groups", trackingGc.processCalled);
         assertEquals("safeGcTs must be forwarded to process phase", safeGcTs, trackingGc.capturedSafeGcTs);
@@ -846,7 +846,7 @@ public class TestStorageGarbageCollector
 
         try
         {
-            trackingGc.runStorageGC(304L, fileStats, bitmaps);
+            trackingGc.runStorageGC(304L, fileStats, bitmaps, Collections.emptySet());
             fail("process failure should propagate to the caller");
         }
         catch (RuntimeException e)
@@ -1570,12 +1570,12 @@ public class TestStorageGarbageCollector
         retinaManager.deleteRecord(fileId, 0, 1, deleteTs);
 
         // Old file: row 1 should be deleted (direct write always works)
-        long[] oldBitmap = retinaManager.queryVisibility(fileId, 0, deleteTs, 0L);
+        long[] oldBitmap = retinaManager.queryVisibility(fileId, 0, deleteTs);
         assertTrue("old file row 1 should be deleted (direct write)",
                 (oldBitmap[1 / 64] & (1L << (1 % 64))) != 0);
 
         // New file: row 0 should NOT be deleted (dual-write is off)
-        long[] newBitmap = retinaManager.queryVisibility(newFileId, 0, deleteTs, 0L);
+        long[] newBitmap = retinaManager.queryVisibility(newFileId, 0, deleteTs);
         assertFalse("new file row 0 should NOT be deleted after unregister",
                 (newBitmap[0 / 64] & (1L << (0 % 64))) != 0);
     }
@@ -1732,7 +1732,7 @@ public class TestStorageGarbageCollector
         // Verify every row in every old-file RG is deleted.
         for (int rgId = 0; rgId < numRgs; rgId++)
         {
-            long[] oldBitmap = retinaManager.queryVisibility(fileId, rgId, queryTs, 0L);
+            long[] oldBitmap = retinaManager.queryVisibility(fileId, rgId, queryTs);
             for (int r = 0; r < rowsPerRg; r++)
             {
                 assertTrue("old file rgId=" + rgId + " row " + r + " should be deleted",
@@ -1752,7 +1752,7 @@ public class TestStorageGarbageCollector
                     int newRgId = RetinaResourceManager.rgIdForGlobalRowOffset(
                             newGlobal, result.newFileRgRowStart);
                     int newRgOff = newGlobal - result.newFileRgRowStart[newRgId];
-                    long[] newBitmap = retinaManager.queryVisibility(newFileId, newRgId, queryTs, 0L);
+                    long[] newBitmap = retinaManager.queryVisibility(newFileId, newRgId, queryTs);
                     assertTrue("new file rgId=" + newRgId + " row " + newRgOff
                                     + " (from old rgId=" + rgId + " row " + r + ") should be deleted",
                             (newBitmap[newRgOff / 64] & (1L << (newRgOff % 64))) != 0);
@@ -2448,7 +2448,7 @@ public class TestStorageGarbageCollector
 
         retinaManager.deleteRecord(srcFileId, 0, 1, 150L);
 
-        long[] gcBitmap = retinaManager.queryVisibility(srcFileId, 0, safeGcTs, 0L);
+        long[] gcBitmap = retinaManager.queryVisibility(srcFileId, 0, safeGcTs);
         Map<String, long[]> bitmaps = new HashMap<>();
         bitmaps.put(RetinaUtils.buildRgKey(srcFileId, 0), gcBitmap);
 
@@ -2503,14 +2503,14 @@ public class TestStorageGarbageCollector
         retinaManager.deleteRecord(srcFileId, 0, 3, 200L);
         int newRowForOld3 = fwd[3];
         assertTrue("fwd[3] should be valid", newRowForOld3 >= 0);
-        long[] dualBm = retinaManager.queryVisibility(newFileId, 0, 200L, 0L);
+        long[] dualBm = retinaManager.queryVisibility(newFileId, 0, 200L);
         assertTrue("dual-write: new row " + newRowForOld3 + " should be deleted",
                 isBitSet(dualBm, newRowForOld3));
 
         e2eGc.syncVisibility(result, safeGcTs);
 
         int newRowForOld1 = fwd[1];
-        long[] syncBm = retinaManager.queryVisibility(newFileId, 0, 150L, 0L);
+        long[] syncBm = retinaManager.queryVisibility(newFileId, 0, 150L);
         assertTrue("sync: new row " + newRowForOld1 + " should show old row 1 deleted at ts=150",
                 isBitSet(syncBm, newRowForOld1));
 
@@ -2530,7 +2530,7 @@ public class TestStorageGarbageCollector
 
         for (long snap : new long[]{100L, 149L, 150L, 199L, 200L, 299L, 300L, 500L})
         {
-            long[] bm = retinaManager.queryVisibility(newFileId, 0, snap, 0L);
+            long[] bm = retinaManager.queryVisibility(newFileId, 0, snap);
             assertEquals("snap=" + snap + " newRow0 (old row1, del@150)", snap >= 150, isBitSet(bm, 0));
             assertEquals("snap=" + snap + " newRow1 (old row3, del@200)", snap >= 200, isBitSet(bm, 1));
             assertEquals("snap=" + snap + " newRow2 (old row5, del@300)", snap >= 300, isBitSet(bm, 2));
@@ -2539,8 +2539,8 @@ public class TestStorageGarbageCollector
 
         for (long snap : new long[]{100L, 150L, 200L, 300L, 500L})
         {
-            long[] oldBm = retinaManager.queryVisibility(srcFileId, 0, snap, 0L);
-            long[] newBm = retinaManager.queryVisibility(newFileId, 0, snap, 0L);
+            long[] oldBm = retinaManager.queryVisibility(srcFileId, 0, snap);
+            long[] newBm = retinaManager.queryVisibility(newFileId, 0, snap);
             for (int oldRow = 1; oldRow <= 7; oldRow += 2)
             {
                 int newRow = fwd[oldRow];
@@ -2609,7 +2609,7 @@ public class TestStorageGarbageCollector
             retinaManager.deleteRecord(srcFileId, 0, i, 5L + i * 5L);
         }
 
-        long[] gcBitmap = retinaManager.queryVisibility(srcFileId, 0, safeGcTs, 0L);
+        long[] gcBitmap = retinaManager.queryVisibility(srcFileId, 0, safeGcTs);
         Map<String, long[]> bitmaps = new HashMap<>();
         bitmaps.put(RetinaUtils.buildRgKey(srcFileId, 0), gcBitmap);
 
@@ -2831,7 +2831,7 @@ public class TestStorageGarbageCollector
         for (long snapTs : new long[]{100L, 150L, 200L, 250L, 300L, 350L, 400L,
                 450L, 500L, 550L, 800L, 1000L})
         {
-            long[] oldBm = retinaManager.queryVisibility(srcFileId, 0, snapTs, 0L);
+            long[] oldBm = retinaManager.queryVisibility(srcFileId, 0, snapTs);
             for (int oldRow = deletedBefore; oldRow < numRows; oldRow++)
             {
                 int newGlobal = fwd[oldRow];
@@ -2840,7 +2840,7 @@ public class TestStorageGarbageCollector
                 int newRgId = RetinaResourceManager.rgIdForGlobalRowOffset(
                         newGlobal, result.newFileRgRowStart);
                 int newRgOff = newGlobal - result.newFileRgRowStart[newRgId];
-                long[] newBm = retinaManager.queryVisibility(newFileId, newRgId, snapTs, 0L);
+                long[] newBm = retinaManager.queryVisibility(newFileId, newRgId, snapTs);
 
                 boolean oldDel = isBitSet(oldBm, oldRow);
                 boolean newDel = isBitSet(newBm, newRgOff);
@@ -2867,7 +2867,7 @@ public class TestStorageGarbageCollector
         // 3e. Verify INSERT files are unaffected by GC
         for (long insFileId : insertedFileIds)
         {
-            long[] insBm = retinaManager.queryVisibility(insFileId, 0, 1000L, 0L);
+            long[] insBm = retinaManager.queryVisibility(insFileId, 0, 1000L);
             assertNotNull("INSERT file " + insFileId + " visibility should exist", insBm);
             for (int w = 0; w < insBm.length; w++)
             {
@@ -3200,7 +3200,7 @@ public class TestStorageGarbageCollector
         // At ts=450 all three deletes (350,360,370) are baked into the base bitmap.
         for (long snapTs : new long[]{450L, 500L})
         {
-            long[] bmB = retinaManager.queryVisibility(fileIdB, 0, snapTs, 0L);
+            long[] bmB = retinaManager.queryVisibility(fileIdB, 0, snapTs);
             for (int r = 0; r < 3; r++)
             {
                 assertTrue("file-B snap_ts=" + snapTs + " row " + r + " should be deleted",
@@ -3216,7 +3216,7 @@ public class TestStorageGarbageCollector
         // file-C: no deletions at any snap_ts (only ts >= safeGcTs3 queryable)
         for (long snapTs : new long[]{450L, 500L})
         {
-            long[] bmC = retinaManager.queryVisibility(fileIdC, 0, snapTs, 0L);
+            long[] bmC = retinaManager.queryVisibility(fileIdC, 0, snapTs);
             assertEquals("file-C should have no deletions at snap_ts=" + snapTs,
                     0L, bmC[0]);
         }
@@ -3226,7 +3226,7 @@ public class TestStorageGarbageCollector
         // No deletions were applied after safeGcTs3 to this file.
         for (long snapTs : new long[]{450L, 500L, 1000L})
         {
-            long[] bmAtriple = retinaManager.queryVisibility(fileIdAtriple, 0, snapTs, 0L);
+            long[] bmAtriple = retinaManager.queryVisibility(fileIdAtriple, 0, snapTs);
             for (int r = 0; r < 2; r++)
             {
                 assertFalse("file-A''' snap_ts=" + snapTs + " row " + r + " should not be deleted",

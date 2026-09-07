@@ -73,6 +73,12 @@ enum RetinaState {
     FAILED = 3;
 }
 
+enum ReadSource {
+    READ_SOURCE_UNSPECIFIED = 0;
+    FILE = 1;
+    BUFFER = 2;
+}
+
 message VnodeReplayStart {
     uint32 virtualNodeId = 1;
     uint64 startTs = 2;
@@ -167,14 +173,14 @@ message QueryVisibilityRequest {
     uint64 fileId = 2;
     repeated uint32 rgIds = 3;
     uint64 timestamp = 4;
-    // Optional transaction ID. Only set for long-running queries (offloaded).
-    optional int64 transId = 5;
+    int64 transId = 5;
 }
 
 message QueryVisibilityResponse {
     ResponseHeader header = 1;
     repeated VisibilityBitmap bitmaps = 2;
     optional string checkpointPath = 3;
+    ReadSource readSource = 4;
 }
 
 message ReclaimVisibilityRequest {
@@ -206,6 +212,7 @@ message GetWriteBufferRequest {
     string tableName = 3;
     uint64 timestamp = 4;
     uint32 virtualNodeId = 5;
+    int64 transId = 6;
 }
 
 message GetWriteBufferResponse {
